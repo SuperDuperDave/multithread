@@ -4,7 +4,7 @@ Multithread (formerly Agent Relay) is an [MIT-licensed](../LICENSE) preview
 exercised on the Linux/WSL2 profile below. Installation, scripted demonstration
 and bounded native provider work have separate evidence.
 [Hosted checks](CI.md#hosted-result) record the public commit and runner; consult
-the [selected release](https://github.com/SuperDuperDave/agent-relay/releases) for
+the [selected release](https://github.com/SuperDuperDave/multithread/releases) for
 package and onboarding results.
 
 Use [setup](SETUP.md) for the current installation and first collaboration path.
@@ -138,8 +138,8 @@ A success toast or green transport connection is not a durable-write witness.
 Do not post auth files, environment dumps, raw provider transcripts, live SQLite
 databases, private receiver URLs, personal Git metadata or unreviewed full logs.
 Use a minimal disposable reproduction with artificial identifiers.
-Report ordinary bugs through [GitHub Issues](https://github.com/SuperDuperDave/agent-relay/issues).
-Report vulnerabilities through [private vulnerability reporting](https://github.com/SuperDuperDave/agent-relay/security/advisories/new),
+Report ordinary bugs through [GitHub Issues](https://github.com/SuperDuperDave/multithread/issues).
+Report vulnerabilities through [private vulnerability reporting](https://github.com/SuperDuperDave/multithread/security/advisories/new),
 not a public issue. No response-time commitment is made.
 
 ## Trust limits

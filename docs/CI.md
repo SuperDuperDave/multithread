@@ -6,7 +6,7 @@ runner. Native-provider evidence has its separate scope.
 
 ## Hosted result
 
-[This hosted run](https://github.com/SuperDuperDave/agent-relay/actions/runs/34542612312) passed for public commit `2bfca836d7c267c514313b602dcef91799d75e2f`
+[This hosted run](https://github.com/SuperDuperDave/multithread/actions/runs/34542612312) passed for public commit `2bfca836d7c267c514313b602dcef91799d75e2f`
 on `ubuntu-24.04` with the explicit CI compatibility profile described below.
 The privilege and two-level namespace preflight passed. All 327 discovered tests
 ran with zero failures, errors, skips, expected failures or unexpected successes.

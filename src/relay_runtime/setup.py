@@ -201,7 +201,7 @@ def setup_report(repo, *, apply=False, codex=None, claude=None):
         result["providers"][client] = {"state": "prepared", "executable": plan["argv"][0],
                                        "version": "not_checked", "plan": plan, "launch_command": command}
         _next(result, client, "When a provider launch is authorized, run this in an interactive terminal and review its displayed invocation.", command)
-    result["first_collaboration_url"] = "https://github.com/SuperDuperDave/agent-relay/blob/main/docs/PEER.md#first-collaboration"
+    result["first_collaboration_url"] = "https://github.com/SuperDuperDave/multithread/blob/main/docs/PEER.md#first-collaboration"
     return result
 
 

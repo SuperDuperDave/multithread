@@ -24,13 +24,13 @@ uses their normal interfaces and remains separate from Multithread setup.
 ## Install and enroll
 
 Start in the Git repository you intend to use. Review the
-[publisher and selected release](https://github.com/SuperDuperDave/agent-relay/releases/latest)
+[publisher and selected release](https://github.com/SuperDuperDave/multithread/releases/latest)
 before running its installer:
 
 ```sh
 multithread_setup=$(mktemp) &&
   curl -fsSL --proto '=https' \
-    https://github.com/SuperDuperDave/agent-relay/releases/latest/download/install.py \
+    https://github.com/SuperDuperDave/multithread/releases/latest/download/install.py \
     -o "$multithread_setup" &&
   /usr/bin/python3 -I -S -B "$multithread_setup" --enroll-repo "$PWD"
 ```
@@ -75,7 +75,7 @@ repository:
 
 ```text
 Set up the current published Multithread release for this Git repository using
-https://github.com/SuperDuperDave/agent-relay/blob/main/docs/SETUP.md.
+https://github.com/SuperDuperDave/multithread/blob/main/docs/SETUP.md.
 Confirm the Git root/common directory and compatibility first. Review the
 publisher's versioned install.py release asset and its embedded version, source
 commit and digests. I authorize that reviewed account-local installation or

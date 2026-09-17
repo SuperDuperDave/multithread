@@ -88,7 +88,7 @@ interface before calling.
 
 ```text
 Use Multithread for one scoped, read-only collaboration in this Git repository.
-Follow https://github.com/SuperDuperDave/agent-relay/blob/main/docs/PEER.md.
+Follow https://github.com/SuperDuperDave/multithread/blob/main/docs/PEER.md.
 Verify the Git root/common directory and installed readiness. Choose an existing,
 functioning Claude or Codex provider, preferably the other provider from yours.
 I authorize one native peer call through my existing provider installation and

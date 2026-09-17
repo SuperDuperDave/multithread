@@ -27,7 +27,7 @@ import urllib.request
 
 
 PINNED_RELEASE = None
-PROJECT = "https://github.com/SuperDuperDave/agent-relay"
+PROJECT = "https://github.com/SuperDuperDave/multithread"
 MAX_ARCHIVE = 8 * 1024 * 1024
 MAX_FILE = 2 * 1024 * 1024
 MAX_TOTAL = 16 * 1024 * 1024

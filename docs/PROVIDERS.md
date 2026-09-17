@@ -311,7 +311,7 @@ The public walkthrough uses normal provider interfaces and explicit Git actions;
 it does not require distributing the private account-specific validation harness.
 Other provider versions and platform profiles require their own checks.
 [Hosted checks](CI.md#hosted-result) exercise the no-account suite, not providers;
-consult [v0.1.0](https://github.com/SuperDuperDave/agent-relay/releases/tag/v0.1.0) for package and onboarding results.
+consult [v0.1.0](https://github.com/SuperDuperDave/multithread/releases/tag/v0.1.0) for package and onboarding results.
 
 ## Historical credential-free probes
 

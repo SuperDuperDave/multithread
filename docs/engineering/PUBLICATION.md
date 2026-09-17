@@ -1,10 +1,10 @@
 # Publication boundary
 
-The [public source](https://github.com/SuperDuperDave/agent-relay) began as a fresh parentless snapshot
+The [public source](https://github.com/SuperDuperDave/multithread) began as a fresh parentless snapshot
 of 67 explicitly selected files with 25 exact reviewed exceptions. The export
 passed all 327 strict tests plus isolated installation, package inspection and
 the no-account demo before upload. No development history, ignored files or
-unselected content was imported. Consult [v0.1.0](https://github.com/SuperDuperDave/agent-relay/releases/tag/v0.1.0)
+unselected content was imported. Consult [v0.1.0](https://github.com/SuperDuperDave/multithread/releases/tag/v0.1.0)
 for final release-archive and onboarding results.
 
 The project is [MIT licensed](../../LICENSE), copyright (c) 2026 David Jones,
@@ -151,7 +151,7 @@ Temporary fixture cleanup completed before success was emitted.
 [Hosted CI](../CI.md#hosted-result) records its exact public commit and run.
 [Support](../SUPPORT.md#useful-safe-support-information) links the public issue
 tracker and private vulnerability-reporting channel. The
-[v0.1.0 release](https://github.com/SuperDuperDave/agent-relay/releases/tag/v0.1.0) is the reference for the tagged
+[v0.1.0 release](https://github.com/SuperDuperDave/multithread/releases/tag/v0.1.0) is the reference for the tagged
 source, archive checksums, package verification and anonymous clone/download
 results. Only recorded results for that source and archive establish those checks.
 The [bounded native workflow](../PROVIDERS.md#bounded-native-workflow) does not

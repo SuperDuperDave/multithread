@@ -43,12 +43,12 @@ From the Git repository you want to use, run this publisher's installer:
 ```sh
 multithread_setup=$(mktemp) &&
   curl -fsSL --proto '=https' \
-    https://github.com/SuperDuperDave/agent-relay/releases/latest/download/install.py \
+    https://github.com/SuperDuperDave/multithread/releases/latest/download/install.py \
     -o "$multithread_setup" &&
   /usr/bin/python3 -I -S -B "$multithread_setup" --enroll-repo "$PWD"
 ```
 
-Trust and review the [publisher and release](https://github.com/SuperDuperDave/agent-relay/releases/latest)
+Trust and review the [publisher and release](https://github.com/SuperDuperDave/multithread/releases/latest)
 before running its code. The installer verifies its pinned package, shows the
 selected release and repository scope, and asks you to type `install` once.
 Checksums bind the selected bytes; they are not publisher signatures.
@@ -135,8 +135,8 @@ commit in another worktree. It ends with
 Clone and review the source, then run from its root:
 
 ```sh
-git clone https://github.com/SuperDuperDave/agent-relay.git
-cd agent-relay
+git clone https://github.com/SuperDuperDave/multithread.git
+cd multithread
 /usr/bin/python3 -I -S -B examples/no_account_demo.py
 ```
 

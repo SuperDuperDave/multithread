@@ -1,10 +1,10 @@
 # Offline installation and recovery
 
 Multithread is [MIT licensed](../../LICENSE). The public source is
-[SuperDuperDave/agent-relay](https://github.com/SuperDuperDave/agent-relay). Choose the release-archive
+[SuperDuperDave/multithread](https://github.com/SuperDuperDave/multithread). Choose the release-archive
 or source-build route below. [Hosted checks](../CI.md#hosted-result) and the
 [bounded native workflow](../PROVIDERS.md#bounded-native-workflow) have separate
-scope. Consult the [selected release](https://github.com/SuperDuperDave/agent-relay/releases) for final package
+scope. Consult the [selected release](https://github.com/SuperDuperDave/multithread/releases) for final package
 and downloaded-package results.
 
 This guide accompanies the **v0.4.4 preview**. Use the archive route only
@@ -44,7 +44,7 @@ edits PATH/shell configuration, enrolls a repository or enables provider hooks.
 
 ## Install from the release archive
 
-Use this route when the [v0.4.4 release](https://github.com/SuperDuperDave/agent-relay/releases/tag/v0.4.4) lists both
+Use this route when the [v0.4.4 release](https://github.com/SuperDuperDave/multithread/releases/tag/v0.4.4) lists both
 `relay-0.4.4-linux-x86_64.tar.gz` and its `.sha256` file under Assets.
 Source publication and green CI alone do not establish a downloaded-package
 check; read the release's package and onboarding results first.
@@ -54,8 +54,8 @@ Download both files into a new empty directory. For example, with curl installed
 ```sh
 mkdir multithread-download
 cd multithread-download
-curl --fail --location --remote-name https://github.com/SuperDuperDave/agent-relay/releases/download/v0.4.4/relay-0.4.4-linux-x86_64.tar.gz
-curl --fail --location --remote-name https://github.com/SuperDuperDave/agent-relay/releases/download/v0.4.4/relay-0.4.4-linux-x86_64.tar.gz.sha256
+curl --fail --location --remote-name https://github.com/SuperDuperDave/multithread/releases/download/v0.4.4/relay-0.4.4-linux-x86_64.tar.gz
+curl --fail --location --remote-name https://github.com/SuperDuperDave/multithread/releases/download/v0.4.4/relay-0.4.4-linux-x86_64.tar.gz.sha256
 sha256sum --check relay-0.4.4-linux-x86_64.tar.gz.sha256
 tar -tvzf relay-0.4.4-linux-x86_64.tar.gz
 ```

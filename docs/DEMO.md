@@ -91,7 +91,7 @@ The public-profile and crash suites cover additional cases separately.
 The [bounded native workflow](PROVIDERS.md#bounded-native-workflow) separately
 exercises actual Codex and Claude sessions. This demo remains a scripted,
 no-account tour. See [hosted checks](CI.md#hosted-result) for the public-source
-run and [v0.1.0](https://github.com/SuperDuperDave/agent-relay/releases/tag/v0.1.0) for package and
+run and [v0.1.0](https://github.com/SuperDuperDave/multithread/releases/tag/v0.1.0) for package and
 anonymous-onboarding results. The [acceptance matrix](engineering/REQUIREMENTS.md)
 keeps these scopes separate.
 

@@ -23,7 +23,7 @@ import tarfile
 import tempfile
 
 
-REPOSITORY_URL = "https://github.com/SuperDuperDave/agent-relay"
+REPOSITORY_URL = "https://github.com/SuperDuperDave/multithread"
 RUNTIME_FILES = frozenset({
     "relay_core/__init__.py", "relay_core/cli.py", "relay_core/protocol.py",
     "relay_core/store.py", "relay_runtime/__init__.py",
