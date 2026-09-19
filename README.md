@@ -2,7 +2,7 @@
 
 **Native collaboration for coding agents.**
 
-A Mainthread project · [Project page](https://mainthread.ai/work/relay/)
+A Mainthread project · [Project page](https://mainthread.ai/work/multithread/)
 
 Give your work additional threads while keeping its purpose, ownership, and
 results connected.

@@ -13,7 +13,7 @@ the [peer reference](PEER-REFERENCE.md). The [source entry](#use-the-source-entr
 is available for reviewed development work.
 
 See the
-[project page](https://mainthread.ai/work/relay/) for the Multithread introduction.
+[project page](https://mainthread.ai/work/multithread/) for the Multithread introduction.
 
 Use it when a second perspective is worth the extra provider usage. Either
 agent can call Claude or Codex. The initiating agent keeps the continuing goal.
