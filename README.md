@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/brand/readme-banner.png" alt="Multithread. Native collaboration for coding agents. A Mainthread project." width="100%"></p>
+
 # Multithread
 
 **Native collaboration for coding agents.**
