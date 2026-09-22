@@ -282,7 +282,10 @@ def _run_worker(access, args, argv):
                 print("multithread: installed ledger unavailable; no success receipt", file=sys.stderr)
                 code = 1
             except BaseException:
-                print("multithread: worker failed; operation outcome may be uncertain", file=sys.stderr)
+                if args.command == "provider-hook":
+                    print("multithread: provider observation unavailable; no context receipt", file=sys.stderr)
+                else:
+                    print("multithread: worker failed; operation outcome may be uncertain", file=sys.stderr)
                 code = 1
             finally:
                 sys.stdout.flush()

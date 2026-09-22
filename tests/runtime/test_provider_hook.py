@@ -145,6 +145,15 @@ class ProviderHookTests(unittest.TestCase):
         self.assertNotIn("commit", events[0]["meta"])
         self.assertEqual(commit, events[1]["meta"]["commit"])
 
+    def test_noncommit_detached_head_does_not_record_lifecycle(self):
+        self.fixture.initialize()
+        tree = subprocess.check_output(["/usr/bin/git", "-C", str(self.fixture.repo),
+                                        "rev-parse", "HEAD^{tree}"], text=True).strip()
+        (self.fixture.repo / ".git" / "HEAD").write_text(tree + "\n")
+        result = self.hook("claude", "SessionStart", "noncommit-head")
+        self.silent(result, degraded=True)
+        self.assertEqual([], self.rows())
+
     def test_legacy_resume_after_commit_and_modern_startup_retry(self):
         self.fixture.initialize()
         self.context(self.hook("claude", "SessionStart", "resumed-session"),
