@@ -181,7 +181,7 @@ class ClaudeProtocolTests(unittest.TestCase):
                     stream.close()
 
     def run_native(self, steps, *, task=None, control=None, resume=None, session=SESSION,
-                   timeout=5, pipe_size=None, feedback=None):
+                   timeout=5, pipe_size=None, feedback=None, capture_envelope=None):
         self.count += 1
         self.specification.write_text(json.dumps(steps))
         self.requests.unlink(missing_ok=True)
@@ -197,6 +197,8 @@ class ClaudeProtocolTests(unittest.TestCase):
         envelope = {"schema": 1, "provider": "claude", "state": "unavailable",
                     "requested_session_id": session, "session_id": None, "result": None,
                     "needs_attention": True, "usage": None}
+        if capture_envelope is not None:
+            capture_envelope.append(envelope)
         body = (task if task is not None else self.task).encode("utf-8")
         claude_peer.run(process, body, str(self.repo), resume, directory, envelope,
                         timeout, control=control, feedback=feedback)
@@ -746,6 +748,16 @@ class ClaudeProtocolTests(unittest.TestCase):
         self.assertEqual(ANSWER, envelope["native_results"][0]["result_excerpt"])
         self.assertFalse(envelope["native_results"][0]["related"])
         self.assert_raw(envelope, directory)
+
+    def test_unwritten_task_at_deadline_has_terminal_delivery_status(self):
+        captured = []
+        with self.assertRaises(subprocess.TimeoutExpired):
+            self.run_native([{"sleep": 5}], task="x" * 40000,
+                            pipe_size=4096, timeout=0.05, capture_envelope=captured)
+        envelope = captured[0]
+        self.assertEqual("uncertain", envelope["task_delivery"])
+        self.assertFalse(envelope["native_input"][0]["written"])
+        self.assertGreater(envelope["native_input_unwritten_bytes"], 0)
 
     def test_unsupported_control_request_is_not_answered_by_an_invented_protocol(self):
         control = Control()
