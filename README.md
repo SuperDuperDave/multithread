@@ -110,6 +110,11 @@ Collaboration is optional unless your task requires it. It can help with a
 critical change, a stalled investigation or a design that still misses the
 intended look and feel. [Choose the contribution and how to assess it](docs/PEER.md#choose-the-contribution-you-need).
 
+For ongoing projects, the optional [Multithread skill](skills/multithread/SKILL.md)
+helps an agent discover when and how to use the installed system. Add it to a
+provider's project-local skill location only if you want that guidance available
+there; [setup explains the locations](docs/SETUP.md#ask-your-coding-agent).
+
 The [manual two-worktree walkthrough](docs/PROVIDERS.md#try-a-review-across-two-worktrees)
 remains available for separate sessions with manual wakes and explicit Git work.
 
