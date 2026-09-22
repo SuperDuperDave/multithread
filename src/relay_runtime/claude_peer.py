@@ -413,12 +413,13 @@ class _Driver:
         if partial and self.envelope.get("state") != "returned":
             self.envelope["partial_result"] = partial
         if resolve_pending:
+            task = self.inputs.get(self.initial)
+            if task is not None:
+                self.envelope["task_delivery"] = "written" if task["written"] else "uncertain"
             for identifier in self.order:
                 record = self.inputs[identifier]
                 if record["consumption"] == "consumed":
                     self.receipt(identifier, "consumed", "A native main-session frame named this input as answered in a turn; consumption is not task completion.")
-                elif record["consumption"] == "unknown":
-                    self.receipt(identifier, "uncertain", "The native result carried no answered-message identity, so consumption of this input is unknown; do not resend automatically.")
                 elif not record["written"]:
                     self.receipt(identifier, "uncertain", "This input was not fully written to the native input pipe before the call ended; do not resend automatically.")
                 else:
@@ -440,7 +441,6 @@ class _Driver:
                                  provider_duration_ms=last["duration_ms"])
         task = self.inputs.get(self.initial, {"written": False})
         unsettled = [identifier for identifier in self.order if not self.inputs[identifier]["result_covered"]]
-        unknown = [identifier for identifier in self.order if self.inputs[identifier]["consumption"] == "unknown"]
         self.envelope["task_delivery"] = "written" if task["written"] else "uncertain"
         if not task["written"]:
             state = "uncertain"
@@ -457,15 +457,13 @@ class _Driver:
         else:
             state = "returned"
             message = "Assess the answer and durable Multithread evidence; a returned turn is not workflow completion."
-        if unknown and state in ("returned", "provider_error"):
-            message += " Some input carried no native consumption observation; treat that attribution as unknown."
         stopped = last is not None and (last["terminal_reason"] not in (None, "completed", "end_turn")
                                        or last["stop_reason"] not in (None, "end_turn", "stop_sequence"))
         if stopped:
             message += " The native stopping reason requires attention before continuing."
         self.envelope.update(state=state, result=self.answer if state == "returned" else None,
                              message=message, needs_attention=bool(
-                                 state != "returned" or stopped or unknown or self.denials
+                                 state != "returned" or stopped or self.denials
                                  or self.unknown_requests or self.had_problem))
         self.outcome_recorded = state in ("returned", "provider_error")
 
