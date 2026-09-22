@@ -92,11 +92,38 @@ me to the first-collaboration prompt in docs/PEER.md#first-collaboration.
 
 The agent should continue through the authorized steps it can verify. If the
 repository is ambiguous, establish the intended target before enrollment.
+
 `--yes` applies the selected installer release without its interactive prompt;
 it approves installing or updating to that exact embedded release, including
 replacing a recognized active version. To require a particular prior activation,
 also pass `--expected-activation` with its observed ID (`none` for a first
 installation). This approval does not authorize unrelated changes or provider usage.
+
+For repeated use, an optional [Multithread skill](../skills/multithread/SKILL.md)
+gives agents a short route to the installed CLI and public guides without copying
+the manuals into every project's instructions. It is a reviewed starting point,
+not installed by setup or required for collaboration. Codex discovers project
+skills at `.agents/skills/multithread/SKILL.md`; Claude Code uses
+`.claude/skills/multithread/SKILL.md`. Ask your agent to place the skill in the
+provider location you use, review it with your project guidance, and preserve
+any existing local skill. If you use both providers, keep one project-local copy
+and point the other provider's skill path to it where supported. Project-specific
+collaboration preferences belong in that project's guidance; public command
+syntax and behavior remain in the installed help and linked docs. Existing
+sessions may need to discover a newly added skill before using it.
+
+To add that optional guidance, give your agent this prompt in the enrolled
+repository:
+
+```text
+Add the reviewed Multithread skill from
+https://github.com/SuperDuperDave/multithread/blob/main/skills/multithread/SKILL.md
+to the project-local skill location for the coding provider(s) this repository
+uses. Preserve any existing skill or project instructions; if both providers
+use it, keep one maintained copy where supported. Verify the resulting paths
+and tell me how each provider will discover it. Do not change provider settings
+or run a peer call as part of this task.
+```
 
 For local identity checks, use:
 

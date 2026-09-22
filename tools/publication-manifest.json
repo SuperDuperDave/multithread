@@ -35,6 +35,7 @@
     "examples/demo_scenario.py",
     "examples/launch_provider.py",
     "examples/no_account_demo.py",
+    "skills/multithread/SKILL.md",
     "src/relay.py",
     "src/relay_bootstrap.py",
     "src/relay_core/__init__.py",
