@@ -119,6 +119,32 @@ class ProviderHookTests(unittest.TestCase):
         self.assertEqual(protected, [snapshot(path) for path in self.protected] + [snapshot(foreign)])
         self.assertEqual(2, len(self.rows()))
 
+    def test_unborn_checkout_records_lifecycle_without_inventing_commit(self):
+        unborn = self.fixture.base / "unborn-project"
+        subprocess.run(["/usr/bin/git", "-c", "init.defaultBranch=unborn-fixture",
+                        "init", "-q", str(unborn)], check=True)
+        self.assertTrue(self.fixture.success("init", repo=unborn)["initialized"])
+        self.context(self.hook("claude", "SessionStart", "unborn-session", repo=unborn),
+                     "claude", "SessionStart", "unborn-session")
+        first = self.fixture.success("events", repo=unborn)[0]
+        self.assertEqual("session.started", first["kind"])
+        self.assertEqual({"branch": "unborn-fixture", "client": "claude",
+                          "worktree": "primary"}, first["meta"])
+
+        subprocess.run(["/usr/bin/git", "-C", str(unborn),
+                        "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false",
+                        "-c", "user.name=Fixture", "-c", "user.email=fixture",
+                        "commit", "--allow-empty", "-q", "-F", "-"],
+                       input="First fixture commit\n", text=True, check=True)
+        commit = subprocess.check_output(["/usr/bin/git", "-C", str(unborn),
+                                          "rev-parse", "HEAD"], text=True).strip()
+        self.context(self.hook("claude", "SessionStart", "committed-session", repo=unborn),
+                     "claude", "SessionStart", "committed-session")
+        events = self.fixture.success("events", repo=unborn)
+        self.assertEqual(2, len(events))
+        self.assertNotIn("commit", events[0]["meta"])
+        self.assertEqual(commit, events[1]["meta"]["commit"])
+
     def test_legacy_resume_after_commit_and_modern_startup_retry(self):
         self.fixture.initialize()
         self.context(self.hook("claude", "SessionStart", "resumed-session"),
