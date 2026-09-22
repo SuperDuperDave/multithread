@@ -223,7 +223,8 @@ permissions, deadlines or retry behavior.
 
 Where a submission stage is unobserved, the waiting message says so. Ordinary
 Claude calls distinguish writing the task from waiting after a complete pipe
-write. If input closes early, a matching successful native reply cannot establish
+write; opted-in streaming Claude calls now expose the same distinction while
+waiting. If input closes early, a matching successful native reply cannot establish
 an answer to the complete task: the call is `uncertain`, needs attention and
 retains useful text as `partial_result` and in raw output. A native refusal
 remains `provider_error`; interrupted calls remain uncertain. Inspect the
