@@ -114,7 +114,8 @@ Keep credentials, account files and unrelated private material out of the task.
 
 Read the receipt and retained result before continuing. Independently inspect
 the cited files and assess each finding; do not apply changes. Finish with the
-findings you accept or reject, why, and any remaining work. Distinguish an
+findings you accept or reject, why, any remaining work, the result state,
+evidence directory and any verified session ID. Distinguish an
 unavailable provider, a refused action, an uncertain outcome, a returned answer
 and a completed review. Do not infer completion from exit status or returned
 text, widen permissions, or automatically retry an uncertain call.
