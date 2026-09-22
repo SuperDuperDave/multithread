@@ -101,6 +101,8 @@ class _Driver:
         self.envelope["initial_message_uuid"] = identifier
         self.initial = identifier
         self.submit(identifier, self.task, initial=True)
+        # The queued task has not yet crossed the native stdin pipe.
+        self.envelope["task_delivery"] = "in_progress"
 
     def submit(self, identifier, text, initial=False):
         frame = {"type": "user", "uuid": identifier, "session_id": self.requested,
@@ -122,10 +124,14 @@ class _Driver:
         self.flushed += count
         while self.marks and self.marks[0][0] <= self.flushed:
             self.inputs[self.marks.pop(0)[1]]["written"] = True
+        if self.inputs[self.initial]["written"]:
+            self.envelope["task_delivery"] = "written"
 
     def unwritable(self):
         """Undeliverable bytes stay undelivered; a later result never covers them."""
         self.envelope["native_input_write_error"] = "the native input pipe closed with unwritten bytes"
+        if not self.inputs[self.initial]["written"]:
+            self.envelope["task_delivery"] = "uncertain"
         self.marks.clear()
         del self.outgoing[:]
         self.close_stdin()

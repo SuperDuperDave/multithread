@@ -2,6 +2,7 @@
 
 import fcntl
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -9,12 +10,13 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stderr
 from unittest import mock
 import uuid
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
-from relay_runtime import claude_peer, native_io
+from relay_runtime import claude_peer, native_io, provider
 
 SESSION = "10000000-0000-4000-8000-000000000001"
 OTHER_SESSION = "20000000-0000-4000-8000-000000000002"
@@ -228,6 +230,30 @@ class ClaudeProtocolTests(unittest.TestCase):
         self.assertEqual(1, len(submitted))
         self.assertEqual(self.task, submitted[0]["message"]["content"])
         self.assert_raw(envelope, directory)
+
+    def test_waiting_feedback_follows_actual_initial_pipe_write(self):
+        envelope = {"state": "uncertain", "provider": "claude",
+                    "requested_session_id": SESSION}
+        driver = claude_peer._Driver(mock.Mock(), b"ARTIFICIAL-PRIVATE-TASK", str(self.repo),
+                                     None, envelope, 600, None)
+        driver.start()
+        self.assertEqual("in_progress", envelope["task_delivery"])
+        size = driver.marks[0][0]
+        feedback = provider._WaitingFeedback(0, 600, envelope, None)
+        stderr = io.StringIO()
+        with (redirect_stderr(stderr),
+              mock.patch.object(provider.time, "monotonic", side_effect=[30, 60, 90])):
+            feedback()
+            driver.wrote(size - 1)
+            feedback()
+            driver.wrote(1)
+            feedback()
+        lines = stderr.getvalue().splitlines()
+        self.assertEqual(3, len(lines))
+        self.assertTrue(all("writing task to provider stdin" in line for line in lines[:2]))
+        self.assertIn("task written to provider stdin; waiting for result", lines[2])
+        self.assertNotIn("ARTIFICIAL-PRIVATE", stderr.getvalue())
+        self.assertEqual("written", envelope["task_delivery"])
 
     def test_initial_task_returns_the_exact_final_answer_with_native_identity(self):
         control = Control()
