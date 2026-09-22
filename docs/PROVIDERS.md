@@ -51,7 +51,9 @@ retains only the supported event name and exact session/prompt/turn identifiers.
 Prompt text, assistant responses, transcript paths, supplied working-directory
 paths, permission modes, tool arguments and credentials are not stored or used
 as authority. Lifecycle records additionally contain sanitized Git identity from
-the admitted checkout, so do not publish a live ledger as a demonstration asset.
+the admitted checkout. In a new repository before its first commit, they omit
+commit metadata until a commit exists. Do not publish a live ledger as a
+demonstration asset.
 
 ## Lifecycle behavior
 

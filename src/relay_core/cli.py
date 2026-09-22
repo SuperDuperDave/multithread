@@ -566,24 +566,33 @@ def _sanitized_hook_event(
 def _git_identity(repo: Path) -> dict[str, str]:
     env = _clean_git_env()
 
-    def git(*parts: str) -> str:
+    def git(*parts: str, allow_failure: bool = False):
         result = subprocess.run(
             ["git", "-C", str(repo), *parts],
-            check=True,
+            check=not allow_failure,
             capture_output=True,
             text=True,
             timeout=5,
             env=env,
         )
-        return result.stdout.strip()
+        return result if allow_failure else result.stdout.strip()
 
     branch = git("branch", "--show-current") or "detached"
-    commit = git("rev-parse", "HEAD")
+    head = git("rev-parse", "--verify", "HEAD^{commit}", allow_failure=True)
+    if head.returncode:
+        # An unborn branch has no commit to report. A broken or non-commit HEAD
+        # must still fail rather than masquerade as that ordinary starting state.
+        ref = git("symbolic-ref", "-q", "HEAD")
+        if git("show-ref", "--verify", "--quiet", ref, allow_failure=True).returncode != 1:
+            head.check_returncode()
+        commit = None
+    else:
+        commit = head.stdout.strip()
     root = Path(git("rev-parse", "--path-format=absolute", "--show-toplevel")).resolve()
     common = Path(git("rev-parse", "--path-format=absolute", "--git-common-dir")).resolve()
     primary = common.parent if common.name == ".git" else root
     worktree = "primary" if root == primary else "linked"
-    return {"branch": branch, "commit": commit, "worktree": worktree}
+    return {"branch": branch, **({"commit": commit} if commit else {}), "worktree": worktree}
 
 
 def _resolve_commit_capsule(repo: Path, revision: str) -> dict[str, str]:
