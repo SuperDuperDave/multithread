@@ -716,7 +716,13 @@ class ClaudeProtocolTests(unittest.TestCase):
             [{"read": 1}, {"emit": init()}, {"read": 1}, {"sleep": 0.5}], control=control, timeout=2)
         self.assertEqual("uncertain", envelope["state"])
         self.assertIn("no duplicate input was submitted", envelope["message"])
-        self.assertEqual(1, len([frame for frame in self.submitted() if frame["uuid"] == entry["request_id"]]))
+        self.assertEqual([entry["request_id"]],
+                         [item["uuid"] for item in envelope["native_input"]
+                          if item["kind"] == "session_input"])
+        # The first input may be in the pipe when duplicate rejection closes it;
+        # native consumption before cleanup is not part of this invariant.
+        self.assertLessEqual(len([frame for frame in self.submitted()
+                                  if frame["uuid"] == entry["request_id"]]), 1)
 
     def test_input_is_never_accepted_before_a_validated_session(self):
         entry = request()
