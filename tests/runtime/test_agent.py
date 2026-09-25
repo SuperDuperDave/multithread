@@ -115,6 +115,25 @@ class MuseAgentTests(unittest.TestCase):
         self.assertEqual((code, result["state"], result["adapter_exit_code"]), (1, "uncertain", 3))
         self.assertIn("synthetic expired token", error.getvalue())
 
+    def test_bad_success_receipt_keeps_safe_bounded_diagnostics(self):
+        self.client.write_text("import sys\nsys.stderr.write('x' * 5000 + '\\x1b')\n"
+                               "print('{}')\n")
+        self.run_agent("register", "Buddy", "--client", str(self.client))
+        error = io.StringIO()
+        with redirect_stderr(error):
+            code, result = self.run_agent("send", "Buddy", str(self.base / "packet.json"))
+        self.assertEqual((code, result["state"]), (1, "uncertain"))
+        self.assertEqual(error.getvalue().count("x"), 4095)
+        self.assertIn("\\u001b", error.getvalue())
+        self.assertNotIn("\x1b", error.getvalue())
+
+    def test_adapter_main_module_identity_supports_pickle(self):
+        self.client.write_text("import json, pickle\nclass Packet: pass\n"
+                               "pickle.dumps(Packet())\nprint(json.dumps({'ok': True}))\n")
+        self.run_agent("register", "Buddy", "--client", str(self.client))
+        code, result = self.run_agent("project", "Buddy")
+        self.assertEqual((code, result["result"]["ok"]), (0, True))
+
     def test_timeout_distinguishes_uncertain_send_from_unavailable_read(self):
         self.run_agent("register", "Buddy", "--client", str(self.client))
         with mock.patch.object(agent.subprocess, "run", side_effect=subprocess.TimeoutExpired("adapter", 300)):

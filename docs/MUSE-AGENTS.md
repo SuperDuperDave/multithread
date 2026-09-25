@@ -21,8 +21,9 @@ the Muse runtime, contact the bridge during registration or enroll a project.
 The adapter must support `--repo CHECKOUT project|check|prepare|send|status|replies`
 and return a JSON object on successful calls. It owns its own credentials and
 transport. The router executes the exact registered single-file Python bytes
-under `-I -S -B`, so ambient `PYTHONPATH`, user site-packages and sibling
-modules are unavailable through normal imports. An adapter may deliberately
+under `-I -S -B`, so only Python's standard library is importable through
+normal imports; ambient `PYTHONPATH`, site-packages and sibling modules are
+unavailable. An adapter may deliberately
 open other files or launch tools; review those dependencies and their trust
 boundary before registration. Keep the source in a location where other
 accounts cannot alter it while you review and register it. After an adapter

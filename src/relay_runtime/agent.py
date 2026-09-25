@@ -29,7 +29,8 @@ descriptor, path = int(sys.argv[1]), sys.argv[2]
 with os.fdopen(descriptor, "rb") as source:
     body = source.read()
 sys.argv = [path, *sys.argv[3:]]
-exec(compile(body, path, "exec"), {"__name__": "__main__", "__file__": path})
+globals()["__file__"] = path
+exec(compile(body, path, "exec"), globals())
 """
 
 
@@ -162,7 +163,9 @@ def _show_adapter_errors(errors):
     errors.seek(max(0, size - _MAX_ERROR_TAIL))
     tail = errors.read(_MAX_ERROR_TAIL).decode("utf-8", errors="replace")
     if tail:
-        print("adapter diagnostics (private, bounded tail):\n" + tail, file=sys.stderr)
+        safe = "".join(char if char in "\n\t" or char.isprintable()
+                       else f"\\u{ord(char):04x}" for char in tail)
+        print("adapter diagnostics (private, bounded tail):\n" + safe, file=sys.stderr)
 
 
 def _operate(item, args):
@@ -191,6 +194,14 @@ def _operate(item, args):
             response = output.read(_MAX_RESPONSE + 1) if size <= _MAX_RESPONSE else None
             if result.returncode:
                 _show_adapter_errors(errors)
+            try:
+                parsed = json.loads(response) if response is not None else None
+            except (ValueError, UnicodeError):
+                parsed = None
+            if not result.returncode and (not isinstance(parsed, dict) or
+                                           args.action == "send" and
+                                           not _TASK_ID.fullmatch(str(parsed.get("task_id", "")))):
+                _show_adapter_errors(errors)
     except (OSError, subprocess.TimeoutExpired) as exc:
         state = "uncertain" if args.action == "send" else "unavailable"
         return {"kind": "muse", "nickname": item["nickname"], "operation": args.action,
@@ -201,10 +212,6 @@ def _operate(item, args):
         return {"kind": "muse", "nickname": item["nickname"], "operation": args.action,
                 "state": state, "adapter_exit_code": result.returncode,
                 "message": "adapter did not return a valid result; inspect its own diagnostics before retrying"}, 1
-    try:
-        parsed = json.loads(response) if response is not None else None
-    except (ValueError, UnicodeError):
-        parsed = None
     if not isinstance(parsed, dict):
         return {"kind": "muse", "nickname": item["nickname"], "operation": args.action,
                 "state": "uncertain" if args.action == "send" else "unavailable",
