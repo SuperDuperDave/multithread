@@ -115,6 +115,13 @@ helps an agent discover when and how to use the installed system. Add it to a
 provider's project-local skill location only if you want that guidance available
 there; [setup explains the locations](docs/SETUP.md#ask-your-coding-agent).
 
+If you also work with a Muse agent, identify that agent by its nickname and use
+the optional [Muse agent guide](docs/MUSE-AGENTS.md) and
+[skill](skills/muse-agent/SKILL.md). On a release with `multithread agent muse`,
+register one reviewed adapter for that nickname across projects. A Muse bridge
+is a separate asynchronous transport; Multithread does not install it or route
+it through native `peer`. Projects without a Muse agent need no bridge setup.
+
 The [manual two-worktree walkthrough](docs/PROVIDERS.md#try-a-review-across-two-worktrees)
 remains available for separate sessions with manual wakes and explicit Git work.
 

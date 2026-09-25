@@ -35,6 +35,7 @@ PAYLOAD_MODULES = {
     "relay_runtime.confinement": "relay_runtime/confinement.py",
     "relay_runtime.cli": "relay_runtime/cli.py",
     "relay_runtime.provider": "relay_runtime/provider.py",
+    "relay_runtime.agent": "relay_runtime/agent.py",
     "relay_runtime.codex_peer": "relay_runtime/codex_peer.py",
     "relay_runtime.claude_peer": "relay_runtime/claude_peer.py",
     "relay_runtime.native_io": "relay_runtime/native_io.py",
