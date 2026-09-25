@@ -60,7 +60,8 @@ def _parser():
             config.add_argument("--client", required=True, choices=("codex", "claude"))
             config.add_argument("--launcher-name", choices=("multithread", "relay"), default="relay",
                                 help="exact installed hook entry; native helpers select multithread. Default relay preserves the existing configuration API")
-            for name, description in (("launch", "review hooks and start an interactive native provider"),
+            for name, description in (("agent", "use an optional account-registered agent adapter"),
+                                      ("launch", "review hooks and start an interactive native provider"),
                                       ("peer", "call Codex or Claude and return its result to this task"),
                                       ("setup", "check readiness or explicitly enroll this repository"),
                                       ("update", "review and explicitly install a public release update")):
@@ -339,14 +340,14 @@ def main(argv=None, *, registry=None, command_alias_check=None):
             boundary += 1
         else:
             break
-    helper = boundary < len(raw) and raw[boundary] in {"setup", "update"}
+    helper = boundary < len(raw) and raw[boundary] in {"agent", "setup", "update"}
     args = _parser().parse_args(raw[:boundary + 1] if helper else raw)
     if helper:
         args.provider_args = raw[boundary + 1:]
     try:
         if args.state_home is not None or "RELAY_HOME" in os.environ:
             raise StateError("installed Multithread refuses state-directory overrides")
-        if args.command in {"launch", "peer", "setup", "update"}:
+        if args.command in {"agent", "launch", "peer", "setup", "update"}:
             # A compatibility invocation must verify the preferred alias before
             # any helper executes it. Keep hooks and read-only runtime diagnosis
             # outside this check; an unavailable observation stays nonblocking.
@@ -359,16 +360,19 @@ def main(argv=None, *, registry=None, command_alias_check=None):
             # Each helper obtains its config via a separate admitted ledger worker;
             # never launch a provider in the worker's closed environment/Landlock.
             from .provider import launch_main, peer_main
+            from .agent import agent_main
             from .setup import setup_main
             from .update import update_main
             forwarded = list(args.provider_args)
             if args.native_help:
                 forwarded += ["--help"]
-            if args.repo is not None:
+            if args.repo is not None and (args.command != "agent" or
+                                          forwarded[:2] not in (["muse", "list"], ["muse", "inspect"],
+                                                                 ["muse", "register"], ["muse", "remove"])):
                 forwarded += ["--repo", args.repo]
-            if args.json:
+            if args.json and args.command != "agent":
                 forwarded += ["--json"]
-            return {"launch": launch_main, "peer": peer_main,
+            return {"agent": agent_main, "launch": launch_main, "peer": peer_main,
                     "setup": setup_main, "update": update_main}[args.command](forwarded)
         if args.command == "provider-hook":
             args.provider_payload = _provider_input(args.client)

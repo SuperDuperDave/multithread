@@ -32,6 +32,11 @@ Choose the interaction that fits the task:
   Hooks provide this session's coordination identity and bounded pending state.
   Respect exact claim ownership, immutable commit handoffs, explicit ACKs,
   documented manual wakes, and the operator's Git responsibilities.
+- If the user has a configured Muse agent, identify it by nickname and use the
+  optional [Muse agent skill](../muse-agent/SKILL.md). Its bridge has an
+  asynchronous custody and reply lifecycle; it is separate from native
+  `multithread peer` and from the local coordination ledger. Check whether the
+  installed release exposes `multithread agent muse`; older releases do not.
 
 Before retrying an uncertain operation, inspect its receipt and durable state.
 A written task is not proven consumed; a returned answer is not automatically a

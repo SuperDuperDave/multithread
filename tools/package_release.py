@@ -30,6 +30,7 @@ RUNTIME_FILES = frozenset({
     "relay_runtime/admission.py", "relay_runtime/cli.py",
     "relay_runtime/confinement.py", "relay_runtime/enrollment.py",
     "relay_runtime/provider.py", "relay_runtime/codex_peer.py", "relay_runtime/peer_control.py",
+    "relay_runtime/agent.py",
     "relay_runtime/claude_peer.py", "relay_runtime/native_io.py",
     "relay_runtime/setup.py", "relay_runtime/update.py",
 })

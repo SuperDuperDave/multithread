@@ -82,6 +82,9 @@ assert installed["activation"]["release_id"] == release_id, installed
 assert not installed["enrolls_projects"] and not installed["changes_hooks"] and not installed["network_access"]
 assert launcher.is_symlink()
 assert compatibility_launcher.is_symlink() and os.readlink(launcher) == str(compatibility_launcher)
+agents = call([str(launcher), "agent", "muse", "list"])
+assert agents == {"kind": "muse", "agents": []}, agents
+assert not (home / ".local/share/relay/agents.json").exists()
 assert not (home / ".local/share/relay/enrollments").exists()
 assert not (project / ".relay").exists()
 assert snapshot(foreign) == before_foreign, "installation wrote ambient HOME"
@@ -97,6 +100,41 @@ assert "exec /usr/bin/python3 -I -S -B -c " in launch_body
 assert release_id in launch_body and record["bootstrap"]["sha256"] in launch_body
 print(json.dumps({"plan": plan, "installed": installed, "network_interfaces": interfaces,
                   "account_home": str(home), "bootstrap_sha256": record["bootstrap"]["sha256"]}))
+"""
+
+
+_AGENT = _COMMON + r"""
+assert not pathlib.Path("/source").exists()
+assert not pathlib.Path("/bundle").exists()
+client = pathlib.Path("/tmp/muse-client.py")
+calls = pathlib.Path("/tmp/muse-client-calls")
+client.write_text('import json, pathlib, sys\n'
+                  'pathlib.Path("/tmp/muse-client-calls").write_text("called")\n'
+                  'print(json.dumps({"repo": sys.argv[2], "action": sys.argv[3]}))\n')
+registry = home / ".local/share/relay/agents.json"
+dry = call([str(launcher), "agent", "muse", "register", "Buddy", "--client", str(client), "--dry-run"])
+assert dry["registered"] is False and not registry.exists(), dry
+registered = call([str(launcher), "agent", "muse", "register", "Buddy", "--client", str(client)])
+assert registered["registered"] and registered["changed"], registered
+assert registry.stat().st_mode & 0o777 == 0o600
+assert call([str(launcher), "agent", "muse", "list"])["agents"] == ["Buddy"]
+assert call([str(launcher), "agent", "muse", "inspect", "buddy"])["sha256"] == registered["sha256"]
+project_result = call([str(launcher), "agent", "muse", "project", "BUDDY"])
+assert project_result["result"] == {"repo": str(project), "action": "project"}, project_result
+global_repo = call([str(launcher), "--repo", str(project), "agent", "muse", "project", "Buddy"])
+assert global_repo["result"] == project_result["result"], global_repo
+sent = subprocess.run([str(launcher), "agent", "muse", "send", "Buddy", "/tmp/synthetic-packet"],
+                      cwd=project, text=True, capture_output=True, timeout=15)
+assert sent.returncode == 1 and json.loads(sent.stdout)["state"] == "uncertain", sent
+assert calls.read_text() == "called"
+calls.unlink()
+client.write_text(client.read_text() + "# changed\n")
+refused = subprocess.run([str(launcher), "agent", "muse", "project", "Buddy"], cwd=project,
+                         text=True, capture_output=True, timeout=15)
+assert refused.returncode == 1 and "adapter bytes changed" in refused.stderr, refused
+assert not calls.exists(), "changed adapter executed"
+print(json.dumps({"nickname": registered["nickname"], "registry_mode": oct(registry.stat().st_mode & 0o777),
+                  "project_routed": True, "send_uncertain": True, "changed_client_refused": True}))
 """
 
 
@@ -475,6 +513,21 @@ class PublicProfileTests(unittest.TestCase):
             self.skipTest("bwrap namespaces unavailable: " + result.stderr.strip())
         self.assertEqual(0, result.returncode, result.stdout + result.stderr)
         return json.loads(result.stdout)
+
+    def test_optional_muse_adapter_in_fresh_installed_account(self):
+        built = subprocess.run(
+            ["/usr/bin/python3", "-I", "-S", "-B", str(SOURCE / "relay_bootstrap.py"),
+             "build-release", "--output", str(self.bundle), "--version", "0.0.0-muse-fixture"],
+            env=self.env, text=True, capture_output=True, timeout=20)
+        self.assertEqual(0, built.returncode, built.stdout + built.stderr)
+        release_id = json.loads(built.stdout)["release_id"]
+        self.sandbox(_INSTALL, release_id, include_source=True)
+        result = self.sandbox(_AGENT, release_id, include_source=False)
+        self.assertEqual("Buddy", result["nickname"])
+        self.assertEqual("0o600", result["registry_mode"])
+        self.assertTrue(result["project_routed"])
+        self.assertTrue(result["send_uncertain"])
+        self.assertTrue(result["changed_client_refused"])
 
     def test_public_installed_ledger_in_fresh_rootless_account(self):
         built = subprocess.run(
