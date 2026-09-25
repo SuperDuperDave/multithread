@@ -121,6 +121,11 @@ assert call([str(launcher), "agent", "muse", "list"])["agents"] == ["Buddy"]
 assert call([str(launcher), "agent", "muse", "inspect", "buddy"])["sha256"] == registered["sha256"]
 project_result = call([str(launcher), "agent", "muse", "project", "BUDDY"])
 assert project_result["result"] == {"repo": str(project), "action": "project"}, project_result
+global_repo = call([str(launcher), "--repo", str(project), "agent", "muse", "project", "Buddy"])
+assert global_repo["result"] == project_result["result"], global_repo
+sent = subprocess.run([str(launcher), "agent", "muse", "send", "Buddy", "/tmp/synthetic-packet"],
+                      cwd=project, text=True, capture_output=True, timeout=15)
+assert sent.returncode == 1 and json.loads(sent.stdout)["state"] == "uncertain", sent
 assert calls.read_text() == "called"
 calls.unlink()
 client.write_text(client.read_text() + "# changed\n")
@@ -129,7 +134,7 @@ refused = subprocess.run([str(launcher), "agent", "muse", "project", "Buddy"], c
 assert refused.returncode == 1 and "adapter bytes changed" in refused.stderr, refused
 assert not calls.exists(), "changed adapter executed"
 print(json.dumps({"nickname": registered["nickname"], "registry_mode": oct(registry.stat().st_mode & 0o777),
-                  "project_routed": True, "changed_client_refused": True}))
+                  "project_routed": True, "send_uncertain": True, "changed_client_refused": True}))
 """
 
 
@@ -521,6 +526,7 @@ class PublicProfileTests(unittest.TestCase):
         self.assertEqual("Buddy", result["nickname"])
         self.assertEqual("0o600", result["registry_mode"])
         self.assertTrue(result["project_routed"])
+        self.assertTrue(result["send_uncertain"])
         self.assertTrue(result["changed_client_refused"])
 
     def test_public_installed_ledger_in_fresh_rootless_account(self):

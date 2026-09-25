@@ -1,10 +1,11 @@
 """Optional Muse adapter routing with isolated account state and synthetic clients."""
 
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 import io
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -73,6 +74,61 @@ class MuseAgentTests(unittest.TestCase):
         with mock.patch("sys.stderr", error):
             self.assertEqual(agent.agent_main(["muse", "project", "Buddy"], registry_path=self.registry), 1)
         self.assertIn("adapter bytes changed", error.getvalue())
+        self.assertFalse(self.calls.exists())
+
+    def test_ambient_pythonpath_cannot_replace_adapter_imports(self):
+        shadow = self.base / "shadow"
+        shadow.mkdir()
+        marker = self.base / "shadow-imported"
+        (shadow / "json.py").write_text(f"from pathlib import Path\nPath({str(marker)!r}).write_text('loaded')\n")
+        self.run_agent("register", "Buddy", "--client", str(self.client))
+        with mock.patch.dict(os.environ, {"PYTHONPATH": str(shadow)}):
+            code, result = self.run_agent("project", "Buddy")
+        self.assertEqual(code, 0)
+        self.assertEqual(result["result"]["ok"], True)
+        self.assertFalse(marker.exists())
+
+    def test_adapter_runs_the_held_verified_bytes_after_source_changes(self):
+        self.run_agent("register", "Buddy", "--client", str(self.client))
+        original_run = subprocess.run
+
+        def change_before_child(command, **kwargs):
+            self.client.write_text("raise RuntimeError('changed source executed')\n")
+            return original_run(command, **kwargs)
+
+        with mock.patch.object(agent.subprocess, "run", side_effect=change_before_child):
+            code, result = self.run_agent("project", "Buddy")
+        self.assertEqual(code, 0)
+        self.assertEqual(result["result"]["ok"], True)
+        error = io.StringIO()
+        with redirect_stderr(error):
+            self.assertEqual(self.run_agent("project", "Buddy")[0], 1)
+        self.assertIn("adapter bytes changed", error.getvalue())
+
+    def test_adapter_failure_keeps_bounded_diagnostics_and_uncertain_send(self):
+        self.client.write_text("import sys\nprint('synthetic expired token', file=sys.stderr)\n"
+                               "raise SystemExit(3)\n")
+        self.run_agent("register", "Buddy", "--client", str(self.client))
+        error = io.StringIO()
+        with redirect_stderr(error):
+            code, result = self.run_agent("send", "Buddy", str(self.base / "packet.json"))
+        self.assertEqual((code, result["state"], result["adapter_exit_code"]), (1, "uncertain", 3))
+        self.assertIn("synthetic expired token", error.getvalue())
+
+    def test_timeout_distinguishes_uncertain_send_from_unavailable_read(self):
+        self.run_agent("register", "Buddy", "--client", str(self.client))
+        with mock.patch.object(agent.subprocess, "run", side_effect=subprocess.TimeoutExpired("adapter", 300)):
+            send_code, send = self.run_agent("send", "Buddy", str(self.base / "packet.json"))
+            read_code, read = self.run_agent("project", "Buddy")
+        self.assertEqual((send_code, send["state"]), (1, "uncertain"))
+        self.assertEqual((read_code, read["state"]), (1, "unavailable"))
+
+    def test_malformed_remote_task_id_refuses_before_adapter(self):
+        self.run_agent("register", "Buddy", "--client", str(self.client))
+        error = io.StringIO()
+        with redirect_stderr(error):
+            self.assertEqual(self.run_agent("status", "Buddy", "not-a-uuid")[0], 1)
+        self.assertIn("exact server task UUID", error.getvalue())
         self.assertFalse(self.calls.exists())
 
     def test_bad_or_missing_reply_is_not_completion(self):

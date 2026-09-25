@@ -20,8 +20,14 @@ nickname in a private account registry. It does not copy credentials, configure
 the Muse runtime, contact the bridge during registration or enroll a project.
 The adapter must support `--repo CHECKOUT project|check|prepare|send|status|replies`
 and return a JSON object on successful calls. It owns its own credentials and
-transport. Registration pins its exact bytes; after an adapter update, remove
-the old registration and register the reviewed new bytes explicitly.
+transport. The router executes the exact registered single-file Python bytes
+under `-I -S -B`, so ambient `PYTHONPATH`, user site-packages and sibling
+modules are unavailable through normal imports. An adapter may deliberately
+open other files or launch tools; review those dependencies and their trust
+boundary before registration. Keep the source in a location where other
+accounts cannot alter it while you review and register it. After an adapter
+update, remove the old registration and register the reviewed new bytes
+explicitly.
 
 ```sh
 multithread agent muse register Buddy --client /absolute/path/to/reviewed-client.py --dry-run
@@ -42,11 +48,15 @@ multithread agent muse status Buddy TASK_UUID --repo /path/to/project
 multithread agent muse replies Buddy TASK_UUID --repo /path/to/project
 ```
 
-`register` and `prepare` do not contact the agent. `send` does. Check that the
-packet directory is Git-ignored and review its exact payload and destination.
+`register` does not run the adapter or contact the agent. The current Buddy
+adapter prepares locally, while another adapter's `prepare` may have effects;
+review its implementation before use. `send` may contact the agent. Check that
+the packet directory is Git-ignored and review its exact payload and destination.
 The router reports an uncertain send when the adapter does not return a valid
 receipt; inspect the retained packet and remote state before retrying. It does
-not interpret a returned body as a completed task.
+not interpret a returned body as a completed task. On adapter failure, a
+bounded tail of its stderr is shown as private diagnostics; keep that output
+out of public reports and inspect it when a send outcome is uncertain.
 
 ## Identity and availability
 

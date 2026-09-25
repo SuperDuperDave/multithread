@@ -23,6 +23,14 @@ _TASK_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]
 _MAX_REGISTRY = 64 * 1024
 _MAX_CLIENT = 1024 * 1024
 _MAX_RESPONSE = 16 * 1024 * 1024
+_MAX_ERROR_TAIL = 4096
+_ADAPTER_LOADER = """import os, sys
+descriptor, path = int(sys.argv[1]), sys.argv[2]
+with os.fdopen(descriptor, "rb") as source:
+    body = source.read()
+sys.argv = [path, *sys.argv[3:]]
+exec(compile(body, path, "exec"), {"__name__": "__main__", "__file__": path})
+"""
 
 
 class AgentError(Exception):
@@ -102,14 +110,22 @@ def _save(path, data):
             os.unlink(temporary)
 
 
-def _client_digest(raw):
+def _client_bytes(raw):
     path = Path(raw)
     if not path.is_absolute() or path.resolve(strict=True) != path:
         raise AgentError("client must be an absolute path without symlink components")
-    info = path.lstat()
-    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_size > _MAX_CLIENT:
-        raise AgentError("client must be a bounded regular file owned by this account")
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_size > _MAX_CLIENT:
+            raise AgentError("client must be a bounded regular file owned by this account")
+        with os.fdopen(descriptor, "rb", closefd=False) as stream:
+            body = stream.read(_MAX_CLIENT + 1)
+        if len(body) > _MAX_CLIENT:
+            raise AgentError("client exceeds the adapter size limit")
+        return body
+    finally:
+        os.close(descriptor)
 
 
 def _nickname(raw):
@@ -141,22 +157,40 @@ def _parser():
     return parser
 
 
+def _show_adapter_errors(errors):
+    size = errors.tell()
+    errors.seek(max(0, size - _MAX_ERROR_TAIL))
+    tail = errors.read(_MAX_ERROR_TAIL).decode("utf-8", errors="replace")
+    if tail:
+        print("adapter diagnostics (private, bounded tail):\n" + tail, file=sys.stderr)
+
+
 def _operate(item, args):
-    observed = _client_digest(item["client"])
-    if observed != item["sha256"]:
+    body = _client_bytes(item["client"])
+    if hashlib.sha256(body).hexdigest() != item["sha256"]:
         raise AgentError("registered adapter bytes changed; inspect and register the reviewed client again")
     if args.action in {"status", "replies"} and not _TASK_ID.fullmatch(args.value):
         raise AgentError("expected an exact server task UUID")
-    command = [sys.executable, item["client"], "--repo", str(args.repo.absolute()), args.action]
+    command = [sys.executable, "-I", "-S", "-B", "-c", _ADAPTER_LOADER,
+               None, item["client"], "--repo", str(args.repo.absolute()), args.action]
     if hasattr(args, "value"):
         command.append(args.value)
     try:
-        with tempfile.TemporaryFile() as output, tempfile.TemporaryFile() as errors:
-            result = subprocess.run(command, stdout=output, stderr=errors,
-                                    timeout=300, check=False)
+        with tempfile.TemporaryFile() as held, tempfile.TemporaryFile() as output, tempfile.TemporaryFile() as errors:
+            held.write(body)
+            held.seek(0)
+            command[6] = str(held.fileno())
+            try:
+                result = subprocess.run(command, pass_fds=(held.fileno(),), stdout=output,
+                                        stderr=errors, timeout=300, check=False)
+            except subprocess.TimeoutExpired:
+                _show_adapter_errors(errors)
+                raise
             size = output.tell()
             output.seek(0)
-            body = output.read(_MAX_RESPONSE + 1) if size <= _MAX_RESPONSE else None
+            response = output.read(_MAX_RESPONSE + 1) if size <= _MAX_RESPONSE else None
+            if result.returncode:
+                _show_adapter_errors(errors)
     except (OSError, subprocess.TimeoutExpired) as exc:
         state = "uncertain" if args.action == "send" else "unavailable"
         return {"kind": "muse", "nickname": item["nickname"], "operation": args.action,
@@ -168,7 +202,7 @@ def _operate(item, args):
                 "state": state, "adapter_exit_code": result.returncode,
                 "message": "adapter did not return a valid result; inspect its own diagnostics before retrying"}, 1
     try:
-        parsed = json.loads(body) if body is not None else None
+        parsed = json.loads(response) if response is not None else None
     except (ValueError, UnicodeError):
         parsed = None
     if not isinstance(parsed, dict):
@@ -192,7 +226,7 @@ def agent_main(argv=None, *, registry_path=None):
         else:
             key = _nickname(args.nickname)
             if args.action == "register":
-                digest = _client_digest(str(args.client))
+                digest = hashlib.sha256(_client_bytes(str(args.client))).hexdigest()
                 proposed = {"kind": "muse", "nickname": args.nickname, "client": str(args.client), "sha256": digest}
                 prior = data["agents"].get(key)
                 if prior is not None and prior != proposed:
