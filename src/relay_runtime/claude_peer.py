@@ -48,6 +48,7 @@ class _Driver:
         self.envelope = envelope
         self.requested = envelope.get("requested_session_id") or resume
         self.deadline = time.monotonic() + timeout
+        self.started = time.monotonic()
         self.timeout = timeout
         self.control = control
         self.session = None
@@ -76,6 +77,9 @@ class _Driver:
         self.observation_only = False
         self.outcome_recorded = False
         self.had_problem = False
+        self.assistant_messages = 0
+        self.tool_requests = 0
+        self.result_frames = 0
         self.envelope.update(state="uncertain", requested_session_id=self.requested,
                              needs_attention=True)
 
@@ -90,6 +94,17 @@ class _Driver:
             collection.append(value)
         else:
             self.details_truncated = True
+
+    def progress(self, event):
+        """Expose only attributed native frame counts and timing, never content."""
+        self.envelope["native_progress"] = {
+            "last_event": event,
+            "observed_at_seconds": round(max(0, time.monotonic() - self.started), 3),
+            "assistant_messages": self.assistant_messages,
+            "tool_requests": self.tool_requests,
+            "subagent_frames": self.subagent_frames,
+            "result_frames": self.result_frames,
+        }
 
     # --- submitted input -------------------------------------------------
 
@@ -225,6 +240,7 @@ class _Driver:
         """Only the requested main session answers this call's input."""
         if value.get("parent_tool_use_id") is not None:
             self.subagent_frames += 1
+            self.progress("subagent_frame")
             return False
         session = value.get("session_id")
         if value.get("type") in ("assistant", "user", "result") and session is None:
@@ -252,6 +268,21 @@ class _Driver:
                           ("permissionMode", "native_permission_mode")):
             if identity(value.get(name)):
                 self.envelope[key] = value[name]
+        if identity(value.get("model")):
+            requested = self.envelope.get("requested_model")
+            self.envelope["model_observation"] = {
+                "source": "claude_system_init", "reported_model": value["model"],
+                "relation": "not_requested" if requested is None else
+                            "same_literal" if requested == value["model"] else
+                            "different_name_unverified"}
+        else:
+            # Keep the last reported name but explicitly mark that this init
+            # supplied no model metadata. Do not infer its current model.
+            if self.envelope.get("model_observation", {}).get("source") == "claude_system_init":
+                self.envelope["model_observation"]["relation"] = "prior_init_only"
+            else:
+                self.envelope["model_observation"] = {"source": "unavailable", "reported_model": None,
+                                                      "relation": "unknown"}
         self.session = session
         self.envelope["session_id"] = session
         # Streaming resume and native background turns can repeat init for the
@@ -260,6 +291,7 @@ class _Driver:
         # history. provider_version describes this init; legacy native settings
         # retain the latest supplied valid values.
         self.envelope["native_initialization_count"] = self.envelope.get("native_initialization_count", 0) + 1
+        self.progress("initialized")
         if first and self.control is not None and self.accepting and not self.observation_only:
             self.control.set_target(session, None)
 
@@ -282,6 +314,10 @@ class _Driver:
             # Reasoning and tool blocks are progress, not the turn's answer.
             if block["type"] == "text" and isinstance(block.get("text"), str):
                 text.append(block["text"])
+            if block["type"] == "tool_use":
+                self.tool_requests += 1
+        self.assistant_messages += 1
+        self.progress("assistant_message")
         joined = "".join(text)
         if joined and self.text_size < _MAX_PARTIAL:
             kept = joined[:_MAX_PARTIAL - self.text_size]
@@ -333,6 +369,8 @@ class _Driver:
         else:
             self.results_truncated = True
             self.results[-1] = record
+        self.result_frames += 1
+        self.progress("native_result")
         if related and success and not is_error and isinstance(text, str):
             self.answer = text
         # Later totals restate the same cumulative scope; they are never summed.

@@ -29,7 +29,8 @@ class PeerFollowUpTests(unittest.TestCase):
         fixture = self.fixture
         args = SimpleNamespace(client=client, report_entry=report_entry,
                                timeout=937, max_turns=37 if client == "claude" else None,
-                               live_input=client == "claude")
+                               live_input=client == "claude", model=None,
+                               effort=None, stream_progress=False)
         plan = {"repo": str(fixture.repo), "argv": [str(fixture.provider)],
                 "relay_plan": {"hook_command": shlex.join(
                     [str(fixture.relay), "--repo", str(fixture.repo), "provider-hook", "--client", client])}}
@@ -162,15 +163,15 @@ class PeerFollowUpTests(unittest.TestCase):
                 self.assertNotIn("follow_up_preparation", receipt)
 
     def test_final_receipt_failure_removes_preparation_from_returned_json(self):
-        record = provider._record
+        record = provider._atomic_record
 
-        def fail_final(directory, name, value):
+        def fail_final(directory, name, value, **kwargs):
             if name == "result.json":
                 self.assertIn("follow_up_preparation", value)
                 raise OSError("artificial final receipt failure")
-            return record(directory, name, value)
+            return record(directory, name, value, **kwargs)
 
-        with mock.patch.object(provider, "_record", side_effect=fail_final):
+        with mock.patch.object(provider, "_atomic_record", side_effect=fail_final):
             code, result, _ = self.fixture.invoke()
         self.assertEqual(1, code)
         self.assertEqual("returned", result["state"])

@@ -292,6 +292,33 @@ class ClaudeProtocolTests(unittest.TestCase):
         self.assertFalse((self.repo / "injected").exists())
         self.assert_raw(envelope, directory)
 
+    def test_requested_model_is_compared_only_to_a_native_init_literal(self):
+        envelope = {"provider": "claude", "requested_session_id": SESSION,
+                    "requested_model": "opus"}
+        driver = claude_peer._Driver(mock.Mock(), b"Review", str(self.repo), None,
+                                     envelope, 5, None)
+        driver.initialization(init(model="claude-opus-5-5", cwd=str(self.repo)))
+        self.assertEqual("different_name_unverified", envelope["model_observation"]["relation"])
+        self.assertEqual("claude-opus-5-5", envelope["model_observation"]["reported_model"])
+        driver.initialization(init(model="opus", cwd=str(self.repo)))
+        self.assertEqual("same_literal", envelope["model_observation"]["relation"])
+        driver.initialization(init(model=None, cwd=str(self.repo)))
+        self.assertEqual("prior_init_only", envelope["model_observation"]["relation"])
+        self.assertEqual("opus", envelope["model_observation"]["reported_model"])
+
+    def test_subagent_frame_advances_content_free_progress_without_attributing_answer(self):
+        envelope, _, _ = self.run_native([
+            {"read": 1}, {"emit": init()},
+            {"emit": assistant("ARTIFICIAL-PRIVATE-SUBAGENT", parent="toolu_1")},
+            {"emit": assistant("Main answer", uuids=["$uuid:0"])},
+            {"emit": result()}])
+        progress = envelope["native_progress"]
+        self.assertEqual("native_result", progress["last_event"])
+        self.assertEqual(1, progress["subagent_frames"])
+        self.assertEqual(1, progress["assistant_messages"])
+        self.assertEqual(1, progress["result_frames"])
+        self.assertNotIn("ARTIFICIAL-PRIVATE", json.dumps(progress))
+
     def test_resumed_session_uses_the_exact_supplied_identity(self):
         envelope, _, _ = self.run_native([{"read": 1}, {"emit": init()}, {"emit": result()}],
                                          resume=SESSION)
