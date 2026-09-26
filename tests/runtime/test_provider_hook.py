@@ -119,6 +119,56 @@ class ProviderHookTests(unittest.TestCase):
         self.assertEqual(protected, [snapshot(path) for path in self.protected] + [snapshot(foreign)])
         self.assertEqual(2, len(self.rows()))
 
+    def test_checkout_free_codex_hook_follows_the_session_directory(self):
+        """The generated Codex hook has no --repo: Codex runs it in the session's
+        working directory, and enrollment comes from that directory alone."""
+        git = ["/usr/bin/git", "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false",
+               "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid"]
+        alpha, beta, stray = (self.fixture.base / name for name in ("alpha", "beta", "unenrolled"))
+        for repo in (alpha, beta, stray):
+            subprocess.run(["/usr/bin/git", "init", "-q", str(repo)], check=True)
+            subprocess.run(git + ["-C", str(repo), "commit", "--allow-empty", "-qm", "Fixture"], check=True)
+        linked = self.fixture.base / "alpha-linked"
+        subprocess.run(git + ["-C", str(alpha), "worktree", "add", "-qb", "linked", str(linked)], check=True)
+        plain = self.fixture.base / "not-a-checkout"
+        plain.mkdir()
+        for repo in (alpha, beta):
+            self.assertTrue(self.fixture.success("init", repo=repo)["initialized"])
+
+        def ledger(repo):
+            return [(row["kind"], row["session"]) for row in self.fixture.success("events", repo=repo)]
+
+        def run(cwd, event, **fields):
+            # Payload paths name the other checkout; they must never select it.
+            payload = {"cwd": str(beta if cwd != beta else alpha), "transcript_path": str(beta), **fields}
+            return self.hook("codex", event, "moving-session", payload=payload, cwd=cwd)
+
+        context = self.context(run(alpha, "SessionStart"), "codex", "SessionStart", "moving-session")
+        self.assertIn(json.dumps(str(alpha)), context)
+        self.assertEqual([("session.started", "moving-session")], ledger(alpha))
+        self.assertEqual([], ledger(beta))
+        # A linked worktree shares its repository's ledger.
+        self.silent(run(linked, "Stop", turn_id="linked-turn", prompt_id="linked-prompt"))
+        self.assertEqual(("turn.completed", "moving-session"), ledger(alpha)[-1])
+        # The ledger follows the session's working checkout, including a resume
+        # elsewhere; it is never chosen by the hook command or payload.
+        before_alpha = ledger(alpha)
+        self.context(run(beta, "SessionStart", source="resume"), "codex", "SessionStart", "moving-session")
+        self.context(run(beta, "UserPromptSubmit", prompt_id="beta-prompt"), "codex", "UserPromptSubmit", "moving-session")
+        self.silent(run(beta, "Interrupt", turn_id="beta-turn"))
+        self.silent(run(beta, "SessionEnd"))
+        self.assertEqual(before_alpha, ledger(alpha))
+        self.assertEqual(["session.started", "turn.interrupted", "session.ended"],
+                         [kind for kind, _ in ledger(beta)])
+        # Unenrolled checkouts and plain directories degrade without state.
+        before = snapshot(self.fixture.base)
+        for directory in (stray, plain):
+            for event in ("SessionStart", "UserPromptSubmit", "Stop", "SessionEnd", "Interrupt"):
+                with self.subTest(directory=directory.name, event=event):
+                    self.silent(run(directory, event, turn_id="stray-turn"), degraded=True)
+        self.assertEqual(before, snapshot(self.fixture.base))
+        self.assertFalse((stray / ".relay").exists())
+
     def test_unborn_checkout_records_lifecycle_without_inventing_commit(self):
         unborn = self.fixture.base / "unborn-project"
         subprocess.run(["/usr/bin/git", "-c", "init.defaultBranch=unborn-fixture",

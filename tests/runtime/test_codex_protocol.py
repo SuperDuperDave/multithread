@@ -158,7 +158,8 @@ class CodexProtocolTests(unittest.TestCase):
             directory = self.base / name.lower()
             directory.mkdir(mode=0o700)
             self.environment[name] = str(directory)
-        hook = shlex.join([str(self.relay), "--repo", str(self.repo), "provider-hook", "--client", "codex"])
+        # Codex hooks name no checkout: trust is keyed by command text, not checkout.
+        hook = shlex.join([str(self.relay), "provider-hook", "--client", "codex"])
         self.native_arguments = []
         events = ["SessionStart", "UserPromptSubmit", "Stop", "SessionEnd", "Interrupt"]
         for event in events:

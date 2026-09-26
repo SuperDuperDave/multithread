@@ -25,7 +25,7 @@ import tempfile
 import time
 import tomllib
 import uuid
-from . import account_launcher
+from . import account_launcher, hook_argv
 from .native_io import (USAGE_SCOPES, MODEL_USAGE_SCOPES, COST_SCOPES,
                         claude_measurements, measurement_scope, canonical_provider_version)
 
@@ -127,7 +127,7 @@ def prepare(client, repo, relay, provider):
         hook = shlex.split(hook_command)
     except ValueError:
         raise LaunchError("The configuration plan has an invalid hook command.") from None
-    if hook != [launcher, "--repo", str(checkout), "provider-hook", "--client", client]:
+    if hook != hook_argv(launcher, client, checkout):
         raise LaunchError("The hook command does not match the selected Multithread and checkout.")
     arguments = plan.get("native_arguments")
     if (not isinstance(arguments, list) or not arguments

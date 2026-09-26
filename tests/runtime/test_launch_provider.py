@@ -58,7 +58,8 @@ class LaunchProviderTests(unittest.TestCase):
         path.chmod(0o700)
 
     def configuration(self, client):
-        hook = shlex.join([str(self.relay), "--repo", str(self.repo), "provider-hook", "--client", client])
+        selector = [] if client == "codex" else ["--repo", str(self.repo)]
+        hook = shlex.join([str(self.relay), *selector, "provider-hook", "--client", client])
         events = ["SessionStart", "UserPromptSubmit", "Stop", "SessionEnd"]
         if client == "codex":
             events.append("Interrupt")
@@ -226,15 +227,29 @@ class LaunchProviderTests(unittest.TestCase):
                 self.assert_unavailable(self.invoke())
 
     def test_mismatched_hook_executable_repo_client_or_action_refuses(self):
-        parts = shlex.split(self.plan["hook_command"])
-        for index, replacement in ((0, str(self.provider)), (2, str(self.base)),
-                                   (3, "provider-config"), (5, "claude")):
-            changed = list(parts)
-            changed[index] = replacement
-            plan = {**self.plan, "hook_command": shlex.join(changed)}
-            with (self.subTest(index=index),
-                  mock.patch.object(launch.subprocess, "run", return_value=self.mocked_result(plan))):
-                self.assert_unavailable(self.invoke())
+        relay, repo = str(self.relay), str(self.repo)
+        wrong = {
+            # Codex's command must stay checkout-free: one trust review covers
+            # every checkout only while the reviewed text is identical.
+            "codex": ([str(self.provider), "provider-hook", "--client", "codex"],
+                      [relay, "--repo", repo, "provider-hook", "--client", "codex"],
+                      [relay, "--repo", str(self.base), "provider-hook", "--client", "codex"],
+                      [relay, "provider-config", "--client", "codex"],
+                      [relay, "provider-hook", "--client", "claude"]),
+            "claude": ([str(self.provider), "--repo", repo, "provider-hook", "--client", "claude"],
+                       [relay, "provider-hook", "--client", "claude"],
+                       [relay, "--repo", str(self.base), "provider-hook", "--client", "claude"],
+                       [relay, "--repo", repo, "provider-config", "--client", "claude"],
+                       [relay, "--repo", repo, "provider-hook", "--client", "codex"]),
+        }
+        for client, commands in wrong.items():
+            for command in commands:
+                plan = {**self.configuration(client), "hook_command": shlex.join(command)}
+                with (self.subTest(client=client, command=command),
+                      mock.patch.object(launch.subprocess, "run", return_value=self.mocked_result(plan))):
+                    value = self.assert_unavailable(self.invoke(client=client))
+                    self.assertEqual("The hook command does not match the selected Multithread and checkout.",
+                                     value["message"])
 
     def test_invalid_native_arguments_refuse(self):
         for arguments in (None, [], "-c setting", {}, [1], [None], ["contains\0nul"]):

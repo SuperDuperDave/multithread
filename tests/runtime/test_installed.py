@@ -35,8 +35,9 @@ class InstalledTests(unittest.TestCase):
         digest = manager.install(SOURCE, bootstrap.manifest_for(payload))
         manager.activate(digest, expected_activation=None)
 
-    def command(self, *args, repo=None, before="", extra_env=None, stdin=""):
-        argv = ["--repo", str(repo or self.repo), "--json", *args]
+    def command(self, *args, repo=None, before="", extra_env=None, stdin="", cwd=None):
+        # cwd runs the command as a provider does: from a directory, without --repo.
+        argv = [*([] if cwd is not None else ["--repo", str(repo or self.repo)]), "--json", *args]
         script = f"""
 import importlib.util, os, pathlib, sys
 spec = importlib.util.spec_from_file_location("trusted_test_bootstrap", {str(SOURCE / 'relay_bootstrap.py')!r})
@@ -55,7 +56,7 @@ registry = Registry(pathlib.Path({str(self.registry)!r}))
         env.update(extra_env or {})
         return subprocess.run(
             ["/usr/bin/python3", "-I", "-S", "-B", "-c", textwrap.dedent(script)],
-            env=env, input=stdin, text=True, capture_output=True, timeout=20)
+            env=env, input=stdin, text=True, capture_output=True, timeout=20, cwd=cwd)
 
     def success(self, *args, **kwargs):
         result = self.command(*args, **kwargs)

@@ -38,13 +38,18 @@ establish native trust, model-visible context or working provider tools.
 A reviewed hook definition must invoke the absolute account-installed launcher:
 
 ```text
-/ABSOLUTE/ACCOUNT/HOME/.local/bin/multithread --repo /ABSOLUTE/ENROLLED/CHECKOUT provider-hook --client codex
+/ABSOLUTE/ACCOUNT/HOME/.local/bin/multithread provider-hook --client codex
+/ABSOLUTE/ACCOUNT/HOME/.local/bin/multithread --repo /ABSOLUTE/ENROLLED/CHECKOUT provider-hook --client claude
 ```
 
-Use `claude` for the other client. Shell-quote each actual argument; the paths above
-are placeholders, not runnable commands. Enrollment must already exist from an
-explicit `init`. Omission of `--repo` uses the real process working directory,
-never a path from hook input. An explicit checkout is preferable for setup.
+Shell-quote each actual argument; the paths above are placeholders, not runnable
+commands. Enrollment must already exist from an explicit `init`. Without
+`--repo`, the hook uses the real process working directory, never a path from
+hook input. Codex records hook trust per event and exact command text, not per
+checkout, so its generated command names no checkout: one review covers every
+enrolled checkout, and Codex runs each hook in the session's working directory,
+which launch and peer set to the checkout. Claude has no per-hook trust record;
+its command keeps the explicit checkout.
 
 The command accepts one strict JSON object on stdin, bounded to 256 KiB. It
 retains only the supported event name and exact session/prompt/turn identifiers.

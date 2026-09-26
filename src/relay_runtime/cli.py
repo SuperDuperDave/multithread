@@ -23,7 +23,7 @@ from relay_core.store import RelayStore, _bind_installed_access
 from .admission import Admission
 from .confinement import ConfinementError, abi_version
 from .enrollment import Registry, EnrollmentError
-from . import account_launcher
+from . import account_launcher, hook_argv
 
 _MAX_OUTPUT = 16 * 1024 * 1024
 _MAX_PROVIDER_CONTEXT = 8 * 1024
@@ -147,7 +147,7 @@ def _provider_contract(client, session, repo):
 def _provider_configuration(args):
     repo = str(Path(args.repo or os.getcwd()).absolute())
     launcher = account_launcher(compatibility=getattr(args, "launcher_name", "relay") == "relay")
-    command = shlex.join([str(launcher), "--repo", repo, "provider-hook", "--client", args.client])
+    command = shlex.join(hook_argv(launcher, args.client, repo))
     events = ["SessionStart", "UserPromptSubmit", "Stop", "SessionEnd"]
     if args.client == "codex":
         events.append("Interrupt")

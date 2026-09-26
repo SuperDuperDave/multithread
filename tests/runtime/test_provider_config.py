@@ -60,7 +60,8 @@ class ProviderConfigTests(unittest.TestCase):
         self.assertEqual(str(self.fixture.repo), value["repo"])
         launcher = str(Path(pwd.getpwuid(os.getuid()).pw_dir) / ".local/bin" / (launcher_name or "relay"))
         self.assertEqual(
-            [launcher, "--repo", str(self.fixture.repo), "provider-hook", "--client", client],
+            [launcher, *([] if client == "codex" else ["--repo", str(self.fixture.repo)]),
+             "provider-hook", "--client", client],
             shlex.split(value["hook_command"]))
         events = ["SessionStart", "UserPromptSubmit", "Stop", "SessionEnd"]
         if client == "codex":
