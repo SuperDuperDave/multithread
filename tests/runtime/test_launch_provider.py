@@ -47,6 +47,10 @@ class LaunchProviderTests(unittest.TestCase):
             f"Path({str(self.receipt)!r}).write_text(json.dumps(receipt))\n"))
         self.plan = self.configuration("codex")
         self.plan_file.write_text(json.dumps(self.plan))
+        # Codex accepts only the account launcher; this fixture stands in for it.
+        launcher = mock.patch.object(launch, "account_launcher", return_value=self.relay)
+        launcher.start()
+        self.addCleanup(launcher.stop)
         for attribute, value in (("system", "Linux"), ("machine", "x86_64")):
             patcher = mock.patch.object(launch.platform, attribute, return_value=value)
             patcher.start()
@@ -57,8 +61,9 @@ class LaunchProviderTests(unittest.TestCase):
         path.write_text(f"#!{sys.executable}\n" + source)
         path.chmod(0o700)
 
-    def configuration(self, client):
-        hook = shlex.join([str(self.relay), "--repo", str(self.repo), "provider-hook", "--client", client])
+    def configuration(self, client, launcher=None):
+        selector = [] if client == "codex" else ["--repo", str(self.repo)]
+        hook = shlex.join([str(launcher or self.relay), *selector, "provider-hook", "--client", client])
         events = ["SessionStart", "UserPromptSubmit", "Stop", "SessionEnd"]
         if client == "codex":
             events.append("Interrupt")
@@ -226,15 +231,29 @@ class LaunchProviderTests(unittest.TestCase):
                 self.assert_unavailable(self.invoke())
 
     def test_mismatched_hook_executable_repo_client_or_action_refuses(self):
-        parts = shlex.split(self.plan["hook_command"])
-        for index, replacement in ((0, str(self.provider)), (2, str(self.base)),
-                                   (3, "provider-config"), (5, "claude")):
-            changed = list(parts)
-            changed[index] = replacement
-            plan = {**self.plan, "hook_command": shlex.join(changed)}
-            with (self.subTest(index=index),
-                  mock.patch.object(launch.subprocess, "run", return_value=self.mocked_result(plan))):
-                self.assert_unavailable(self.invoke())
+        relay, repo = str(self.relay), str(self.repo)
+        wrong = {
+            # Codex's command must stay checkout-free: one trust review covers
+            # every checkout only while the reviewed text is identical.
+            "codex": ([str(self.provider), "provider-hook", "--client", "codex"],
+                      [relay, "--repo", repo, "provider-hook", "--client", "codex"],
+                      [relay, "--repo", str(self.base), "provider-hook", "--client", "codex"],
+                      [relay, "provider-config", "--client", "codex"],
+                      [relay, "provider-hook", "--client", "claude"]),
+            "claude": ([str(self.provider), "--repo", repo, "provider-hook", "--client", "claude"],
+                       [relay, "provider-hook", "--client", "claude"],
+                       [relay, "--repo", str(self.base), "provider-hook", "--client", "claude"],
+                       [relay, "--repo", repo, "provider-config", "--client", "claude"],
+                       [relay, "--repo", repo, "provider-hook", "--client", "codex"]),
+        }
+        for client, commands in wrong.items():
+            for command in commands:
+                plan = {**self.configuration(client), "hook_command": shlex.join(command)}
+                with (self.subTest(client=client, command=command),
+                      mock.patch.object(launch.subprocess, "run", return_value=self.mocked_result(plan))):
+                    value = self.assert_unavailable(self.invoke(client=client))
+                    self.assertEqual("The hook command does not match the selected Multithread and checkout.",
+                                     value["message"])
 
     def test_invalid_native_arguments_refuse(self):
         for arguments in (None, [], "-c setting", {}, [1], [None], ["contains\0nul"]):
@@ -436,6 +455,92 @@ class LaunchProviderTests(unittest.TestCase):
             with (self.subTest(provider=str(provider)),
                   mock.patch.object(launch.subprocess, "run") as run):
                 self.assert_unavailable(self.invoke(provider=provider))
+                run.assert_not_called()
+
+    def account_entries(self):
+        """Lay out an account bin as the installer does: multithread links to relay.
+
+        The relay entry answers provider-config like the installed worker: its
+        hook names the entry that --launcher-name requests, relay by default.
+        """
+        directory = self.base / "account bin"
+        directory.mkdir()
+        relay, multithread = directory / "relay", directory / "multithread"
+        plans = self.base / "plans.json"
+        plans.write_text(json.dumps({client + " " + name: self.configuration(client, directory / name)
+                                     for client in ("codex", "claude") for name in ("relay", "multithread")}))
+        self.make_executable(relay, (
+            "import json, sys\nfrom pathlib import Path\n"
+            "argv = sys.argv[1:]\n"
+            "name = argv[argv.index('--launcher-name') + 1] if '--launcher-name' in argv else 'relay'\n"
+            f"plans = json.loads(Path({str(plans)!r}).read_text())\n"
+            "print(json.dumps(plans[argv[argv.index('--client') + 1] + ' ' + name]))\n"))
+        multithread.symlink_to(relay)
+        return relay, multithread
+
+    def test_codex_hook_names_the_account_entry_whatever_spelling_selects_it(self):
+        relay, multithread = self.account_entries()
+        alias = self.base / "alias"
+        alias.symlink_to(relay)
+        expected = self.configuration("codex", multithread)
+        for spelling in (multithread, relay, alias, relay.parent / ".." / relay.parent.name / "relay"):
+            for flag in ("--relay", "--multithread"):
+                self.relay = spelling
+                with (self.subTest(spelling=str(spelling), flag=flag),
+                      mock.patch.object(launch, "account_launcher", return_value=multithread)):
+                    code, output, errors, prompt = self.invoke(launcher_flag=flag)
+                    self.assertEqual(0, code, output + errors)
+                    value = json.loads(output)
+                    self.assertEqual(expected["hook_command"], value["relay_plan"]["hook_command"])
+                    self.assertEqual([str(self.provider), *expected["native_arguments"]], value["argv"])
+                    prompt.assert_not_called()
+
+    def test_peer_codex_hook_names_the_account_entry_whatever_spelling_selects_it(self):
+        relay, multithread = self.account_entries()
+        task = self.base / "task.txt"
+        task.write_text("Review.\n")
+        expected = self.configuration("codex", multithread)
+        output = io.StringIO()
+        with (redirect_stdout(output), mock.patch.dict(os.environ, self.environment, clear=True),
+              mock.patch.object(launch, "account_launcher", return_value=multithread)):
+            code = launch.peer_main(["codex", "--repo", str(self.repo), "--relay", str(relay),
+                                     "--provider", str(self.provider), "--task-file", str(task),
+                                     "--dry-run", "--json"])
+        self.assertEqual(0, code, output.getvalue())
+        value = json.loads(output.getvalue())
+        self.assertEqual([str(self.provider), *expected["native_arguments"], "app-server", "--listen", "stdio://"],
+                         value["argv"])
+
+    def test_claude_hook_keeps_the_launcher_spelling_it_was_given(self):
+        relay, multithread = self.account_entries()
+        for spelling in (relay, multithread):
+            self.relay = spelling
+            with (self.subTest(spelling=str(spelling)),
+                  mock.patch.object(launch, "account_launcher", return_value=multithread)):
+                code, output, errors, _ = self.invoke(client="claude", launcher_flag="--relay")
+                self.assertEqual(0, code, output + errors)
+                self.assertEqual(self.configuration("claude", spelling)["hook_command"],
+                                 json.loads(output)["relay_plan"]["hook_command"])
+
+    def test_codex_refuses_a_launcher_that_is_not_the_account_entry(self):
+        relay, multithread = self.account_entries()
+        elsewhere = self.base / "elsewhere"
+        elsewhere.mkdir()
+        # Same bytes and name, different file: an old activation or another install.
+        copy_entry = elsewhere / "multithread"
+        copy_entry.write_bytes(relay.read_bytes())
+        copy_entry.chmod(0o700)
+        for account, reason in ((multithread, ""), (self.base / "absent" / "multithread", " (not found)")):
+            self.relay = copy_entry
+            with (self.subTest(account=str(account)),
+                  mock.patch.object(launch, "account_launcher", return_value=account),
+                  mock.patch.object(launch.subprocess, "run") as run):
+                value = self.assert_unavailable(self.invoke())
+                self.assertEqual(
+                    f"Codex hooks run only the installed launcher {account}{reason}, and {copy_entry} is a "
+                    "different file. Codex trusts one exact hook command, so another launcher would move that "
+                    f"trust from every other Codex session. Omit --multithread or pass {account}.",
+                    value["message"])
                 run.assert_not_called()
 
     def test_unsupported_platform_refuses_before_any_subprocess(self):

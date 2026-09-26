@@ -25,7 +25,7 @@ import tempfile
 import time
 import tomllib
 import uuid
-from . import account_launcher
+from . import account_launcher, hook_argv
 from .native_io import (USAGE_SCOPES, MODEL_USAGE_SCOPES, COST_SCOPES,
                         claude_measurements, measurement_scope, canonical_provider_version)
 
@@ -80,6 +80,30 @@ def executable(value, name):
     return str(path)
 
 
+def codex_launcher(selected):
+    """Give Codex the one launcher spelling that setup prints.
+
+    Codex trusts a hook by event slot and exact command text, so a second
+    spelling of the same launcher would list as modified and move the single
+    trusted command away from every other session. Another path to the
+    installed launcher becomes the account entry; any other file is refused.
+    """
+    canonical = str(account_launcher())
+    if selected == canonical:
+        return canonical
+    try:
+        if os.path.samefile(selected, canonical):
+            return canonical
+    except OSError:
+        pass
+    raise LaunchError(
+        f"Codex hooks run only the installed launcher {canonical}"
+        + ("" if os.path.lexists(canonical) else " (not found)")
+        + f", and {selected} is a different file. Codex trusts one exact hook command, so another "
+        "launcher would move that trust from every other Codex session. Omit --multithread or pass "
+        + canonical + ".")
+
+
 def prepare(client, repo, relay, provider):
     if platform.system() != "Linux" or platform.machine() != "x86_64":
         raise LaunchError("This Multithread release requires a supported x86-64 Linux environment; see docs/SUPPORT.md.")
@@ -93,6 +117,8 @@ def prepare(client, repo, relay, provider):
     if relay is None:
         relay = account_launcher()
     launcher = executable(relay, "Multithread")
+    if client == "codex":
+        launcher = codex_launcher(launcher)
     provider_path = executable(provider, client)
     command = [launcher, "--repo", str(checkout), "--json", "provider-config", "--client", client]
     if Path(launcher).name == "multithread":
@@ -127,7 +153,7 @@ def prepare(client, repo, relay, provider):
         hook = shlex.split(hook_command)
     except ValueError:
         raise LaunchError("The configuration plan has an invalid hook command.") from None
-    if hook != [launcher, "--repo", str(checkout), "provider-hook", "--client", client]:
+    if hook != hook_argv(launcher, client, checkout):
         raise LaunchError("The hook command does not match the selected Multithread and checkout.")
     arguments = plan.get("native_arguments")
     if (not isinstance(arguments, list) or not arguments

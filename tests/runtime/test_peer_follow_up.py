@@ -33,7 +33,8 @@ class PeerFollowUpTests(unittest.TestCase):
                                effort=None, stream_progress=False)
         plan = {"repo": str(fixture.repo), "argv": [str(fixture.provider)],
                 "relay_plan": {"hook_command": shlex.join(
-                    [str(fixture.relay), "--repo", str(fixture.repo), "provider-hook", "--client", client])}}
+                    [str(fixture.relay), *([] if client == "codex" else ["--repo", str(fixture.repo)]),
+                     "provider-hook", "--client", client])}}
         envelope = {"provider": client, "state": "returned", "provider_started": True,
                     "process_exit_code": 0, "needs_attention": False,
                     "session_id": "00000000-0000-4000-8000-000000000001"}

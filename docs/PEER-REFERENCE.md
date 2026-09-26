@@ -391,7 +391,9 @@ hide source files or alter provider capabilities for isolation.
 
 From the reviewed source checkout, `examples/call_peer.py` invokes the same
 helper against a reviewed installed Multithread selected with `--multithread`
-(`--relay` remains a compatibility spelling):
+(`--relay` remains a compatibility spelling). For Codex this must be the account
+launcher setup prints: another path to it takes that spelling in the hook, and
+a different file is refused, because Codex trusts one exact hook command.
 
 ```sh
 /usr/bin/python3 -I -S -B examples/call_peer.py codex \

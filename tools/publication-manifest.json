@@ -136,7 +136,13 @@
     {
       "path": "docs/PROVIDERS.md",
       "rule": "personal-home-path",
-      "line_sha256": "c3e69e87c7ddd48274d52d269986aef5fcdd4fb36c586e030c2ec2c8b2dad1e5",
+      "line_sha256": "86ca795f4d5f6594e23114bf1c25095dea9151a9ff6109dbd898c817d08aae69",
+      "reason": "public-example"
+    },
+    {
+      "path": "docs/PROVIDERS.md",
+      "rule": "personal-home-path",
+      "line_sha256": "771c3c4e8d6c3f788d8731167f3c38ffd80d262fd611777895cb1babd46368cd",
       "reason": "public-example"
     },
     {
