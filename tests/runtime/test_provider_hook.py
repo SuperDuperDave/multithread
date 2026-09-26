@@ -123,7 +123,7 @@ class ProviderHookTests(unittest.TestCase):
         """The generated Codex hook has no --repo: Codex runs it in the session's
         working directory, and enrollment comes from that directory alone."""
         git = ["/usr/bin/git", "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false",
-               "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid"]
+               "-c", "user.name=Fixture", "-c", "user.email=fixture"]
         alpha, beta, stray = (self.fixture.base / name for name in ("alpha", "beta", "unenrolled"))
         for repo in (alpha, beta, stray):
             subprocess.run(["/usr/bin/git", "init", "-q", str(repo)], check=True)
