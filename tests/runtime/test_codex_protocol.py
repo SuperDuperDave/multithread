@@ -362,8 +362,16 @@ class CodexProtocolTests(unittest.TestCase):
             ({'hook_updates': {'enabled': False}}, 'needs_review', dict.fromkeys(events, 'disabled'), review),
             ({'event_updates': {'stop': {'trustStatus': 'modified'}}}, 'needs_review',
              {**dict.fromkeys(events, 'trusted'), 'stop': 'modified'}, review),
-            ({'hook_updates': {'source': 'user'}}, 'needs_configuration', dict.fromkeys(events, 'missing'),
-             "check that Codex hooks are enabled (features.hooks)"),
+            # A persistent copy in user configuration is not the invocation's hook.
+            ({'hook_updates': {'source': 'user'}}, 'needs_configuration', dict.fromkeys(events, 'mismatched'),
+             configuration),
+            ({'extra_hooks': [{'eventName': 'stop', 'handlerType': 'command', 'source': 'user',
+                               'enabled': True, 'trustStatus': 'trusted', 'timeoutSec': 3,
+                               'matcher': None, 'async': False}]}, 'needs_configuration',
+             {**dict.fromkeys(events, 'trusted'), 'stop': 'duplicate'}, configuration),
+            ({'extra_hooks': [{'eventName': 'stop', 'command': 'unrelated user hook', 'handlerType': 'command',
+                               'source': 'user', 'enabled': True, 'trustStatus': 'untrusted', 'timeoutSec': 3,
+                               'matcher': None, 'async': False}]}, 'ready', dict.fromkeys(events, 'trusted'), None),
             ({'hooks_result': {'data': [{'cwd': str(self.repo), 'hooks': []}]}}, 'needs_configuration',
              dict.fromkeys(events, 'missing'), "check that Codex hooks are enabled (features.hooks)"),
             ({'hook_updates': {'matcher': 'unexpected'}}, 'needs_configuration', dict.fromkeys(events, 'mismatched'), configuration),
@@ -381,6 +389,11 @@ class CodexProtocolTests(unittest.TestCase):
             with self.subTest(spec=spec):
                 self.configure(**spec)
                 code, result, _ = self.invoke()
+                if state == 'ready':
+                    # Unrelated hooks from other sources are Codex's own business.
+                    self.assertEqual(0, code, result)
+                    self.assertEqual(statuses, result['hook_readiness']['events'])
+                    continue
                 self.assertNotEqual(0, code, result)
                 self.assertEqual('not_submitted', result['task_submission'])
                 self.assertEqual(state, result['hook_readiness']['state'])
@@ -396,6 +409,8 @@ class CodexProtocolTests(unittest.TestCase):
                 self.assertIn('no task was submitted', result['message'])
                 self.assertIn(remedy, result['message'])
                 self.assertEqual(state == 'needs_review', '/hooks' in result['message'])
+                self.assertEqual('modified' in statuses.values(),
+                                 'Codex last trusted a different command' in result['message'])
 
     def list_hooks(self, **options):
         with mock.patch.dict(os.environ, self.environment, clear=True):

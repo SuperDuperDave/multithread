@@ -32,7 +32,8 @@ _REVIEWABLE = frozenset({"untrusted", "modified", "disabled"})
 def hook_readiness(result, repo, expected_hook):
     """Classify each Multithread hook exactly as Codex lists it for this checkout.
 
-    Every session-flag entry for an event counts before its command is compared,
+    Every session-flag entry for an event, and any persistent copy of the
+    expected command from another source, counts before commands are compared,
     so a second handler cannot sit unseen beside the expected one.
     """
     groups = result.get("data") if isinstance(result, dict) else None
@@ -43,7 +44,8 @@ def hook_readiness(result, repo, expected_hook):
         raise _ProtocolError("Native hook readiness did not identify the selected checkout; no task was submitted.")
     listed = {name: [] for name in _HOOK_EVENTS}
     for hook in groups[0]["hooks"]:
-        if isinstance(hook, dict) and hook.get("source") == "sessionFlags" and hook.get("eventName") in listed:
+        if (isinstance(hook, dict) and hook.get("eventName") in listed
+                and (hook.get("source") == "sessionFlags" or hook.get("command") == expected_hook)):
             listed[hook["eventName"]].append(hook)
     events = {}
     for name, hooks in listed.items():
@@ -52,7 +54,8 @@ def hook_readiness(result, repo, expected_hook):
             events[name] = "missing"
         elif len(hooks) > 1:
             events[name] = "duplicate"
-        elif (hook.get("command") != expected_hook or hook.get("handlerType") != "command"
+        elif (hook.get("source") != "sessionFlags"
+              or hook.get("command") != expected_hook or hook.get("handlerType") != "command"
               or hook.get("async", False) is not False or hook.get("matcher") is not None
               or type(hook.get("timeoutSec")) is not int or hook["timeoutSec"] != 3):
             events[name] = "mismatched"
@@ -80,6 +83,9 @@ def hook_remedy(readiness, repo, expected_hook):
         action = ("Review once in Codex: run " + shlex.join(launch) + " in a terminal, type launch, open /hooks "
                   "and trust the five Multithread hooks running " + expected_hook
                   + ". That review covers every enrolled checkout and worktree.")
+        if "modified" in statuses:
+            action += (" Modified means Codex last trusted a different command in that slot, such as an"
+                       " older per-checkout Multithread hook; trust only this exact command.")
     elif statuses == ["missing"]:
         action = ("Codex listed none of these hooks: check that Codex hooks are enabled (features.hooks), then inspect "
                   + shlex.join(launch + ["--json"]) + ".")

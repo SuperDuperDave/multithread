@@ -45,11 +45,14 @@ A reviewed hook definition must invoke the absolute account-installed launcher:
 Shell-quote each actual argument; the paths above are placeholders, not runnable
 commands. Enrollment must already exist from an explicit `init`. Without
 `--repo`, the hook uses the real process working directory, never a path from
-hook input. Codex records hook trust per event and exact command text, not per
+hook input; if the input states a different `cwd`, the hook refuses without
+writing. Codex records hook trust per event and exact command text, not per
 checkout, so its generated command names no checkout: one review covers every
 enrolled checkout, and Codex runs each hook in the session's working directory,
-which launch and peer set to the checkout. Claude has no per-hook trust record;
-its command keeps the explicit checkout.
+which launch and peer set to the checkout. That trust therefore also covers any
+Codex session started with the same flags in an enrolled checkout; such a hook
+can only record sanitized lifecycle events and read the brief. Claude has no
+per-hook trust record; its command keeps the explicit checkout.
 
 The command accepts one strict JSON object on stdin, bounded to 256 KiB. It
 retains only the supported event name and exact session/prompt/turn identifiers.

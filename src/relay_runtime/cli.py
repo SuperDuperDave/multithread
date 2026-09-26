@@ -78,7 +78,7 @@ def _readonly(args):
         args.command == "ratchet" and args.ratchet_command == "review")
 
 
-def _provider_input(client):
+def _provider_input(client, *, from_cwd=False):
     # Parse before admission solely to choose the read-only worker profile.
     # Payload paths, prompts, tool data and credentials confer no authority and
     # are discarded. Only --repo or the real process cwd selects enrollment.
@@ -88,6 +88,15 @@ def _provider_input(client):
         raise ValidationError("provider hook requires an event name")
     if name not in _PROVIDER_EVENTS or (name == "Interrupt" and client != "codex"):
         return None
+    if from_cwd and "cwd" in payload:
+        # The process directory selects enrollment; the provider's stated
+        # session directory can only veto a mismatch, never select a checkout.
+        try:
+            same = os.path.samestat(os.stat(payload["cwd"]), os.stat("."))
+        except (OSError, TypeError, ValueError):
+            same = False
+        if not same:
+            raise ValidationError("provider hook ran outside its session directory")
     selected = {"hook_event_name": name}
     for key in ("session_id", "prompt_id", "turn_id"):
         value = payload.get(key)
@@ -375,7 +384,7 @@ def main(argv=None, *, registry=None, command_alias_check=None):
             return {"agent": agent_main, "launch": launch_main, "peer": peer_main,
                     "setup": setup_main, "update": update_main}[args.command](forwarded)
         if args.command == "provider-hook":
-            args.provider_payload = _provider_input(args.client)
+            args.provider_payload = _provider_input(args.client, from_cwd=args.repo is None)
             if args.provider_payload is None:
                 return 0
         if threading.active_count() != 1:

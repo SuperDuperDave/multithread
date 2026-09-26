@@ -138,10 +138,24 @@ class ProviderHookTests(unittest.TestCase):
         def ledger(repo):
             return [(row["kind"], row["session"]) for row in self.fixture.success("events", repo=repo)]
 
-        def run(cwd, event, **fields):
-            # Payload paths name the other checkout; they must never select it.
-            payload = {"cwd": str(beta if cwd != beta else alpha), "transcript_path": str(beta), **fields}
+        def run(cwd, event, stated=None, **fields):
+            # Codex states the session directory; other payload paths never select.
+            payload = {"cwd": str(cwd if stated is None else stated), "transcript_path": str(beta), **fields}
             return self.hook("codex", event, "moving-session", payload=payload, cwd=cwd)
+
+        # A stated session directory can veto a mismatch but never select one.
+        before = snapshot(self.fixture.base)
+        for stated in (beta, self.fixture.base / "absent", "\0"):
+            with self.subTest(stated=stated):
+                self.silent(run(alpha, "SessionStart", stated=stated), degraded=True)
+        self.assertEqual(before, snapshot(self.fixture.base))
+        alias = self.fixture.base / "alpha-alias"
+        alias.symlink_to(alpha)
+        self.context(run(alpha, "UserPromptSubmit", stated=alias, prompt_id="alias-prompt"),
+                     "codex", "UserPromptSubmit", "moving-session")
+        unstated = self.hook("codex", "UserPromptSubmit", "moving-session", cwd=alpha,
+                             payload={"prompt_id": "unstated-prompt"})
+        self.context(unstated, "codex", "UserPromptSubmit", "moving-session")
 
         context = self.context(run(alpha, "SessionStart"), "codex", "SessionStart", "moving-session")
         self.assertIn(json.dumps(str(alpha)), context)
