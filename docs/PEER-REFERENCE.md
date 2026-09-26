@@ -6,6 +6,7 @@ deliberate follow-up. This reference covers:
 - [Receipt fields and capture limits](#receipt-fields-and-capture-limits)
 - [Usage measurements](#usage-measurements)
 - [Support reports from retained calls](#prepare-a-support-report-from-an-existing-call)
+- [Frozen review packets](#freeze-a-review-packet)
 - [Input to a running peer](#update-a-running-peer)
 - [Coordination and native verification evidence](#coordination-and-verification-scope)
 - [The reviewed source entry](#use-the-source-entry)
@@ -22,6 +23,8 @@ apply alongside these additional observations.
 | `observed_session_id` | If present on an identity mismatch, the unverified native identity reported by the provider. It is diagnostic, not a resume instruction; inspect the retained raw output. |
 | `resumed` | Whether this call requested resume (`true`) or a fresh session (`false`), not independent proof of restored history or a cache hit. |
 | `provider_version` | Optional provider-reported version from this call's native initialization, with `status`, `version` and `source`. It describes the responding process, not the current installation, model, Multithread release or an earlier turn in a resumed conversation. |
+| `requested_model`, `requested_effort`, `model_observation`, `effective_effort` | Claude call settings requested by the caller. Streaming initialization can report a model name; a different name is `different_name_unverified`, not proof of a model mismatch. A repeated init with no model keeps the last reported name but marks its relation `prior_init_only`. Final-JSON calls lack this native model observation. Effective effort remains `unknown`. |
+| `native_progress` | In Claude streaming mode, content-free latest attributed event time and frame counts. Observed activity is not proof of continuing progress or task completion. |
 | `task_delivery`, `native_input_unwritten_bytes` | When recorded, the task's pipe-write observation and the native input queue's remaining byte count. Count scope depends on capture mode; zero does not establish full task delivery. A complete pipe write does not prove native consumption. Missing fields remain unknown. |
 
 For ordinary Claude final-JSON calls, the byte count records initial task bytes
@@ -30,11 +33,11 @@ can include follow-up frames or be cleared after input closes. That queue count
 does not substitute for the separate `task_delivery` observation.
 
 `stdout_observation` records the byte count and SHA-256 of observed stdout.
-For Codex and Claude `--live-input`, capture is limited to 16 MiB, plus one byte
+For Codex and Claude `--live-input` or `--stream-progress`, capture is limited to 16 MiB, plus one byte
 to detect overflow. Exceeding that bound sets `truncated`, stops interpretation,
 closes native input and leads to owned-process cleanup. Only the captured prefix
 is retained; a previously observed answer survives with `needs_attention`.
-Claude calls without `--live-input` capture raw stdout directly. Their
+Claude calls without either streaming option capture raw stdout directly. Their
 `stdout_observation.scope` is `bounded_read`: the byte count and digest describe
 the read prefix, with the same 16 MiB plus one byte limit. Their raw file can
 exceed that summary limit. After timeout or interruption, this observation is
@@ -52,6 +55,14 @@ already ignores that signal (for example, SIGHUP
 under `nohup`). Once the provider exits, ordinary signals allow the bounded
 result read and receipt to finish. SIGKILL, host failure and a provider that
 escapes that process group cannot be handled this way.
+
+Before provider spawn, the call writes `checkpoint.json` in its private evidence
+directory. After a successful spawn it replaces that checkpoint atomically.
+When `result.json` is missing, `peer report` may show this nonterminal checkpoint:
+`before_spawn` means launch may have happened before the caller stopped;
+`spawned` confirms a process was started. In either case the outcome remains
+unknown, and the checkpoint does not identify a safe resume target or say whether
+the provider still runs. Inspect native output and durable work before follow-up.
 
 A streaming result can precede native process exit. Claude receives the remaining
 call time for its background work; Codex's owned server gets a short shutdown
@@ -89,11 +100,13 @@ prose:
 | Claude `usage`, ordinary call | `usage_scope_id: native_main_loop` — this query's main loop, excluding subagents. |
 | Claude `usage`, live-input call | `usage_scope_id: latest_related_native_result` — the latest result answering this call's input, not a sum of the stream. |
 | Claude `model_usage` | `model_usage_scope_id: native_query_cumulative` — latest reported query totals by model, including native subagents and compaction; not every provider helper call. Available in ordinary and live-input receipts. |
-| Claude `estimated_cost_usd` | `cost_scope_id: cumulative_through_latest_native_result` — latest reported cumulative estimate, including background results in a stream. Do not add successive snapshots or treat it as billing. |
+| Claude `estimated_cost_usd` | `cost_scope_id: cumulative_through_latest_native_result` — latest reported cumulative estimate, including background results in a stream and earlier session spend after resume. It is not the resumed call's incremental cost. Do not add successive snapshots or treat it as billing. |
 | Codex `usage.last` / `usage.total` | `usage_scope_id: native_thread_last_and_total` — native last-request and running thread totals, not incremental usage of this Multithread call. `model_context_window` is separately reported when available. |
 
 Provider-native counters can overlap; do not add every field into a total.
-Resuming does not turn these measurements into whole-conversation accounting.
+The resumed Claude cost estimate can include earlier spend in the same session;
+other usage measurements retain their own native scopes. A single resumed
+receipt is not a per-call spend estimate.
 The [Claude accounting reference](https://code.claude.com/docs/en/agent-sdk/cost-tracking)
 explains its query and stream scopes. These measurements do not establish net
 token savings, subscription-quota consumption or broad reliability.
@@ -115,10 +128,12 @@ files. The result receipt itself can contain private answers and diagnostics;
 the report uses a positive, typed selection rather than trying to redact text.
 
 The output excludes task/answer text, arbitrary native diagnostics, paths,
-session/tool identifiers, hashes, model settings and usage maps. It includes the
+session/tool identifiers, hashes, model names and usage maps. It includes the
 recorded call outcome, task-submission and pipe-delivery observations, process exit, attention flag,
 elapsed time, available provider turn/duration/cost estimates, counts of retained
 errors/denials/unsupported native requests and stdout observation limits.
+It can show the requested effort enum and a literal model comparison without
+disclosing the model name or claiming effective effort.
 Starting in v0.4.11, the report also selects `caller_stop_reason`: `timeout`,
 `interrupted` or `shutdown_timeout` have the meanings above; `not_recorded`
 means the field was absent, while `unknown` means its recorded value was
@@ -137,10 +152,19 @@ even if its prose resembles a known scope. Missing scope remains unknown; do not
 treat those measurements as whole-call totals or sum cumulative values.
 No cost estimate establishes actual billing.
 
+For two completed Claude calls in the same verified session, `peer report
+--call-dir /absolute/current --compare-call-dir /absolute/earlier --json`
+can subtract the earlier cumulative estimate from the current one. Both private
+receipts must have the same known cumulative scope, the current call must request
+resume, and the total must not decrease. The result is a **difference between
+two selected receipts**; intervening session activity is not excluded, so it is
+not certified per-call billing. Uncomparable receipts return `unavailable`.
+
 `report_state: reported` and exit 0 mean a report was produced, even when
 `call.state` is `uncertain` or `provider_error`. Otherwise exit 1 and
 `receipt_status` distinguish missing, unavailable, malformed, unsupported-schema
-and oversized receipts. No call outcome is inferred when reporting is unavailable.
+and oversized receipts. A valid checkpoint with a missing terminal receipt gives
+`report_state: incomplete` and still exits 1. No call outcome is inferred.
 An absent receipt does not establish whether a provider is running or finished.
 The independent receipt-read limit is 16 MiB; JSON expansion can make a valid
 receipt larger than this. Preserve such evidence for deliberate local inspection.
@@ -182,6 +206,37 @@ runtime identity; older receipts leave it unrecorded. The report exposes only
 never the digest, and invalid auxiliary provenance does not discard a useful
 call outcome. Review the report
 before sharing through the [support route](SUPPORT.md#useful-safe-support-information).
+
+## Freeze a review packet
+
+Use `multithread peer packet` to save a reviewable diff without changing Git
+state or sending it to a provider:
+
+```sh
+multithread peer packet --repo /absolute/git-root --base HEAD \
+  --path src/example.py --path tests/example.py \
+  --output-file /absolute/new/private-packet.txt --json
+```
+
+The command resolves the base and HEAD to commit IDs, selects only tracked
+paths named by `--path`, and includes staged and unstaged text changes through
+the current working tree. It refuses binary changes, untracked files in the
+selection, empty diffs, non-UTF-8 output and diffs over 1 MiB. Git runs with
+external diff, text conversion, fsmonitor and system/global configuration
+disabled. The private packet (mode 0600) records the exact selected paths,
+revision IDs, diff byte count and SHA-256. Its digest covers the diff bytes
+between the packet's markers, not the packet header or the peer task file.
+The selected repository's local Git configuration and object storage still need
+to be trusted. Local configuration can include other files, and tracked
+`.gitattributes` can select locally configured filters. This helper is not a
+sandbox for hostile Git metadata. It compares HEAD, status and diff again
+before writing to catch ordinary concurrent edits; it cannot guarantee an
+atomic filesystem snapshot against an adversarial replace-and-restore race.
+
+Inspect the packet before sharing it. This is input preparation, not a secret
+scan, enforced provider read-only mode or permission grant. A reviewer without
+Git tools can inspect the supplied patch, but cannot independently prove its
+working-tree provenance; the caller can recompute the digest locally.
 
 ## Update a running peer
 

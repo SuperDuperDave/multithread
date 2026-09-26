@@ -21,7 +21,7 @@ class ClaudeIntegrationTests(unittest.TestCase):
     executable = staticmethod(fixture.CodexProtocolTests.executable)
     configure = fixture.CodexProtocolTests.configure
 
-    def invoke(self, steps, *, update=False, closure_fault=False):
+    def invoke(self, steps, *, update=False, closure_fault=False, progress_only=False):
         hook = shlex.join([str(self.relay), '--repo', str(self.repo), 'provider-hook', '--client', 'claude'])
         hooks = {event: [{'hooks': [{'type': 'command', 'command': hook, 'timeout': 3}]}]
                  for event in ('SessionStart', 'UserPromptSubmit', 'Stop', 'SessionEnd')}
@@ -52,7 +52,8 @@ class ClaudeIntegrationTests(unittest.TestCase):
                 finally:
                     files.release()
 
-        arguments = ['claude', '--live-input', '--repo', str(self.repo), '--relay', str(self.relay),
+        arguments = ['claude', '--stream-progress' if progress_only else '--live-input',
+                     '--repo', str(self.repo), '--relay', str(self.relay),
                      '--provider', str(self.provider), '--task-file', str(self.task),
                      '--output-dir', str(directory), '--timeout', '2', '--json']
         output, errors = io.StringIO(), io.StringIO()
@@ -86,6 +87,19 @@ class ClaudeIntegrationTests(unittest.TestCase):
         self.assertEqual('stream-json', argv[argv.index('--output-format')+1])
         submitted = [json.loads(row) for row in self.requests.read_text().splitlines()]
         self.assertEqual(self.task.read_text(), submitted[0]['message']['content'])
+
+    def test_progress_stream_returns_without_creating_a_live_input_mailbox(self):
+        code, value, receipt = self.invoke(
+            [{'read': 1}, {'emit': protocol.init()}, {'emit': protocol.result()}],
+            progress_only=True)
+        self.assertEqual(0, code, value)
+        self.assertIsNone(receipt)
+        self.assertNotIn('control', value)
+        self.assertEqual('native_result', value['native_progress']['last_event'])
+        self.assertIn('--stream-progress', value['follow_up_preparation']['argv_prefix'])
+        self.assertNotIn('--live-input', value['follow_up_preparation']['argv_prefix'])
+        self.assertEqual('stream-json', json.loads(self.receipt.read_text())['argv'][
+            json.loads(self.receipt.read_text())['argv'].index('--output-format') + 1])
 
     def test_live_update_can_be_consumed_in_a_later_native_result(self):
         code, value, receipt = self.invoke([

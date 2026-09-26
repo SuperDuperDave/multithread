@@ -136,6 +136,30 @@ class PeerTests(unittest.TestCase):
         self.assertNotIn("--session-id", argv)
         self.assertEqual(self.task.read_bytes(), (self.base / "received-task.txt").read_bytes())
 
+    def test_per_call_model_and_effort_are_requested_without_claiming_effective_effort(self):
+        code, dry, _ = self.invoke("--model", "opus", "--effort", "high", "--dry-run")
+        self.assertEqual(0, code)
+        self.assertEqual("opus", dry["requested_model"])
+        self.assertEqual("high", dry["requested_effort"])
+        self.assertEqual("unknown", dry["effective_effort"])
+        self.assertEqual(["--model", "opus", "--effort", "high"], dry["argv"][-6:-2])
+        self.assertFalse(self.calls.exists())
+        code, result, _ = self.invoke("--model", "opus", "--effort", "high")
+        self.assertEqual(0, code)
+        self.assertEqual("unknown", result["effective_effort"])
+        self.assertEqual("unknown", result["model_observation"]["relation"])
+        self.assertEqual(["--model", "opus", "--effort", "high"],
+                         json.loads(self.receipt.read_text())["argv"][-6:-2])
+        prefix = result["follow_up_preparation"]["argv_prefix"]
+        self.assertEqual("opus", prefix[prefix.index("--model") + 1])
+        self.assertEqual("high", prefix[prefix.index("--effort") + 1])
+
+    def test_model_name_cannot_become_a_native_option(self):
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as raised:
+            peer.peer_main(["claude", "--task-file", str(self.task), "--model=--permission-mode"])
+        self.assertEqual(2, raised.exception.code)
+        self.assertFalse(self.calls.exists())
+
     def test_wait_slices_deliver_partial_stdin_once_and_keep_default_final_json(self):
         task = ("ARTIFICIAL-PRIVATE-TASK 雪 `touch injected`\n" * 1200).encode()
         self.assertLess(len(task), 64 * 1024)
@@ -409,6 +433,8 @@ class PeerTests(unittest.TestCase):
         self.assertFalse(result["provider_started"])
         self.assertEqual(before, {path.name: path.read_bytes() for path in evidence.iterdir()})
         self.assertFalse(self.calls.exists())
+        self.assertIn("--output-dir already exists", result["message"])
+        self.assertIn("redirect command output outside it", result["message"])
 
     def test_bad_tasks_refuse_before_config_or_provider(self):
         for body in (b" \n", b"bad\0task", b"\xff", b"x" * (64 * 1024 + 1)):
@@ -654,6 +680,51 @@ class PeerTests(unittest.TestCase):
         self.assertEqual(result, json.loads((Path(result["evidence_directory"]) / "result.json").read_text()))
         self.assertEqual(handlers, {number: signal.getsignal(number) for number in handlers})
 
+    def test_sigkill_leaves_an_honest_recovery_checkpoint_without_terminal_receipt(self):
+        self.configure(sleep=True)
+        evidence = self.base / "killed-caller"
+        wrapper = subprocess.Popen(
+            [sys.executable, "-I", "-S", "-B", str(ROOT / "examples" / "call_peer.py"),
+             "claude", "--repo", str(self.repo), "--multithread", str(self.relay),
+             "--provider", str(self.provider), "--task-file", str(self.task),
+             "--output-dir", str(evidence), "--timeout", "30", "--json"],
+            cwd=ROOT, env=self.environment, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, start_new_session=True)
+        native = None
+        checkpoint = None
+        try:
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                try:
+                    native = json.loads(self.receipt.read_text())
+                    checkpoint = json.loads((evidence / "checkpoint.json").read_text())
+                    if checkpoint["phase"] == "spawned":
+                        break
+                except (FileNotFoundError, json.JSONDecodeError):
+                    if wrapper.poll() is not None:
+                        break
+                time.sleep(0.01)
+            self.assertIsNotNone(native, "fixture provider did not reach its sleep")
+            self.assertIsNotNone(checkpoint, "provider checkpoint was never observed")
+            self.assertEqual("spawned", checkpoint["phase"])
+            wrapper.kill()
+            self.assertEqual(-signal.SIGKILL, wrapper.wait(timeout=5))
+            self.assertFalse((evidence / "result.json").exists())
+            report = peer._read_report(evidence)
+            self.assertEqual("incomplete", report["report_state"])
+            self.assertEqual("missing", report["receipt_status"])
+            self.assertEqual("spawned", report["checkpoint"]["phase"])
+            self.assertEqual("unknown", report["checkpoint"]["outcome"])
+        finally:
+            if wrapper.poll() is None:
+                wrapper.kill()
+                wrapper.wait(timeout=5)
+            if native is not None:
+                try:
+                    os.killpg(native["pgid"], signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
     def test_inherited_ignored_hangup_stays_ignored_through_call(self):
         original = peer.prepare
 
@@ -789,18 +860,49 @@ class PeerTests(unittest.TestCase):
                 self.assertEqual(errors, raw["errors"])
 
     def test_result_record_failure_retains_returned_text(self):
-        original = peer._record
-        def record(directory, name, value):
+        original = peer._atomic_record
+        def record(directory, name, value, **kwargs):
             if name == "result.json":
                 raise OSError("artificial full disk")
-            return original(directory, name, value)
-        with mock.patch.object(peer, "_record", side_effect=record):
+            return original(directory, name, value, **kwargs)
+        with mock.patch.object(peer, "_atomic_record", side_effect=record):
             code, result, _ = self.invoke()
         self.assertEqual(1, code)
         self.assertEqual("returned", result["state"])
         self.assertEqual("Useful peer answer 雪", result["result"])
         self.assertIn("unavailable", result["evidence_recording"])
         self.assertEqual("call\n", self.calls.read_text())
+
+    def test_atomic_result_publish_preserves_old_receipt_on_replace_failure(self):
+        directory = self.base / "atomic-result"
+        directory.mkdir(mode=0o700)
+        result = directory / "result.json"
+        result.write_bytes(b'{"old":true}')
+        with mock.patch.object(peer.os, "replace", side_effect=OSError("artificial rename failure")):
+            with self.assertRaises(OSError):
+                peer._atomic_record(directory, "result.json", {"new": True})
+        self.assertEqual(b'{"old":true}', result.read_bytes())
+        self.assertEqual(["result.json"], sorted(path.name for path in directory.iterdir()))
+
+    def test_spawned_checkpoint_failure_keeps_terminal_attention_and_excludes_cost(self):
+        original = peer._atomic_record
+
+        def fail_checkpoint(directory, name, value, **kwargs):
+            if name == "checkpoint.json":
+                raise OSError("artificial checkpoint failure")
+            return original(directory, name, value, **kwargs)
+
+        with mock.patch.object(peer, "_atomic_record", side_effect=fail_checkpoint):
+            code, result, _ = self.invoke()
+        self.assertEqual(1, code)
+        self.assertEqual("returned", result["state"])
+        self.assertTrue(result["needs_attention"])
+        self.assertNotIn("follow_up_preparation", result)
+        self.assertIn("durability could not be confirmed", result["evidence_recording"])
+        directory = Path(result["evidence_directory"])
+        self.assertTrue(json.loads((directory / "result.json").read_text())["needs_attention"])
+        self.assertEqual("reported", peer._read_report(directory)["call"]["faults"]["recording"])
+        self.assertIsNone(peer._comparable_cost_receipt(directory))
 
     def test_installed_dispatch_preserves_native_environment_boundary(self):
         with (mock.patch.dict(os.environ, self.environment, clear=True),

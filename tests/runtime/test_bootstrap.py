@@ -42,6 +42,20 @@ class BootstrapTests(unittest.TestCase):
         self.manifest = subject.manifest_for(self.payload)
         self.digest = hashlib.sha256(self.manifest).hexdigest()
 
+    def test_published_payload_closures_remain_frozen_for_release_management(self):
+        historical = subject._PUBLISHED_V0415_PAYLOAD_FILES
+        self.assertNotIn("relay_runtime/agent.py", historical)
+        self.assertNotIn("relay_runtime/review_packet.py", historical)
+        self.assertIn("relay_runtime/agent.py", subject.PAYLOAD_FILES)
+        for names in subject._RELEASE_PAYLOAD_SETS:
+            payload = {name: b"# synthetic released module\n" for name in names}
+            manifest = subject._payload_manifest(payload, release_management=True)
+            self.assertEqual(names, frozenset(subject._validate_manifest(
+                manifest, release_management=True)["members"]))
+            if names != subject.PAYLOAD_FILES:
+                with self.assertRaises(subject.BootstrapError):
+                    subject._validate_manifest(manifest)
+
     def install(self, *, activate=True):
         digest = self.installation.install(self.source, self.manifest)
         self.assertEqual(digest, self.digest)

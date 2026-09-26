@@ -170,6 +170,21 @@ tool loop. Choose bounds proportionate
 to the task so the peer has time to inspect evidence and produce a useful
 answer. Multithread makes one invocation and never automatically retries it.
 
+For Claude, `--model opus --effort high` requests those settings for this call
+without changing the account profile. The dry run and private receipts preserve
+the request; a clean follow-up preserves both flags. Native streaming can report
+a model name, though an alias may resolve to another literal name. Effective
+effort is not verified. These options are not available for the Codex peer.
+
+For a review of working-tree changes, `multithread peer packet --repo
+/absolute/repo --path src/example.py --output-file /absolute/new/packet.txt`
+creates a private, bounded diff packet with a digest. Repeat `--path` for the
+explicit files or directories to include and use `--base COMMIT` for a reviewed
+base revision. The packet includes tracked text changes through the working
+tree; it refuses untracked or binary changes in the selection. **Inspect the
+packet before giving its path to a peer.** It does not scan secrets or change
+the peer's tool permissions. [Packet details](PEER-REFERENCE.md#freeze-a-review-packet).
+
 For a concrete example of a review contribution and its limits, see
 [a peer review that improved v0.4.6](examples/PEER-REVIEW.md).
 
@@ -205,6 +220,8 @@ task, and an unavailable peer does not itself justify changing approval policy.
 Each call retains a private directory containing its request, task, native
 stdout/stderr and interpreted result. Use `--output-dir /absolute/new/directory`
 to choose a durable location; an existing directory is refused without changes.
+Redirect command stdout outside that directory; creating a file there first
+would make the evidence directory exist before the call begins.
 The default is a retained temporary directory, subject to the OS's cleanup
 policy. Its location is printed before launch, together with Claude's requested
 session UUID or a note that Codex will assign the identity.
@@ -221,6 +238,12 @@ The terminal or calling application may buffer or hide stderr. `--json` stdout
 still contains only the final result. Ordinary Claude calls retain their normal
 final-JSON mode; waiting feedback does not inspect native transcripts or change
 permissions, deadlines or retry behavior.
+
+Add `--stream-progress` to a Claude call when intermediate native observations
+would help. It uses Claude's event stream without opening a live input channel;
+`--live-input` also uses that stream. Feedback can report the last observed
+event and bounded frame counts, never task text or proof of continuing progress.
+The default final-JSON call cannot observe intermediate provider activity.
 
 Where a submission stage is unobserved, the waiting message says so. Ordinary
 Claude calls distinguish writing the task from waiting after a complete pipe

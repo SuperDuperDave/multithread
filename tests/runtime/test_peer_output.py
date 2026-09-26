@@ -44,6 +44,23 @@ class PeerOutputTests(unittest.TestCase):
         self.assertNotIn("ARTIFICIAL-PRIVATE", stderr.getvalue())
         self.assertEqual(original, envelope)
 
+    def test_waiting_feedback_reports_only_observed_stream_counts(self):
+        envelope = {"state": "uncertain", "task_delivery": "written",
+                    "native_output_mode": "stream_json",
+                    "native_progress": {"last_event": "assistant_message", "observed_at_seconds": 12.5,
+                                        "assistant_messages": 2, "tool_requests": 3,
+                                        "subagent_frames": 1, "result_frames": 0},
+                    "result": "ARTIFICIAL-PRIVATE-ANSWER"}
+        stderr = io.StringIO()
+        with (redirect_stderr(stderr),
+              mock.patch.object(provider.time, "monotonic", return_value=30)):
+            provider._WaitingFeedback(0, 600, envelope, None)()
+        output = stderr.getvalue()
+        self.assertIn("last observed native event assistant_message at ~12s", output)
+        self.assertIn("2 assistant messages, 3 tool-use blocks, 1 subagent frames", output)
+        self.assertIn("later progress unknown", output)
+        self.assertNotIn("ARTIFICIAL-PRIVATE", output)
+
     def test_waiting_feedback_tracks_local_input_and_submission_observations(self):
         envelope = {"state": "uncertain", "task_submission": "not_submitted"}
         control = SimpleNamespace(closed=False, accepting=True, target=None)

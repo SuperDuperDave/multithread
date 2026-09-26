@@ -32,6 +32,7 @@ RUNTIME_FILES = frozenset({
     "relay_runtime/provider.py", "relay_runtime/codex_peer.py", "relay_runtime/peer_control.py",
     "relay_runtime/agent.py",
     "relay_runtime/claude_peer.py", "relay_runtime/native_io.py",
+    "relay_runtime/review_packet.py",
     "relay_runtime/setup.py", "relay_runtime/update.py",
 })
 SOURCE_FILES = frozenset({"LICENSE", "src/relay_bootstrap.py"}) | {

@@ -21,7 +21,8 @@ from relay_runtime import peer_control, provider
 
 CANARY = "ARTIFICIAL-PRIVATE-REPORT-CANARY"
 CALL_FIELDS = {
-    "provider", "provider_version", "state", "provider_started", "needs_attention", "process_exit_code",
+    "provider", "provider_version", "requested_effort", "model_relation",
+    "state", "provider_started", "needs_attention", "process_exit_code",
     "elapsed_seconds", "provider_turns", "provider_duration_ms", "estimated_cost_usd",
     "actual_billed_cost", "permission_denial_count", "provider_error_count",
     "session_identity", "stdout_observation", "faults", "unavailable_stage",
@@ -145,13 +146,15 @@ class PeerReportTests(unittest.TestCase):
                 os.readlink(path) if stat.S_ISLNK(info.st_mode) else None)
         return observed
 
-    def invoke(self, *, directory=None, structured=True, repo=None):
+    def invoke(self, *, directory=None, structured=True, repo=None, compare_call_dir=None):
         """Guard the public command boundary, independently of report helpers."""
         arguments = ["report", "--call-dir", str(directory or self.directory)]
         if structured:
             arguments.append("--json")
         if repo is not None:
             arguments.extend(("--repo", str(repo)))
+        if compare_call_dir is not None:
+            arguments.extend(("--compare-call-dir", str(compare_call_dir)))
         before = self.snapshot()
         output, errors = io.StringIO(), io.StringIO()
         native_open, builtin_open, io_open = os.open, builtins.open, io.open
@@ -161,7 +164,8 @@ class PeerReportTests(unittest.TestCase):
             self.assertFalse(flags & (os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND),
                              "Report attempted a write-capable open")
             if not flags & os.O_DIRECTORY:
-                self.assertEqual("result.json", os.fspath(path), "Report read unrelated evidence")
+                self.assertIn(os.fspath(path), ("result.json", "checkpoint.json"),
+                              "Report read unrelated evidence")
                 self.assertIsInstance(kwargs.get("dir_fd"), int)
                 self.assertTrue(flags & os.O_NOFOLLOW, "Receipt open must refuse symlinks")
                 self.assertTrue(flags & os.O_NONBLOCK, "Receipt open must not block on a FIFO")
@@ -640,6 +644,57 @@ class PeerReportTests(unittest.TestCase):
         self.assertIn("missing", output)
         self.assertNotIn("provider_error", output)
         self.assertNotIn("active", output.lower())
+
+    def test_missing_terminal_receipt_projects_only_a_nonterminal_checkpoint(self):
+        checkpoint = {"schema": 1, "kind": "peer_checkpoint", "provider": "claude",
+                      "phase": "spawned", "provider_start_observation": "confirmed",
+                      "requested_session_id": CANARY, "outcome": "unknown"}
+        path = self.directory / "checkpoint.json"
+        path.write_text(json.dumps(checkpoint), encoding="utf-8")
+        path.chmod(0o600)
+        code, report = self.invoke()
+        self.assertEqual(1, code)
+        self.assertEqual("incomplete", report["report_state"])
+        self.assertEqual("missing", report["receipt_status"])
+        self.assertEqual({"provider": "claude", "phase": "spawned",
+                          "provider_start_observation": "confirmed", "outcome": "unknown"},
+                         report["checkpoint"])
+        self.assertNotIn(CANARY, json.dumps(report))
+
+    def test_before_spawn_checkpoint_does_not_claim_provider_start(self):
+        checkpoint = {"schema": 1, "kind": "peer_checkpoint", "provider": "claude",
+                      "phase": "before_spawn", "provider_start_observation": "unknown",
+                      "requested_session_id": CANARY, "outcome": "unknown"}
+        path = self.directory / "checkpoint.json"
+        path.write_text(json.dumps(checkpoint), encoding="utf-8")
+        path.chmod(0o600)
+        code, report = self.invoke()
+        self.assertEqual(1, code)
+        self.assertEqual("unknown", report["checkpoint"]["provider_start_observation"])
+        self.assertNotIn(CANARY, json.dumps(report))
+
+    def test_same_session_cumulative_difference_is_qualified_and_read_only(self):
+        session = "00000000-0000-4000-8000-000000000001"
+        prior = self.base / "prior"
+        prior.mkdir(mode=0o700)
+        earlier = self.receipt(session_id=session, resumed=False,
+                               cost_scope_id="cumulative_through_latest_native_result",
+                               estimated_cost_usd=1.25)
+        (prior / "result.json").write_text(json.dumps(earlier), encoding="utf-8")
+        (prior / "result.json").chmod(0o600)
+        self.write(self.receipt(session_id=session, resumed=True,
+                                cost_scope_id="cumulative_through_latest_native_result",
+                                estimated_cost_usd=1.5))
+        code, report = self.invoke(compare_call_dir=prior)
+        self.assertEqual(0, code)
+        self.assertEqual("estimated", report["cost_comparison"]["status"])
+        self.assertEqual(0.25, report["cost_comparison"]["estimated_difference_usd"])
+        self.assertIn("intervening", report["cost_comparison"]["scope"])
+        self.write(self.receipt(session_id="other-session", resumed=True,
+                                cost_scope_id="cumulative_through_latest_native_result",
+                                estimated_cost_usd=1.5))
+        _, report = self.invoke(compare_call_dir=prior)
+        self.assertEqual("unavailable", report["cost_comparison"]["status"])
 
     def test_unavailable_human_reports_offer_one_private_preserving_next_step(self):
         valid = json.dumps(self.receipt(result=CANARY)).encode("utf-8")

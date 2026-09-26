@@ -232,6 +232,13 @@ def _native_identity(value):
     return value
 
 
+def _model_selection(value):
+    if (not isinstance(value, str) or not 0 < len(value) <= 128 or value.startswith("-") or any(
+            ord(character) < 33 or ord(character) > 126 for character in value)):
+        raise argparse.ArgumentTypeError("use a nonempty printable model name without spaces (at most 128 characters)")
+    return value
+
+
 def _positive(value):
     number = int(value)
     if not 1 <= number <= 3600:
@@ -269,6 +276,41 @@ def _record(directory, name, value):
         stream.write(json.dumps(value, ensure_ascii=True, sort_keys=True, indent=2).encode("utf-8"))
         stream.flush()
         os.fsync(stream.fileno())
+
+
+def _sync_directory(directory):
+    parent = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(parent)
+    finally:
+        os.close(parent)
+
+
+def _atomic_record(directory, name, value, *, sync_directory=False):
+    """Publish a complete private JSON file; a torn write leaves the old file."""
+    fd, temporary = tempfile.mkstemp(prefix=".receipt-", dir=directory)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            os.fchmod(stream.fileno(), 0o600)
+            stream.write(json.dumps(value, ensure_ascii=True, sort_keys=True).encode("utf-8"))
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, directory / name)
+        if sync_directory:
+            _sync_directory(directory)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def _call_checkpoint(envelope, phase):
+    # A checkpoint is never a terminal receipt. A killed caller may have
+    # crossed the spawn boundary before it could update this observation.
+    return {"schema": 1, "kind": "peer_checkpoint", "phase": phase,
+            "provider": envelope["provider"],
+            "requested_session_id": envelope["requested_session_id"],
+            "provider_start_observation": "confirmed" if phase == "spawned" else "unknown",
+            "outcome": "unknown"}
 
 
 def _drain(observer):
@@ -317,6 +359,22 @@ class _WaitingFeedback:
             stage = "task delivery incomplete; waiting for provider exit"
         else:
             stage = "waiting; submission stage not recorded"
+        activity = self.envelope.get("native_progress")
+        if (isinstance(activity, dict) and activity.get("last_event") in
+                ("initialized", "assistant_message", "subagent_frame", "native_result")
+                and type(activity.get("observed_at_seconds")) in (int, float)
+                and activity["observed_at_seconds"] >= 0):
+            progress = (f"last observed native event {activity['last_event']} at "
+                        f"~{activity['observed_at_seconds']:.0f}s; "
+                        f"{activity.get('assistant_messages', 0)} assistant messages, "
+                        f"{activity.get('tool_requests', 0)} tool-use blocks, "
+                        f"{activity.get('subagent_frames', 0)} subagent frames; "
+                        "later progress unknown")
+        else:
+            progress = ("provider progress unknown (final JSON has no intermediate events; "
+                        "use --stream-progress on a new Claude call)"
+                        if self.envelope.get("native_output_mode") == "final_json" else
+                        "provider progress unknown")
         if self.control is None:
             channel = "input not enabled for this call"
         elif "control_fault" in self.envelope:
@@ -329,7 +387,7 @@ class _WaitingFeedback:
             channel = "input target advertised; new input acceptance unknown"
         try:
             print(f"multithread peer: {stage}; {now - self.started:.0f}s elapsed / "
-                  f"{self.timeout}s call limit; {channel}; provider progress unknown.",
+                  f"{self.timeout}s call limit; {channel}; {progress}.",
                   file=sys.stderr, flush=True)
         except (OSError, UnicodeError, ValueError):
             # A lost diagnostic sink must not interrupt the owned provider.
@@ -567,8 +625,11 @@ def peer_main(argv=None, *, report_entry=None):
     if raw and raw[0] == "control":
         from .peer_control import control_main
         return control_main(raw[1:])
+    if raw and raw[0] == "packet":
+        from .review_packet import packet_main
+        return packet_main(raw[1:])
     parser = argparse.ArgumentParser(prog="multithread peer", description="Call a native provider and return its observed result to the initiating task.",
-                                     epilog="For an existing call: multithread peer report --call-dir PATH [--json] produces a read-only support summary; peer control --help covers live input.")
+                                     epilog="For an existing call: peer report --call-dir PATH [--json] gives a read-only summary; peer packet --help freezes a scoped review diff; peer control --help covers live input.")
     parser.add_argument("client", choices=("claude", "codex"))
     parser.add_argument("--repo", type=Path, default=Path.cwd(), help="enrolled peer checkout")
     parser.add_argument("--multithread", "--relay", dest="relay", type=Path, help="reviewed absolute installed launcher; --relay is a compatibility spelling")
@@ -578,13 +639,21 @@ def peer_main(argv=None, *, report_entry=None):
     parser.add_argument("--output-dir", type=Path, help="new private evidence directory; default: retained temporary directory")
     parser.add_argument("--timeout", type=_positive, default=600, help="call wall-time limit in seconds, 1 through 3600 (default: 600)")
     parser.add_argument("--max-turns", type=_positive, help="optional Claude agentic-turn cap, 1 through 3600; tool/source work can consume it before the final answer; no cap by default")
+    parser.add_argument("--model", type=_model_selection, help="request this Claude model for this call; the provider decides what it actually uses")
+    parser.add_argument("--effort", choices=("low", "medium", "high", "xhigh", "max"),
+                        help="request this Claude effort level for this call; effective effort is not verified")
     parser.add_argument("--live-input", action="store_true", help="enable Claude session input while this call runs; queued input may start later turns within the call timeout. Codex always exposes exact-turn input")
+    parser.add_argument("--stream-progress", action="store_true", help="use Claude's native event stream for content-free progress observations, without enabling live input; the default remains final JSON")
     parser.add_argument("--dry-run", action="store_true", help="validate task/configuration and print a plan; no provider or evidence writes")
     parser.add_argument("--json", action="store_true", help="return a structured result; this DOES launch unless --dry-run is used; exit 0 means a returned turn, so also check needs_attention and task evidence")
     args = parser.parse_args(raw)
     args.report_entry = report_entry
     if args.client == "codex" and args.max_turns is not None:
         parser.error("--max-turns is a Claude option; Codex returns one native turn with its normal tool loop")
+    if args.client == "codex" and (args.model is not None or args.effort is not None):
+        parser.error("--model and --effort are Claude options in this peer release")
+    if args.client == "codex" and args.stream_progress:
+        parser.error("Codex already uses native streaming; --stream-progress is a Claude option")
     if args.client == "claude" and args.resume is not None:
         try:
             _session(args.resume)
@@ -624,8 +693,14 @@ def _follow_up_preparation(args, plan, envelope):
               "--timeout", str(args.timeout)]
     if args.max_turns is not None:
         prefix.extend(["--max-turns", str(args.max_turns)])
+    if args.model is not None:
+        prefix.extend(["--model", args.model])
+    if args.effort is not None:
+        prefix.extend(["--effort", args.effort])
     if args.live_input:
         prefix.append("--live-input")
+    if args.stream_progress:
+        prefix.append("--stream-progress")
     # Never copy the old task/evidence destination. A bare final option requires
     # a new task path before parsing can reach stdin or launch preparation.
     prefix.extend(["--dry-run", "--json", "--task-file"])
@@ -643,6 +718,10 @@ def _run_peer(args, interruption):
                 "relay_acknowledgement": "not_checked", "workflow_completion": "not_checked",
                 "authentication": "inherited from provider; not verified",
                 "elapsed_seconds": None, "usage": None, "actual_billed_cost": "unknown",
+                "requested_model": args.model, "requested_effort": args.effort,
+                "effective_effort": "unknown",
+                "model_observation": {"source": "unavailable", "reported_model": None,
+                                      "relation": "unknown"},
                 "producer_runtime": _producer_runtime()}
     directory = None
     plan = None
@@ -651,7 +730,8 @@ def _run_peer(args, interruption):
     control = None
     code = 1
     stage = "task_read"
-    streaming = args.client == "codex" or args.live_input
+    streaming = args.client == "codex" or args.live_input or args.stream_progress
+    envelope["native_output_mode"] = "stream_json" if streaming else "final_json"
     try:
         task = _task(args.task_file)
         stage = "relay_configuration"
@@ -663,6 +743,10 @@ def _run_peer(args, interruption):
                 native.extend(["--verbose", "--input-format", "stream-json", "--replay-user-messages"])
             if args.max_turns is not None:
                 native.extend(["--max-turns", str(args.max_turns)])
+            if args.model is not None:
+                native.extend(["--model", args.model])
+            if args.effort is not None:
+                native.extend(["--effort", args.effort])
             native.extend(["--resume" if args.resume else "--session-id", session])
         else:
             native = [*plan["argv"], "app-server", "--listen", "stdio://"]
@@ -677,10 +761,17 @@ def _run_peer(args, interruption):
             directory = Path(tempfile.mkdtemp(prefix="relay-peer-"))
         else:
             candidate = args.output_dir.absolute()
-            candidate.mkdir(mode=0o700)  # Refuse an existing directory; never overwrite another call.
+            try:
+                candidate.mkdir(mode=0o700)  # Refuse an existing directory; never overwrite another call.
+            except FileExistsError:
+                raise LaunchError(f"--output-dir already exists: {candidate}. Choose a new directory; redirect command output outside it.") from None
+            except FileNotFoundError:
+                raise LaunchError(f"--output-dir parent does not exist: {candidate.parent}. Create the parent or choose a new path.") from None
+            except PermissionError:
+                raise LaunchError(f"--output-dir parent is not writable: {candidate.parent}. Choose a writable private location.") from None
             directory = candidate
         envelope["evidence_directory"] = str(directory)
-        if streaming:
+        if args.client == "codex" or args.live_input:
             control = CallControl(directory, args.client)
             envelope["control"] = {"call_id": control.call["call_id"],
                                    "input_mode": control.call["input_mode"],
@@ -688,10 +779,15 @@ def _run_peer(args, interruption):
         _record(directory, "request.json", {"schema": 1, "argv": native, "repo": plan["repo"],
                                            "producer_runtime": envelope["producer_runtime"],
                                            "requested_session_id": session, "resumed": bool(args.resume),
+                                           "requested_model": args.model, "requested_effort": args.effort,
                                            "task_sha256": hashlib.sha256(task).hexdigest(),
                                            "timeout_seconds": args.timeout})
         with _private_file(directory, "task.txt") as stream:
             stream.write(task)
+            stream.flush()
+            os.fsync(stream.fileno())
+        _record(directory, "checkpoint.json", _call_checkpoint(envelope, "before_spawn"))
+        _sync_directory(directory)
         # This durable breadcrumb survives an interrupted caller. Provider stdout
         # and stderr can contain private task context; they are never auto-published.
         print("multithread peer: session " + _display_text(session or "assigned by provider")
@@ -712,6 +808,12 @@ def _run_peer(args, interruption):
                                                stdout=output, stderr=errors, start_new_session=True)
                 finally:
                     interruption["starting"] = False
+                try:
+                    _atomic_record(directory, "checkpoint.json", _call_checkpoint(envelope, "spawned"),
+                                   sync_directory=True)
+                except OSError:
+                    envelope.update(needs_attention=True,
+                                    evidence_recording="Recovery checkpoint durability could not be confirmed after provider spawn; inspect retained evidence.")
                 if streaming:
                     if args.client == "codex":
                         from . import codex_peer as driver
@@ -726,7 +828,8 @@ def _run_peer(args, interruption):
                     _call_final_json(process, task, args.timeout, feedback, envelope)
                 else:
                     driver.run(process, task, plan["repo"], args.resume,
-                               directory, envelope, args.timeout, control=ObservedControl(control, envelope), observer=observer,
+                               directory, envelope, args.timeout,
+                               control=ObservedControl(control, envelope) if control is not None else None, observer=observer,
                                feedback=feedback,
                                **({"expected_hook": plan["relay_plan"]["hook_command"]} if args.client == "codex" else {}))
                     # EOF is the ordinary end of this owned stdio server.
@@ -813,6 +916,9 @@ def _run_peer(args, interruption):
         if "control_fault" in envelope:
             envelope["needs_attention"] = True
             code = 1
+        if "evidence_recording" in envelope:
+            envelope["needs_attention"] = True
+            code = 1
         if (process is not None and not streaming
                 and "stdout_observation" not in envelope and "stdout_observation_error" not in envelope):
             # An interrupted final-JSON call has no validated result. Preserve
@@ -828,7 +934,7 @@ def _run_peer(args, interruption):
         envelope["follow_up_preparation"] = preparation
     if directory is not None:
         try:
-            _record(directory, "result.json", envelope)
+            _atomic_record(directory, "result.json", envelope)
         except OSError:
             envelope.pop("follow_up_preparation", None)
             envelope["needs_attention"] = True
@@ -902,6 +1008,14 @@ def _report_projection(record):
         raise ValueError()
     call = {key: record[key] for key in ("provider", "state", "provider_started", "needs_attention")}
     call["provider_version"] = _report_provider_version(record)
+    requested_effort = record.get("requested_effort")
+    call["requested_effort"] = (requested_effort if requested_effort in
+                                ("low", "medium", "high", "xhigh", "max") else None)
+    model_observation = record.get("model_observation")
+    call["model_relation"] = (model_observation.get("relation") if isinstance(model_observation, dict)
+                              and model_observation.get("relation") in
+                              ("same_literal", "different_name_unverified", "prior_init_only",
+                               "not_requested", "unknown") else "unknown")
     call["caller_stop_reason"] = _caller_stop_reason(record)
     call["elapsed_seconds"] = _report_number(record, "elapsed_seconds")
     call["process_exit_code"] = _report_number(record, "process_exit_code", integer=True, minimum=-(2**31))
@@ -988,6 +1102,88 @@ def _report_projection(record):
     return call
 
 
+def _read_checkpoint(directory):
+    """Project a private recovery breadcrumb when a terminal receipt is missing."""
+    from .peer_control import ControlError, _directory, _object, _private
+    try:
+        parent = _directory(directory)
+        try:
+            fd = os.open("checkpoint.json", os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW, dir_fd=parent)
+        finally:
+            os.close(parent)
+        with os.fdopen(fd, "rb") as stream:
+            _private(os.fstat(stream.fileno()))
+            body = stream.read(2049)
+        if len(body) > 2048:
+            return None
+        value = json.loads(body.decode("utf-8"), object_pairs_hook=_object)
+        if (not isinstance(value, dict) or type(value.get("schema")) is not int or value["schema"] != 1
+                or value.get("kind") != "peer_checkpoint"
+                or value.get("provider") not in ("claude", "codex")
+                or value.get("phase") not in ("before_spawn", "spawned")
+                or value.get("provider_start_observation") !=
+                   ("confirmed" if value["phase"] == "spawned" else "unknown")
+                or value.get("outcome") != "unknown"):
+            return None
+        return {"provider": value["provider"], "phase": value["phase"],
+                "provider_start_observation": value["provider_start_observation"],
+                "outcome": "unknown"}
+    except (OSError, ControlError, ValueError, UnicodeError, RecursionError):
+        return None
+
+
+def _comparable_cost_receipt(directory):
+    """Read only fields needed to compare two private cumulative estimates."""
+    from .peer_control import ControlError, _directory, _object, _private
+    def invalid_constant(_):
+        raise ValueError()
+    try:
+        parent = _directory(directory)
+        try:
+            identity = os.fstat(parent)
+            fd = os.open("result.json", os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW, dir_fd=parent)
+        finally:
+            os.close(parent)
+        with os.fdopen(fd, "rb") as stream:
+            _private(os.fstat(stream.fileno()))
+            body = stream.read(_MAX_RESULT + 1)
+        if len(body) > _MAX_RESULT:
+            return None
+        value = json.loads(body.decode("utf-8"), object_pairs_hook=_object,
+                           parse_constant=invalid_constant)
+        if not isinstance(value, dict):
+            return None
+        _report_projection(value)
+        if (type(value.get("schema")) is not int or value["schema"] != 1
+                or value.get("provider") != "claude" or value.get("state") != "returned"
+                or value.get("provider_started") is not True
+                or value.get("needs_attention") is not False
+                or not isinstance(value.get("session_id"), str) or not value["session_id"]
+                or value.get("cost_scope_id") != "cumulative_through_latest_native_result"
+                or type(value.get("estimated_cost_usd")) not in (int, float)
+                or not math.isfinite(value["estimated_cost_usd"])
+                or not 0 <= value["estimated_cost_usd"] <= 2**53 - 1):
+            return None
+        _session(value["session_id"])
+        return ((identity.st_dev, identity.st_ino), value["session_id"],
+                value.get("resumed"), value["estimated_cost_usd"])
+    except (OSError, ControlError, ValueError, UnicodeError, RecursionError, OverflowError,
+            argparse.ArgumentTypeError):
+        return None
+
+
+def _cost_comparison(current, earlier):
+    latest, prior = _comparable_cost_receipt(current), _comparable_cost_receipt(earlier)
+    result = {"status": "unavailable", "estimated_difference_usd": None,
+              "scope": "two caller-selected cumulative Claude receipts; intervening session activity is not excluded; not billing"}
+    if (latest is None or prior is None or latest[0] == prior[0]
+            or latest[1] != prior[1] or latest[2] is not True
+            or latest[3] < prior[3]):
+        return result
+    result.update(status="estimated", estimated_difference_usd=round(latest[3] - prior[3], 9))
+    return result
+
+
 def _read_report(directory):
     from .peer_control import ControlError, _directory, _object, _private
     report = {"schema": 1, "kind": "peer_report", "report_state": "unavailable",
@@ -999,6 +1195,9 @@ def _read_report(directory):
                 fd = os.open("result.json", os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW, dir_fd=parent)
             except FileNotFoundError:
                 report["receipt_status"] = "missing"
+                checkpoint = _read_checkpoint(directory)
+                if checkpoint is not None:
+                    report.update(report_state="incomplete", checkpoint=checkpoint)
                 return report
         finally:
             os.close(parent)
@@ -1037,17 +1236,27 @@ def _read_report(directory):
 
 def report_main(argv=None):
     parser = argparse.ArgumentParser(prog="multithread peer report",
-        description="Summarize an existing private result receipt using only selected diagnostic fields. Reads result.json; no provider or ledger operation.")
+        description="Summarize selected fields from a private result receipt, or an incomplete recovery checkpoint. No provider or ledger operation.")
     parser.add_argument("--call-dir", required=True, type=Path, help="exact private directory retained by the peer call")
+    parser.add_argument("--compare-call-dir", type=Path,
+                        help="earlier private call directory for an optional same-session cumulative cost difference")
     parser.add_argument("--repo", type=Path, help="accepted for the common command prefix; unused by this receipt-only report")
     parser.add_argument("--json", action="store_true", help="print the structured support report; exit 0 means reported, not a successful call")
     args = parser.parse_args(argv)
     report = _read_report(args.call_dir)
+    if args.compare_call_dir is not None:
+        report["cost_comparison"] = _cost_comparison(args.call_dir, args.compare_call_dir)
     if args.json:
         print(json.dumps(report, ensure_ascii=True, sort_keys=True))
     else:
         print("Multithread peer report: " + report["report_state"])
         print("Result receipt: " + report["receipt_status"])
+        comparison = report.get("cost_comparison")
+        if comparison is not None:
+            print("Selected cumulative cost difference: " +
+                  (str(comparison["estimated_difference_usd"]) + " USD estimate"
+                   if comparison["status"] == "estimated" else "unavailable")
+                  + "; intervening session activity is not excluded; not billing.")
         call = report["call"]
         if call is not None:
             print(f"Recorded call: {call['provider']} / {call['state']}")
@@ -1055,6 +1264,12 @@ def report_main(argv=None):
             print("Recorded provider version: " + (
                 version["version"] + " (provider-reported; " + version["source"] + ")"
                 if version["status"] == "reported" else "unknown (" + version["status"] + ")"))
+            if call["provider"] == "claude" and call["requested_effort"] is not None:
+                print("Requested effort: " + call["requested_effort"]
+                      + "; effective effort unknown.")
+            if call["provider"] == "claude" and call["model_relation"] != "unknown":
+                print("Model observation: " + call["model_relation"]
+                      + " (name comparison only; aliases may resolve to another name).")
             print("Recorded task submission: " + call["task_submission"])
             print("Recorded producer runtime identity: " + call["producer_runtime_identity"] + " (digest omitted)")
             print("Needs attention: " + ("yes" if call["needs_attention"] else "no"))
@@ -1081,6 +1296,11 @@ def report_main(argv=None):
                   + str(call["native_input_unwritten_bytes"] if call["native_input_unwritten_bytes"] is not None else "unknown")
                   + "; a pipe write does not prove native consumption.")
         else:
+            checkpoint = report.get("checkpoint")
+            if checkpoint is not None:
+                print("Recovery checkpoint: " + checkpoint["provider"] + " / " + checkpoint["phase"]
+                      + "; provider start " + checkpoint["provider_start_observation"]
+                      + "; outcome unknown. The caller may have stopped before its terminal receipt.")
             next_step = {
                 "missing": "compare the selected call directory with the original call's retained-evidence location.",
                 "malformed": "inspect the original private result.json locally for invalid or incomplete data without rewriting it.",
@@ -1088,6 +1308,8 @@ def report_main(argv=None):
                 "unsupported_schema": "select a reviewed reporter that supports the retained receipt's schema, preserving the original receipt.",
                 "too_large": "inspect the original private receipt locally in bounded portions without truncating or rewriting it.",
             }[report["receipt_status"]]
+            if checkpoint is not None:
+                next_step = "inspect the retained private task, native output and durable work; do not infer completion or retry automatically."
             print("Next: " + next_step)
         print("Retained receipt only: provider activity, cause and workflow completion are not checked.")
         print("Review before sharing. Task/answer text, paths, identities, hashes and arbitrary native diagnostics are excluded.")
@@ -1158,7 +1380,7 @@ def _display_peer(envelope, *, report_entry=None):
                 print("Output capture was truncated; only the captured prefix is available.")
     if envelope.get("permission_denials"):
         print("Permission requests were denied; review them in the local result before continuing.")
-    print(envelope.get("message", "Inspect the peer result."))
+    print(_display_text(envelope.get("message", "Inspect the peer result.")))
     if type(envelope.get("resumed")) is bool:
         print("Requested session mode: " + ("resume" if envelope["resumed"] else "fresh"))
     try:

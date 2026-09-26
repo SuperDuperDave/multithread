@@ -66,6 +66,15 @@ demonstration asset.
 | Interrupt, Codex only | Observe interrupted turn, requiring turn_id | Empty |
 | Other events, including Claude Interrupt | Ignore | Empty |
 
+SessionStart and UserPromptSubmit each return one context object by design.
+On an initial prompt, their contract and brief text can be similar; the prompt
+hook refreshes the brief after ledger changes. Two event responses alone do not
+show that a handler ran twice. Before removing either delivery, a private native
+trace must establish whether both contexts reach the same model request, whether
+startup context remains available after resume or compaction, and whether the
+effective provider configuration registered the same hook more than once.
+The current hook receipts do not establish those provider behaviors.
+
 The context combines a minimal, versioned agent contract and the existing bounded
 brief, with an 8 KiB UTF-8 total cap. It includes the exact coordination identity
 and installed command argv. Identity labels are not authentication. Ledger fields
