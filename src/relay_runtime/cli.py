@@ -23,7 +23,7 @@ from relay_core.store import RelayStore, _bind_installed_access
 from .admission import Admission
 from .confinement import ConfinementError, abi_version
 from .enrollment import Registry, EnrollmentError
-from . import account_launcher
+from . import account_launcher, hook_argv
 
 _MAX_OUTPUT = 16 * 1024 * 1024
 _MAX_PROVIDER_CONTEXT = 8 * 1024
@@ -59,7 +59,7 @@ def _parser():
             config = action.add_parser("provider-config", help="print reviewed invocation arguments without installing settings or launching a provider")
             config.add_argument("--client", required=True, choices=("codex", "claude"))
             config.add_argument("--launcher-name", choices=("multithread", "relay"), default="relay",
-                                help="exact installed hook entry; native helpers select multithread. Default relay preserves the existing configuration API")
+                                help="exact installed hook entry for Claude; native helpers select multithread. Default relay preserves the existing configuration API. Codex always uses multithread")
             for name, description in (("agent", "use an optional account-registered agent adapter"),
                                       ("launch", "review hooks and start an interactive native provider"),
                                       ("peer", "call Codex or Claude and return its result to this task"),
@@ -78,7 +78,7 @@ def _readonly(args):
         args.command == "ratchet" and args.ratchet_command == "review")
 
 
-def _provider_input(client):
+def _provider_input(client, *, from_cwd=False):
     # Parse before admission solely to choose the read-only worker profile.
     # Payload paths, prompts, tool data and credentials confer no authority and
     # are discarded. Only --repo or the real process cwd selects enrollment.
@@ -88,6 +88,15 @@ def _provider_input(client):
         raise ValidationError("provider hook requires an event name")
     if name not in _PROVIDER_EVENTS or (name == "Interrupt" and client != "codex"):
         return None
+    if from_cwd and "cwd" in payload:
+        # The process directory selects enrollment; the provider's stated
+        # session directory can only veto a mismatch, never select a checkout.
+        try:
+            same = os.path.samestat(os.stat(payload["cwd"]), os.stat("."))
+        except (OSError, TypeError, ValueError):
+            same = False
+        if not same:
+            raise ValidationError("provider hook ran outside its session directory")
     selected = {"hook_event_name": name}
     for key in ("session_id", "prompt_id", "turn_id"):
         value = payload.get(key)
@@ -146,8 +155,11 @@ def _provider_contract(client, session, repo):
 
 def _provider_configuration(args):
     repo = str(Path(args.repo or os.getcwd()).absolute())
-    launcher = account_launcher(compatibility=getattr(args, "launcher_name", "relay") == "relay")
-    command = shlex.join([str(launcher), "--repo", repo, "provider-hook", "--client", args.client])
+    # Codex trusts exact command text, so its hook has one spelling whatever
+    # entry name was asked for; Claude keeps the requested entry.
+    launcher = account_launcher(compatibility=args.client != "codex"
+                                and getattr(args, "launcher_name", "relay") == "relay")
+    command = shlex.join(hook_argv(launcher, args.client, repo))
     events = ["SessionStart", "UserPromptSubmit", "Stop", "SessionEnd"]
     if args.client == "codex":
         events.append("Interrupt")
@@ -375,7 +387,7 @@ def main(argv=None, *, registry=None, command_alias_check=None):
             return {"agent": agent_main, "launch": launch_main, "peer": peer_main,
                     "setup": setup_main, "update": update_main}[args.command](forwarded)
         if args.command == "provider-hook":
-            args.provider_payload = _provider_input(args.client)
+            args.provider_payload = _provider_input(args.client, from_cwd=args.repo is None)
             if args.provider_payload is None:
                 return 0
         if threading.active_count() != 1:

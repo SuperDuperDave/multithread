@@ -15,8 +15,17 @@ Use the installed, verified launcher and its `--help` for exact syntax. Do not
 run a checkout-owned executable in place of the installed launcher. For first
 installation, enrollment, readiness, or native trust review, follow the current
 [setup guide](https://github.com/SuperDuperDave/multithread/blob/main/docs/SETUP.md).
-`multithread setup --repo <checkout> --check` reports preparation, not provider
-authentication, hook delivery, tool capability, or a completed collaboration.
+`multithread setup --repo <checkout> --check` reports preparation and whether
+Codex lists the Multithread hooks as trusted, not provider authentication, hook
+delivery, tool capability, or a completed collaboration.
+
+Launch and hook trust are the person's steps. Never run `multithread launch`,
+and never review, grant or edit native hook trust or provider hook
+configuration, including Codex's `/hooks` review and its `config.toml`. Leave
+`--multithread` and `--relay` unset: Codex trusts one exact hook command, the
+account launcher setup prints. When a peer call or setup check says hooks are
+not ready, stop and report its refusal and the remedy it prints to the person;
+do not relaunch, retry or work around it.
 
 Choose the interaction that fits the task:
 

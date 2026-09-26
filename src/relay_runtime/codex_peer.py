@@ -9,6 +9,8 @@ import json
 import os
 from pathlib import Path
 import selectors
+import shlex
+import signal
 import subprocess
 import time
 
@@ -20,6 +22,161 @@ from .native_io import (USAGE_SCOPES, measurement_error, measurement_number,
 
 _MAX_PENDING = 128
 _MAX_DETAILS = 8
+_MAX_LISTING = 1024 * 1024
+_CLIENT_INFO = {"name": "multithread", "title": "Multithread", "version": "0.4.1"}
+_HOOK_EVENTS = ("sessionStart", "userPromptSubmit", "stop", "sessionEnd", "interrupt")
+# Statuses a person resolves in Codex's /hooks review; any other is configuration.
+_REVIEWABLE = frozenset({"untrusted", "modified", "disabled"})
+
+
+def _multithread_hook(command, launcher):
+    """Recognize any Multithread provider-hook command, current or older."""
+    try:
+        argv = shlex.split(command) if isinstance(command, str) else []
+    except ValueError:
+        return False
+    return (bool(argv) and "provider-hook" in argv
+            and (argv[0] == launcher or Path(argv[0]).name in ("multithread", "relay")))
+
+
+def hook_readiness(result, repo, expected_hook):
+    """Classify each Multithread hook exactly as Codex lists it for this checkout.
+
+    Every session-flag entry for an event, and any Multithread provider hook
+    from another source (including an older per-checkout command), counts before
+    commands are compared, so a second handler cannot sit unseen beside ours.
+    """
+    groups = result.get("data") if isinstance(result, dict) else None
+    if not isinstance(groups, list) or any(not isinstance(group, dict) for group in groups):
+        raise _ProtocolError("Native hook readiness could not be read; no task was submitted.")
+    groups = [group for group in groups if group.get("cwd") == repo]
+    if len(groups) != 1 or not isinstance(groups[0].get("hooks"), list):
+        raise _ProtocolError("Native hook readiness did not identify the selected checkout; no task was submitted.")
+    listed = {name: [] for name in _HOOK_EVENTS}
+    launcher = shlex.split(expected_hook)[0]
+    for hook in groups[0]["hooks"]:
+        if (isinstance(hook, dict) and hook.get("eventName") in listed
+                and (hook.get("source") == "sessionFlags" or _multithread_hook(hook.get("command"), launcher))):
+            listed[hook["eventName"]].append(hook)
+    events = {}
+    for name, hooks in listed.items():
+        hook = hooks[0] if len(hooks) == 1 else {}
+        if not hooks:
+            events[name] = "missing"
+        elif len(hooks) > 1:
+            events[name] = "duplicate"
+        elif (hook.get("source") != "sessionFlags"
+              or hook.get("command") != expected_hook or hook.get("handlerType") != "command"
+              or hook.get("async", False) is not False or hook.get("matcher") is not None
+              or type(hook.get("timeoutSec")) is not int or hook["timeoutSec"] != 3):
+            events[name] = "mismatched"
+        elif hook.get("enabled") is not True:
+            events[name] = "disabled"
+        elif hook.get("trustStatus") in ("trusted", "untrusted", "modified"):
+            events[name] = hook["trustStatus"]
+        else:
+            events[name] = "unrecognized"
+    unready = [name for name in _HOOK_EVENTS if events[name] != "trusted"]
+    state = ("ready" if not unready else "needs_review"
+             if all(events[name] in _REVIEWABLE for name in unready) else "needs_configuration")
+    return {"state": state, "events": events, "unready_events": sorted(unready),
+            "ready_events": sorted(set(events) - set(unready))}
+
+
+def hook_remedy(readiness, repo, expected_hook):
+    """Name the unready events by status and give the one next step for them."""
+    events = readiness["events"]
+    statuses = sorted({events[name] for name in readiness["unready_events"]})
+    detail = "; ".join(status + ": " + ", ".join(name for name in _HOOK_EVENTS if events[name] == status)
+                       for status in statuses)
+    launcher = shlex.split(expected_hook)[0]
+    launch = [launcher, "launch", "codex", "--repo", repo]
+    check = shlex.join([launcher, "setup", "--repo", repo, "--check", "--json"])
+    if readiness["state"] == "needs_review":
+        action = ("In their own terminal, the person reviews once in Codex: run " + shlex.join(launch) + ", type launch, open /hooks "
+                  "and trust the five Multithread hooks running " + expected_hook
+                  + ". That review covers every enrolled checkout and worktree.")
+        if "modified" in statuses:
+            action += (" Modified means Codex last trusted a different command in that slot, such as an"
+                       " older per-checkout Multithread hook; trust only this exact command.")
+    elif statuses == ["missing"] and len(readiness["unready_events"]) == len(_HOOK_EVENTS):
+        action = ("Codex listed none of these hooks: check that Codex hooks are enabled (features.hooks), then inspect "
+                  + check + ".")
+    else:
+        action = ("Codex did not load these hooks as Multithread generated them: compare the plan in "
+                  + check + " with your Codex hook configuration.")
+    # The reader may be an agent: launch and hook trust stay with the person.
+    action += " This is the person's step; an agent reports it and never runs launch or changes hook trust."
+    return "Codex hooks are not ready (" + detail + ")", action
+
+
+def list_hooks(argv, repo, *, timeout=15, on_start=None):
+    """Ask Codex's app server for one checkout's hooks: initialize and hooks/list only.
+
+    This starts Codex but creates no thread or turn, submits no task and changes
+    no trust. ProtocolError, OSError or TimeoutExpired mean the listing is
+    unavailable, never that hooks are absent.
+    """
+    process = subprocess.Popen([*argv, "app-server", "--listen", "stdio://"], cwd=repo,
+                               stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                               stderr=subprocess.DEVNULL, start_new_session=True)
+    if on_start is not None:
+        on_start()
+    deadline = time.monotonic() + timeout
+    buffer = bytearray()
+    received = 0
+
+    def send(value):
+        process.stdin.write((json.dumps(value, ensure_ascii=True, separators=(",", ":")) + "\n").encode("utf-8"))
+        process.stdin.flush()
+
+    listing_requested = False
+    try:
+        send({"id": 1, "method": "initialize", "params": {"clientInfo": _CLIENT_INFO}})
+        with selectors.DefaultSelector() as selector:
+            selector.register(process.stdout, selectors.EVENT_READ)
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(process.args, timeout)
+                if not selector.select(remaining):
+                    continue
+                chunk = os.read(process.stdout.fileno(), 65536)
+                received += len(chunk)
+                if not chunk or received > _MAX_LISTING:
+                    raise _ProtocolError("Codex ended or exceeded its bound before listing hooks.")
+                buffer.extend(chunk)
+                while b"\n" in buffer:
+                    line, _, rest = bytes(buffer).partition(b"\n")
+                    buffer[:] = rest
+                    message = decode(line)
+                    if "method" in message or message.get("id") not in (1, 2):
+                        continue
+                    if "result" not in message or not isinstance(message["result"], dict):
+                        raise _ProtocolError("Codex rejected the hook listing.")
+                    if (message["id"] == 2) != listing_requested:
+                        raise _ProtocolError("Codex answered a request that was not pending.")
+                    if listing_requested:
+                        return message["result"]
+                    send({"method": "initialized", "params": {}})
+                    send({"id": 2, "method": "hooks/list", "params": {"cwds": [repo]}})
+                    listing_requested = True
+    finally:
+        try:
+            process.stdin.close()
+        except OSError:
+            pass
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        # Descendants can outlive the server; end only the group this call created.
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait()
+        process.stdout.close()
 
 
 class _Driver:
@@ -62,27 +219,12 @@ class _Driver:
         self.request("thread/resume" if self.resume else "thread/start", params)
 
     def hooks_ready(self, result):
-        groups = result.get("data")
-        if not isinstance(groups, list) or any(not isinstance(group, dict) for group in groups):
-            raise _ProtocolError("Native hook readiness could not be read; no task was submitted.")
-        groups = [group for group in groups if group.get("cwd") == self.repo]
-        if len(groups) != 1 or not isinstance(groups[0].get("hooks"), list):
-            raise _ProtocolError("Native hook readiness did not identify the selected checkout; no task was submitted.")
-        required = {"sessionStart", "sessionEnd", "userPromptSubmit", "stop", "interrupt"}
-        matches = {name: [] for name in required}
-        for hook in groups[0]["hooks"]:
-            if (isinstance(hook, dict) and hook.get("source") == "sessionFlags"
-                    and hook.get("command") == self.expected_hook and hook.get("eventName") in required):
-                matches[hook["eventName"]].append(hook)
-        ready = {name for name, values in matches.items() if len(values) == 1
-                 and values[0].get("enabled") is True and values[0].get("trustStatus") == "trusted"
-                 and values[0].get("handlerType") == "command" and values[0].get("async", False) is False
-                 and values[0].get("matcher") is None and type(values[0].get("timeoutSec")) is int
-                 and values[0]["timeoutSec"] == 3}
-        self.envelope["hook_readiness"] = {"state": "ready" if ready == required else "needs_review",
-                                            "ready_events": sorted(ready), "unready_events": sorted(required - ready)}
-        if ready != required:
-            raise _ProtocolError("Public Multithread hooks are not ready; no task was submitted. Use multithread launch codex for this checkout, review the exact Multithread commands in /hooks, then return here. Multithread does not change native hook trust.")
+        readiness = hook_readiness(result, self.repo, self.expected_hook)
+        self.envelope["hook_readiness"] = readiness
+        if readiness["state"] != "ready":
+            problem, action = hook_remedy(readiness, self.repo, self.expected_hook)
+            raise _ProtocolError(problem + "; no task was submitted. " + action
+                                 + " Multithread does not change native hook trust.")
 
     def remaining(self):
         remaining = self.deadline - time.monotonic()
@@ -428,8 +570,7 @@ def run(process, task: bytes, repo: str, resume: str | None, directory: Path,
             os.set_blocking(process.stdin.fileno(), False)
             selector.register(process.stdout, selectors.EVENT_READ, "stdout")
             writing = False
-            driver.request("initialize", {"clientInfo": {"name": "multithread", "title": "Multithread",
-                                                         "version": "0.4.1"}})
+            driver.request("initialize", {"clientInfo": _CLIENT_INFO})
             while not observation.eof:
                 if feedback is not None:
                     feedback()

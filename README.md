@@ -71,8 +71,9 @@ Check readiness again at any time:
 ```
 
 This is read-only. It distinguishes runtime/repository readiness from prepared
-or missing providers. Authentication, hook delivery and provider tools remain
-unchecked until observed in a native session.
+or missing providers, and asks Codex whether it trusts the Multithread hooks
+here. Authentication, hook delivery and provider tools remain unchecked until
+observed in a native session.
 
 ## Collaborate
 
@@ -85,7 +86,10 @@ session with Multithread hooks, use the exact launch command printed by setup, o
 ```
 
 Use `claude` for the other provider. Review the invocation and type `launch`;
-adding `--json` prepares the plan without starting a session.
+adding `--json` prepares the plan without starting a session. Launch and Codex's
+`/hooks` review are yours, in your own terminal: a coding agent never runs
+`launch` or changes hook trust, and reports a refused peer call with the remedy
+it prints.
 
 Then give your agent the copyable [first-collaboration prompt](docs/PEER.md#first-collaboration).
 It authorizes one scoped, read-only native review and asks the caller to assess

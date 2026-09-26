@@ -10,14 +10,18 @@ _HOOKS = profile._COMMON + r"""
 assert not pathlib.Path("/source").exists() and not pathlib.Path("/bundle").exists()
 launcher = home / ".local/bin/multithread"
 base = [str(launcher), "--repo", str(project), "--json"]
+codex_hook = [str(launcher), "provider-hook", "--client", "codex"]
 
 def hook(client, name, **fields):
+    # Codex states its session directory, which may veto but never select.
     payload = {"hook_event_name": name, "session_id": client + "-fixture-session",
-               "cwd": str(foreign), "transcript_path": str(foreign / "preserved"),
+               "cwd": str(project if client == "codex" else foreign), "transcript_path": str(foreign / "preserved"),
                "prompt": "SYNTHETIC-PRIVATE-PROMPT", "permission_mode": "bypassPermissions",
                "last_assistant_message": "SYNTHETIC-PRIVATE-RESPONSE", **fields}
-    result = subprocess.run(base + ["provider-hook", "--client", client],
-                            input=json.dumps(payload), text=True, capture_output=True, timeout=15)
+    # Codex runs its checkout-free generated command in the session directory.
+    command = codex_hook if client == "codex" else base + ["provider-hook", "--client", client]
+    result = subprocess.run(command, input=json.dumps(payload), text=True, capture_output=True,
+                            timeout=15, cwd=project)
     assert result.returncode == 0, result
     assert "SYNTHETIC-PRIVATE" not in result.stdout + result.stderr
     return result
@@ -39,6 +43,12 @@ subprocess.run(["/usr/bin/git", "-C", str(project), "-c", "user.name=Fixture",
                input="Public provider hook fixture baseline\n", text=True, env=git_env,
                check=True, capture_output=True)
 call(base + ["init"])
+generated = call(base + ["provider-config", "--client", "codex", "--launcher-name", "multithread"])
+before_veto = snapshot(project)
+vetoed = hook("codex", "SessionStart", cwd=str(foreign))
+assert vetoed.stdout == "" and vetoed.stderr and snapshot(project) == before_veto
+import shlex
+assert shlex.split(generated["hook_command"]) == codex_hook, generated
 handoff = call(base + ["signal", "work.handoff", "--agent", "codex", "--session", "author-fixture",
                        "--work-id", "hook-proof", "--target", "claude", "--commit", "HEAD",
                        "--summary", "Review the fixture artifact; a brief is not an ACK"])["event"]
