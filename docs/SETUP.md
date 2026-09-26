@@ -58,7 +58,8 @@ run the printed read-only repository check before retrying enrollment.
 Use the exact launcher path printed by the installer, normally
 `~/.local/bin/multithread`. Account paths come from the OS account database.
 Multithread does not edit shell `PATH`, provider settings, permissions or sign-ins,
-and setup does not execute a provider or start a model session.
+and setup starts no model session: its only provider execution is Codex's
+read-only hook listing.
 
 For a fixed published version, replace `releases/latest/download/install.py` in
 the command with `releases/download/v0.4.4/install.py` after confirming that tag
@@ -146,7 +147,10 @@ From the chosen checkout:
 This read-only check verifies runtime identity, repository integrity and ledger
 status, then prepares invocation plans for providers found on `PATH`. It prints
 exact next commands. Add `--json` for structured observations and next actions.
-Setup does not run provider executables, including version checks.
+For Codex it also asks Codex's app server for this checkout's hook listing, the
+same check a Codex peer call makes before any task: `initialize` and `hooks/list`
+only, with no thread, turn, model call or trust change. Setup runs no other
+provider executable and no version checks.
 
 To explicitly enroll a new chosen repository, then run the same checks:
 
@@ -165,12 +169,13 @@ Select reviewed provider paths explicitly when necessary:
 |---|---|---|
 | Runtime verified | Healthy installed status and exact release/activation identity | Any installation refusal needs its specific inspection or recovery action. |
 | Repository verified | Enrollment, exact Git identity, healthy integrity check and matching ledger status | Preserve state on refusal or unavailable observation; do not delete or forge enrollment markers. |
-| Provider prepared | Executable path and matching invocation plan | Provider version, sign-in, native trust and tool capability are not checked. A missing provider can be installed or located through its normal interface. |
+| Provider prepared | Executable path and matching invocation plan; for Codex, all five Multithread hooks listed as trusted for this checkout | Provider version, sign-in and tool capability are not checked. `needs_hook_review` names each event Codex lists as untrusted, modified or disabled; `needs_hook_configuration` names hooks that are missing, duplicated or not as generated. A missing provider can be installed or located through its normal interface. |
 | Hook/context delivery | Not checked by setup | Observe the Multithread context in an authorized native session. A generated plan or zero hook exit does not prove delivery. |
 | Provider tools | Not checked by setup | Observe an authorized native tool action. Tool execution alone does not establish a completed collaboration workflow. |
 
 “Multithread is ready for this repository” means the runtime and repository passed.
-Providers may still be missing or need attention. A successful installation
+Providers may still be missing or need attention; when Codex's hooks need review,
+the heading says so and the next action gives the exact review step. A successful installation
 followed by incomplete enrollment remains a successful code installation with
 repository setup unresolved. After a timeout or uncertain enrollment result,
 run the printed read-only check before deciding whether to retry. Keep local
@@ -190,7 +195,12 @@ hooks, then type `launch`. Add `--json` to prepare this plan without starting th
 provider. Existing sessions do not acquire new invocation arguments. Complete
 native sign-in or hook trust through the provider's normal interface, and review
 existing hooks for duplicates or conflicting overrides.
-For Codex, open `/hooks` and review the exact generated commands. Claude's
+For Codex, open `/hooks` and review the exact generated commands. The Codex hook
+command names no checkout: Codex records trust per hook event and exact command
+text, not per repository, so one review covers every enrolled checkout and
+worktree until the command changes. Each hook finds its checkout from the Codex
+session's working directory, which launch and peer set; an unenrolled directory
+records nothing. Claude's
 noninteractive peer mode does not show the interactive workspace trust dialog;
 review the repository and its provider configuration before calling. See
 [provider-specific preparation](PEER.md#before-calling).

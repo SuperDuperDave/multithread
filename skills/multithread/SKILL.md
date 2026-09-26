@@ -15,8 +15,9 @@ Use the installed, verified launcher and its `--help` for exact syntax. Do not
 run a checkout-owned executable in place of the installed launcher. For first
 installation, enrollment, readiness, or native trust review, follow the current
 [setup guide](https://github.com/SuperDuperDave/multithread/blob/main/docs/SETUP.md).
-`multithread setup --repo <checkout> --check` reports preparation, not provider
-authentication, hook delivery, tool capability, or a completed collaboration.
+`multithread setup --repo <checkout> --check` reports preparation and whether
+Codex lists the Multithread hooks as trusted, not provider authentication, hook
+delivery, tool capability, or a completed collaboration.
 
 Choose the interaction that fits the task:
 

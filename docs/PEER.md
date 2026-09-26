@@ -65,9 +65,13 @@ Claude print mode loads normal instructions, hooks, skills and configured MCP
 servers, and does not show its interactive workspace trust dialog.
 The Codex adapter uses the stable App Server interface. The v0.3 native
 source-entry observations use Codex 0.153.4 and Claude Code 2.1.269. Codex hook
-trust remains a separate native review: use `multithread launch codex` for the selected
-checkout, open `/hooks`, and review the exact generated commands. A changed hook
-definition can need review again. Listing a trusted hook does not prove it ran.
+trust remains a separate native review: use `multithread launch codex` in any
+enrolled checkout, open `/hooks`, and review the exact generated commands. One
+review covers every enrolled checkout and worktree; a changed hook definition
+can need review again. Listing a trusted hook does not prove it ran. Before any
+task, a Codex peer call refuses when a hook is not trusted and names each
+unready event with the one step that resolves it; `setup --check` reports the
+same listing.
 
 Multithread inherits the provider's normal environment, sign-in and permission mode.
 It never selects bare mode, copies credentials, changes permission rules or

@@ -17,7 +17,8 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
-from relay_runtime import provider as peer
+from relay_runtime import codex_peer, provider as peer
+from relay_runtime.native_io import ProtocolError
 
 THREAD = "10000000-0000-4000-8000-000000000001"
 OTHER_THREAD = "20000000-0000-4000-8000-000000000002"
@@ -63,6 +64,11 @@ def send_result(message, result):
 while True:
     message = receive()
     method = message.get('method')
+    if spec.get('hang_on') == method:
+        time.sleep(30)
+    if spec.get('flood_on') == method:
+        for _ in range(400):
+            emit({'method': 'fixture/noise', 'params': {'text': 'x' * 4096}})
     if method == 'initialize':
         send_result(message, spec.get('initialize_result', {
             'userAgent': 'multithread/1.2.3 (FixtureOS 91.82.73; fixture) term (multithread; 9.8.7)',
@@ -74,7 +80,10 @@ while True:
                   'source': 'sessionFlags', 'enabled': True, 'trustStatus': 'trusted',
                   'timeoutSec': 3, 'matcher': None, 'async': False}
                  for event in ('sessionStart','sessionEnd','userPromptSubmit','stop','interrupt')]
-        for hook in hooks: hook.update(spec.get('hook_updates', {}))
+        for hook in hooks:
+            hook.update(spec.get('hook_updates', {}))
+            hook.update(spec.get('event_updates', {}).get(hook['eventName'], {}))
+        hooks.extend(dict(hook, command=hook.get('command', HOOK_COMMAND)) for hook in spec.get('extra_hooks', []))
         send_result(message, spec.get('hooks_result', {'data': [{'cwd': os.getcwd(), 'hooks': hooks}]}))
     elif method in ('thread/start', 'thread/resume'):
         thread = {'id': THREAD_ID, 'cwd': os.getcwd(), 'sessionId': THREAD_ID, 'turns': []}
@@ -343,18 +352,86 @@ class CodexProtocolTests(unittest.TestCase):
         self.assertEqual(identifier, resume["params"]["threadId"])
 
     def test_hook_readiness_stops_before_a_thread_or_task_when_review_is_needed(self):
-        for update in ({'trustStatus': 'modified'}, {'trustStatus': 'untrusted'},
-                       {'enabled': False}, {'source': 'user'}, {'matcher': 'unexpected'}):
-            with self.subTest(update=update):
-                self.configure(hook_updates=update)
+        events = ('sessionStart', 'userPromptSubmit', 'stop', 'sessionEnd', 'interrupt')
+        review = "open /hooks and trust the five Multithread hooks running " + shlex.join(
+            [str(self.relay), "provider-hook", "--client", "codex"])
+        configuration = "compare " + shlex.join([str(self.relay), "launch", "codex", "--repo", str(self.repo), "--json"])
+        cases = [
+            ({'hook_updates': {'trustStatus': 'modified'}}, 'needs_review', dict.fromkeys(events, 'modified'), review),
+            ({'hook_updates': {'trustStatus': 'untrusted'}}, 'needs_review', dict.fromkeys(events, 'untrusted'), review),
+            ({'hook_updates': {'enabled': False}}, 'needs_review', dict.fromkeys(events, 'disabled'), review),
+            ({'event_updates': {'stop': {'trustStatus': 'modified'}}}, 'needs_review',
+             {**dict.fromkeys(events, 'trusted'), 'stop': 'modified'}, review),
+            ({'hook_updates': {'source': 'user'}}, 'needs_configuration', dict.fromkeys(events, 'missing'),
+             "check that Codex hooks are enabled (features.hooks)"),
+            ({'hooks_result': {'data': [{'cwd': str(self.repo), 'hooks': []}]}}, 'needs_configuration',
+             dict.fromkeys(events, 'missing'), "check that Codex hooks are enabled (features.hooks)"),
+            ({'hook_updates': {'matcher': 'unexpected'}}, 'needs_configuration', dict.fromkeys(events, 'mismatched'), configuration),
+            ({'hook_updates': {'command': 'unrelated --repo elsewhere'}}, 'needs_configuration',
+             dict.fromkeys(events, 'mismatched'), configuration),
+            ({'hook_updates': {'trustStatus': 'someFutureStatus'}}, 'needs_configuration',
+             dict.fromkeys(events, 'unrecognized'), configuration),
+            # A second session-flag handler for an event cannot hide beside ours.
+            ({'extra_hooks': [{'eventName': 'sessionStart', 'command': 'unrelated handler', 'handlerType': 'command',
+                               'source': 'sessionFlags', 'enabled': True, 'trustStatus': 'trusted',
+                               'timeoutSec': 3, 'matcher': None, 'async': False}]}, 'needs_configuration',
+             {**dict.fromkeys(events, 'trusted'), 'sessionStart': 'duplicate'}, configuration),
+        ]
+        for spec, state, statuses, remedy in cases:
+            with self.subTest(spec=spec):
+                self.configure(**spec)
                 code, result, _ = self.invoke()
                 self.assertNotEqual(0, code, result)
                 self.assertEqual('not_submitted', result['task_submission'])
-                self.assertEqual('needs_review', result['hook_readiness']['state'])
+                self.assertEqual(state, result['hook_readiness']['state'])
+                self.assertEqual(statuses, result['hook_readiness']['events'])
+                self.assertEqual(sorted(name for name in events if statuses[name] != 'trusted'),
+                                 result['hook_readiness']['unready_events'])
                 self.assertEqual(['initialize','initialized','hooks/list'],
                                  [row['method'] for row in self.recorded_requests()])
                 self.assertIsNone(result['session_id'])
-                self.assertIn('/hooks', result['message'])
+                for status in set(statuses.values()) - {'trusted'}:
+                    named = ", ".join(name for name in events if statuses[name] == status)
+                    self.assertIn(status + ": " + named, result['message'])
+                self.assertIn('no task was submitted', result['message'])
+                self.assertIn(remedy, result['message'])
+                self.assertEqual(state == 'needs_review', '/hooks' in result['message'])
+
+    def list_hooks(self, **options):
+        with mock.patch.dict(os.environ, self.environment, clear=True):
+            return codex_peer.list_hooks([str(self.provider), *self.native_arguments], str(self.repo), **options)
+
+    def test_setup_hook_listing_asks_only_initialize_and_hooks_list(self):
+        started = []
+        listing = self.list_hooks(on_start=lambda: started.append(True))
+        self.assertEqual([True], started)
+        self.assertEqual(["initialize", "initialized", "hooks/list"],
+                         [request["method"] for request in self.recorded_requests()])
+        self.assertEqual([str(self.repo)], self.recorded_requests()[2]["params"]["cwds"])
+        receipt = json.loads(self.receipt.read_text())
+        self.assertEqual([str(self.provider), *self.native_arguments, "app-server", "--listen", "stdio://"], receipt["argv"])
+        self.assertEqual(str(self.repo), receipt["cwd"])
+        hook = shlex.join([str(self.relay), "provider-hook", "--client", "codex"])
+        self.assertEqual("ready", codex_peer.hook_readiness(listing, str(self.repo), hook)["state"])
+        self.configure(hook_updates={"trustStatus": "modified"})
+        readiness = codex_peer.hook_readiness(self.list_hooks(), str(self.repo), hook)
+        self.assertEqual("needs_review", readiness["state"])
+
+    def test_setup_hook_listing_faults_are_unavailable_and_reap_codex(self):
+        for spec, error in (({"error_response": "hooks/list"}, ProtocolError),
+                            ({"error_response": "initialize"}, ProtocolError),
+                            ({"flood_on": "hooks/list"}, ProtocolError),
+                            ({"hang_on": "hooks/list"}, subprocess.TimeoutExpired)):
+            with self.subTest(spec=spec):
+                self.configure(**spec)
+                started = time.monotonic()
+                with self.assertRaises(error):
+                    self.list_hooks(timeout=1)
+                self.assertLess(time.monotonic() - started, 10)
+                pid = json.loads(self.receipt.read_text())["pid"]
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(pid, 0)
+                self.assertNotIn("thread/start", [row["method"] for row in self.recorded_requests()])
 
     def test_missing_checkout_listing_cannot_imply_hooks_are_ready(self):
         self.configure(hooks_result={'data': []})

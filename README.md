@@ -71,8 +71,9 @@ Check readiness again at any time:
 ```
 
 This is read-only. It distinguishes runtime/repository readiness from prepared
-or missing providers. Authentication, hook delivery and provider tools remain
-unchecked until observed in a native session.
+or missing providers, and asks Codex whether it trusts the Multithread hooks
+here. Authentication, hook delivery and provider tools remain unchecked until
+observed in a native session.
 
 ## Collaborate
 

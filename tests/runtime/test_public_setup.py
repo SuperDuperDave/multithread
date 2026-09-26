@@ -1,4 +1,4 @@
-"""Source-absent setup observes real shared work without executing providers."""
+"""Source-absent setup observes real shared work; only Codex's hook listing runs."""
 
 import json
 import subprocess
@@ -22,12 +22,45 @@ assert not (home / '.local/share/relay/enrollments').exists()
 provider = pathlib.Path('/tmp/never-run-provider')
 provider.write_text('#!/bin/sh\ntouch /tmp/provider-was-started\nexit 1\n')
 provider.chmod(0o700)
-flags = ['--codex', str(provider), '--claude', str(provider)]
+# Setup asks Codex only for its hook listing; this fake lists the invocation's
+# session-flag hooks as untrusted and records every request it receives.
+fake_codex = pathlib.Path('/tmp/fake-codex')
+fake_codex.write_text("""#!/usr/bin/python3 -I
+import json, sys, tomllib
+assert sys.argv[-3:] == ["app-server", "--listen", "stdio://"], sys.argv
+hooks = {}
+for index, value in enumerate(sys.argv[1:-3], 1):
+    if value == "-c":
+        hooks.update(tomllib.loads(sys.argv[index + 1])["hooks"])
+with open("/tmp/fake-codex-requests", "a") as log:
+    for line in sys.stdin:
+        message = json.loads(line)
+        log.write(message["method"] + "\\n")
+        log.flush()
+        if message["method"] == "initialize":
+            print(json.dumps({"id": message["id"], "result": {}}), flush=True)
+        elif message["method"] == "hooks/list":
+            listed = [{"eventName": event[0].lower() + event[1:], "command": groups[0]["hooks"][0]["command"],
+                       "handlerType": "command", "source": "sessionFlags", "enabled": True,
+                       "trustStatus": "untrusted", "timeoutSec": 3, "matcher": None, "async": False}
+                      for event, groups in hooks.items()]
+            print(json.dumps({"id": message["id"], "result": {"data": [
+                {"cwd": message["params"]["cwds"][0], "hooks": listed}]}}), flush=True)
+""")
+fake_codex.chmod(0o700)
+requests = pathlib.Path('/tmp/fake-codex-requests')
+flags = ['--codex', str(fake_codex), '--claude', str(provider)]
 report = call(base + ['setup', '--apply', *flags])
 assert report['state'] == 'ready', report
 assert report['repository']['doctor']['state'] == report['repository']['status']['state'] == 'verified'
-assert all(row['state'] == 'prepared' for row in report['providers'].values())
+assert report['providers']['claude']['state'] == 'prepared', report
+codex = report['providers']['codex']
+assert codex['state'] == 'needs_hook_review', codex
+assert set(codex['hook_trust']['events'].values()) == {'untrusted'}, codex
+assert report['provider_started'] is True
+assert requests.read_text() == 'initialize\ninitialized\nhooks/list\n', requests.read_text()
 assert not pathlib.Path('/tmp/provider-was-started').exists()
+hook_commands = {codex['plan']['relay_plan']['hook_command']}
 git = ['/usr/bin/git', '-C', str(project), '-c', 'core.hooksPath=/dev/null',
        '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid',
        '-c', 'commit.gpgsign=false']
@@ -46,6 +79,11 @@ for checkout in (project, linked, project):
     checked = call([str(launcher), 'setup', '--repo', str(checkout), '--apply', '--json', *flags])
     assert checked['state'] == 'ready', checked
     assert checked['repository']['identity']['git_common_dir'] == str(project / '.git')
+    assert checked['providers']['codex']['state'] == 'needs_hook_review', checked
+    hook_commands.add(checked['providers']['codex']['plan']['relay_plan']['hook_command'])
+# One reviewed Codex hook command serves the main checkout and its worktree.
+assert hook_commands == {str(launcher) + ' provider-hook --client codex'}, hook_commands
+assert requests.read_text() == 'initialize\ninitialized\nhooks/list\n' * 4, requests.read_text()
 assert call(base + ['events']) == before_events
 assert call(base + ['status']) == before_status
 assert snapshot(home / '.local/share/relay/enrollments') == before_registry
@@ -54,7 +92,8 @@ assert snapshot(foreign) == before_foreign
 assert call([str(launcher), 'runtime', 'status'])['activation'] == activation
 assert not pathlib.Path('/tmp/provider-was-started').exists()
 print(json.dumps({'source_absent': True, 'shared_work_preserved': True,
-                  'providers_started': 0, 'linked_worktree_verified': True}))
+                  'codex_hook_listings': 4, 'other_providers_started': 0,
+                  'linked_worktree_verified': True}))
 '''
 
 
@@ -127,7 +166,7 @@ print(json.dumps({'source_absent': True, 'refused_invocations': len(invocations)
 
 
 class PublicSetupTests(unittest.TestCase):
-    def test_source_absent_setup_preserves_shared_work_and_never_launches_providers(self):
+    def test_source_absent_setup_preserves_shared_work_and_only_lists_codex_hooks(self):
         fixture = profile.PublicProfileTests(methodName='test_public_installed_ledger_in_fresh_rootless_account')
         fixture.setUp()
         self.addCleanup(fixture.doCleanups)
@@ -139,7 +178,8 @@ class PublicSetupTests(unittest.TestCase):
         fixture.sandbox(profile._INSTALL, release_id, include_source=True)
         result = fixture.sandbox(_SETUP, release_id, include_source=False)
         self.assertEqual({'source_absent': True, 'shared_work_preserved': True,
-                          'providers_started': 0, 'linked_worktree_verified': True}, result)
+                          'codex_hook_listings': 4, 'other_providers_started': 0,
+                          'linked_worktree_verified': True}, result)
 
     def test_source_absent_legacy_helpers_refuse_foreign_preferred_command_before_execution(self):
         fixture = profile.PublicProfileTests(methodName='test_public_installed_ledger_in_fresh_rootless_account')

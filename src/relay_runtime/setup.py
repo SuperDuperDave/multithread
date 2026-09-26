@@ -1,4 +1,8 @@
-"""Compose installed readiness checks without provider execution or state repair."""
+"""Compose installed readiness checks without state repair.
+
+The only provider execution is Codex's hook listing, the same question a Codex
+peer call asks before submitting any task.
+"""
 
 import argparse
 import json
@@ -11,8 +15,10 @@ import subprocess
 import sys
 import tempfile
 
+from . import codex_peer
 from . import provider
 from . import account_launcher
+from .native_io import ProtocolError
 
 
 _MAX_OUTPUT = 128 * 1024
@@ -109,6 +115,24 @@ def _next(report, stage, action, command=None):
     report["next_actions"].append(entry)
 
 
+def _codex_hooks(report, plan):
+    """Ready only when a Codex peer call's hook gate would pass for this checkout."""
+    expected = plan["relay_plan"]["hook_command"]
+    try:
+        listing = codex_peer.list_hooks(plan["argv"], plan["repo"],
+                                        on_start=lambda: report.update(provider_started=True))
+        readiness = codex_peer.hook_readiness(listing, plan["repo"], expected)
+    except (ProtocolError, OSError, subprocess.SubprocessError):
+        return {"state": "unavailable", "hook_trust": {"state": "unavailable"},
+                "message": "Codex's hook listing is unavailable; a Codex peer call checks the same listing before any task."}
+    if readiness["state"] == "ready":
+        return {"hook_trust": readiness}
+    problem, action = codex_peer.hook_remedy(readiness, plan["repo"], expected)
+    state = "needs_hook_review" if readiness["state"] == "needs_review" else "needs_hook_configuration"
+    return {"state": state, "message": problem + "; Codex peer calls refuse until then",
+            "hook_trust": {**readiness, "action": action}}
+
+
 def setup_report(repo, *, apply=False, codex=None, claude=None):
     """Inspect the account installation; only explicit apply may call init."""
     result = {"schema": 1, "state": "not_ready", "mode": "apply" if apply else "check",
@@ -198,16 +222,27 @@ def setup_report(repo, *, apply=False, codex=None, claude=None):
                   [launcher, "launch", client, "--repo", selected, "--provider", path, "--json"])
             continue
         command = [launcher, "launch", client, "--repo", selected, "--provider", plan["argv"][0]]
-        result["providers"][client] = {"state": "prepared", "executable": plan["argv"][0],
-                                       "version": "not_checked", "plan": plan, "launch_command": command}
-        _next(result, client, "When a provider launch is authorized, run this in an interactive terminal and review its displayed invocation.", command)
+        entry = {"state": "prepared", "executable": plan["argv"][0],
+                 "version": "not_checked", "plan": plan, "launch_command": command}
+        result["providers"][client] = entry
+        if client == "codex":
+            entry.update(_codex_hooks(result, plan))
+        if entry["state"] in ("needs_hook_review", "needs_hook_configuration"):
+            _next(result, client, entry["hook_trust"]["action"], command)
+        else:
+            _next(result, client, "When a provider launch is authorized, run this in an interactive terminal and review its displayed invocation.", command)
     result["first_collaboration_url"] = "https://github.com/SuperDuperDave/multithread/blob/main/docs/PEER.md#first-collaboration"
     return result
 
 
 def _display(report):
     text = provider._display_text
-    print("Multithread is ready for this repository." if report["state"] == "ready" else "Multithread setup needs attention.")
+    codex = report["providers"]["codex"]["state"]
+    print("Multithread setup needs attention." if report["state"] != "ready" else
+          "Multithread is ready for this repository; Codex peer calls need one hook review first."
+          if codex == "needs_hook_review" else
+          "Multithread is ready for this repository; Codex hooks need attention before peer calls."
+          if codex == "needs_hook_configuration" else "Multithread is ready for this repository.")
     print("Runtime: " + text(report["runtime"]["state"]))
     print("Repository: " + text(report["repository"]["state"]))
     if report["runtime"]["state"] == "verified":
@@ -250,7 +285,7 @@ def _display(report):
 
 
 def setup_main(argv=None):
-    parser = argparse.ArgumentParser(prog="multithread setup", description="Check Multithread readiness; explicitly enroll with --apply. Providers are never started.")
+    parser = argparse.ArgumentParser(prog="multithread setup", description="Check Multithread readiness; explicitly enroll with --apply. The only provider run is Codex's hook listing: no thread, task or trust change.")
     parser.add_argument("--repo", type=Path, default=Path.cwd(), help="chosen Git checkout; default: current directory")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--check", action="store_true", help="read-only readiness check (default)")

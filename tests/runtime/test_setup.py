@@ -44,9 +44,13 @@ class SetupTests(unittest.TestCase):
             mock.patch.object(setup.pwd, "getpwuid", return_value=mock.Mock(pw_dir=str(self.account))),
             mock.patch.object(setup.subprocess, "run", side_effect=self.run_command),
             mock.patch.object(setup.shutil, "which", return_value=None),
+            mock.patch.object(setup.codex_peer, "list_hooks", side_effect=self.list_hooks),
         ):
             patcher.start()
             self.addCleanup(patcher.stop)
+        self.listings = []
+        self.hook_statuses = {}
+        self.listing_error = None
 
     def run_command(self, command, **options):
         self.commands.append(command)
@@ -62,6 +66,25 @@ class SetupTests(unittest.TestCase):
         options["stdout"].write(output)
         options["stderr"].write(errors)
         return subprocess.CompletedProcess(command, code)
+
+    def codex_plan(self, path):
+        hook = shlex.join([self.launcher, "provider-hook", "--client", "codex"])
+        return {"argv": [str(path), "-c", "hooks.fixture=[]"], "repo": str(self.repo),
+                "relay_plan": {"hook_command": hook}, "provider_started": False}
+
+    def list_hooks(self, argv, repo, *, on_start=None, timeout=15):
+        self.listings.append((argv, repo))
+        if isinstance(self.listing_error, OSError) and self.listing_error.errno is None:
+            raise self.listing_error  # The executable itself could not start.
+        on_start()
+        if self.listing_error is not None:
+            raise self.listing_error
+        hook = shlex.join([self.launcher, "provider-hook", "--client", "codex"])
+        return {"data": [{"cwd": repo, "hooks": [
+            {"eventName": event, "command": hook, "handlerType": "command", "source": "sessionFlags",
+             "enabled": True, "trustStatus": self.hook_statuses.get(event, "trusted"),
+             "timeoutSec": 3, "matcher": None, "async": False}
+            for event in ("sessionStart", "userPromptSubmit", "stop", "sessionEnd", "interrupt")]}]}
 
     def invoke(self, *extra):
         output = io.StringIO()
@@ -266,7 +289,7 @@ class SetupTests(unittest.TestCase):
         def prepare(client, repo, launcher, path):
             if client == "claude":
                 raise setup.provider.LaunchError("synthetic hook plan does not match this checkout")
-            return {"argv": [str(path)], "provider_started": False}
+            return self.codex_plan(path)
         with mock.patch.object(setup.provider, "prepare", side_effect=prepare):
             code, result = self.invoke("--codex", "/fixture/codex", "--claude", "/fixture/claude")
         output = self.display(result)
@@ -279,7 +302,54 @@ class SetupTests(unittest.TestCase):
         self.assertIn("Provider sign-in, hook delivery and tool execution: not checked.", output)
         self.assertIn("--provider /fixture/claude --json", output)
         self.assertEqual("unknown", result["provider_authentication"])
-        self.assertFalse(result["provider_started"])
+        self.assertTrue(result["provider_started"], "Codex's hook listing started its app server")
+        self.assertEqual([(self.codex_plan("/fixture/codex")["argv"], str(self.repo))], self.listings)
+
+    def test_codex_is_prepared_only_when_a_peer_hook_gate_would_pass(self):
+        with mock.patch.object(setup.provider, "prepare", side_effect=lambda client, repo, launcher, path: self.codex_plan(path)):
+            code, result = self.invoke("--codex", "/fixture/codex")
+            ready = self.display(result)
+            self.hook_statuses = {"stop": "modified", "sessionStart": "untrusted"}
+            review_code, review = self.invoke("--codex", "/fixture/codex")
+        self.assertEqual(0, code)
+        self.assertEqual("prepared", result["providers"]["codex"]["state"])
+        self.assertEqual("ready", result["providers"]["codex"]["hook_trust"]["state"])
+        self.assertIn("Multithread is ready for this repository.\n", ready)
+        # Runtime and repository readiness still decide the top-level state and
+        # exit code; the unready Codex peer route is stated beside it.
+        self.assertEqual(0, review_code)
+        self.assertEqual("ready", review["state"])
+        codex = review["providers"]["codex"]
+        self.assertEqual("needs_hook_review", codex["state"])
+        self.assertEqual({"sessionStart": "untrusted", "userPromptSubmit": "trusted", "stop": "modified",
+                          "sessionEnd": "trusted", "interrupt": "trusted"}, codex["hook_trust"]["events"])
+        self.assertEqual("Codex hooks are not ready (modified: stop; untrusted: sessionStart); Codex peer calls refuse until then",
+                         codex["message"])
+        output = self.display(review)
+        self.assertIn("Multithread is ready for this repository; Codex peer calls need one hook review first.", output)
+        self.assertIn("codex: needs_hook_review; Codex hooks are not ready (modified: stop; untrusted: sessionStart)", output)
+        action = next(entry for entry in review["next_actions"] if entry["stage"] == "codex")
+        self.assertIn("open /hooks and trust the five Multithread hooks running "
+                      + shlex.join([self.launcher, "provider-hook", "--client", "codex"]), action["action"])
+        self.assertIn("covers every enrolled checkout", action["action"])
+        self.assertEqual(codex["launch_command"], action["command"])
+
+    def test_unavailable_codex_listing_is_not_readiness_or_absence(self):
+        cases = ((OSError("synthetic exec failure"), False), (subprocess.TimeoutExpired(["codex"], 15), True),
+                 (setup.ProtocolError("synthetic listing fault"), True))
+        for error, started in cases:
+            with (self.subTest(error=type(error).__name__),
+                  mock.patch.object(setup.provider, "prepare", side_effect=lambda client, repo, launcher, path: self.codex_plan(path))):
+                self.listing_error = error
+                code, result = self.invoke("--codex", "/fixture/codex")
+                self.assertEqual(0, code)
+                self.assertEqual("ready", result["state"])
+                codex = result["providers"]["codex"]
+                self.assertEqual("unavailable", codex["state"])
+                self.assertEqual({"state": "unavailable"}, codex["hook_trust"])
+                self.assertIn("a Codex peer call checks the same listing", codex["message"])
+                self.assertIs(started, result["provider_started"])
+                self.assertIn("Multithread is ready for this repository.\n", self.display(result))
 
     def test_human_version_uses_observed_activation_and_does_not_require_new_json_fields(self):
         for version in ("0.4.0", None):
