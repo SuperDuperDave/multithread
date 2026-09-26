@@ -3,6 +3,7 @@
   "files": [
     ".github/workflows/ci.yml",
     ".gitignore",
+    "CLAUDE.md",
     "LICENSE",
     "README.md",
     "docs/ARCHITECTURE.md",
