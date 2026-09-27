@@ -477,7 +477,7 @@ def _display_setup(report):
             if "command" in action:
                 command = action["command"]
                 if isinstance(command, list) and command and all(isinstance(argument, str) for argument in command):
-                    _display_command("  Command", command)
+                    _display_command("  Your command" if action.get("actor") == "person" else "  Command", command)
                 else:
                     print("  Command unavailable: captured command is not a nonempty list of strings.")
         elif isinstance(action, str):

@@ -423,6 +423,17 @@ class UpdateCommandTests(ReleaseFixture):
         command = next(line.split(": ", 1)[1] for line in output.splitlines() if line.startswith("  Command: "))
         self.assertEqual(report["next_actions"][0]["command"], shlex.split(command))
 
+    def test_human_install_labels_a_persons_launch_as_theirs(self):
+        self.active = {"installed": False, "activation": None, "launcher": self.launcher}
+        self.expected = None
+        report = self.ready_setup()
+        report["next_actions"][0]["actor"] = "person"
+        self.setup_response = subprocess.CompletedProcess([], 0, json.dumps(report), "")
+        code, output, _ = self.invoke_human("--yes", "--repo", str(self.repo), install=True)
+        self.assertEqual(0, code)
+        self.assertIn("  Your command: " + shlex.join(report["next_actions"][0]["command"]), output)
+        self.assertFalse(any(line.startswith("  Command: ") for line in output.splitlines()))
+
     def test_human_setup_retains_provider_preparation_failure_without_changing_readiness(self):
         report = self.ready_setup()
         report["providers"]["codex"] = {"state": "unavailable", "message": "Synthetic provider executable is not approved."}

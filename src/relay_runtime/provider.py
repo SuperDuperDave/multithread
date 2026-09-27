@@ -104,6 +104,14 @@ def codex_launcher(selected):
         + canonical + ".")
 
 
+def configuration_command(launcher, checkout, client):
+    """The plan-only provider-config invocation that launch preparation runs."""
+    command = [str(launcher), "--repo", str(checkout), "--json", "provider-config", "--client", client]
+    if Path(launcher).name == "multithread":
+        command.extend(["--launcher-name", "multithread"])
+    return command
+
+
 def prepare(client, repo, relay, provider):
     if platform.system() != "Linux" or platform.machine() != "x86_64":
         raise LaunchError("This Multithread release requires a supported x86-64 Linux environment; see docs/SUPPORT.md.")
@@ -120,9 +128,7 @@ def prepare(client, repo, relay, provider):
     if client == "codex":
         launcher = codex_launcher(launcher)
     provider_path = executable(provider, client)
-    command = [launcher, "--repo", str(checkout), "--json", "provider-config", "--client", client]
-    if Path(launcher).name == "multithread":
-        command.extend(["--launcher-name", "multithread"])
+    command = configuration_command(launcher, checkout, client)
     try:
         result = subprocess.run(command, cwd=checkout, stdin=subprocess.DEVNULL,
                                 capture_output=True, text=True, timeout=15, check=False)
@@ -712,9 +718,11 @@ def _follow_up_preparation(args, plan, envelope):
         return None
     # prepare checked this exact hook against the selected launcher. Retain its
     # entry path, as well as the provider's entry, without resolving symlinks.
+    # The account launcher is the default selection, so it needs no --multithread.
     launcher = shlex.split(plan["relay_plan"]["hook_command"])[0]
     entry = args.report_entry if args.report_entry is not None else [launcher, "peer"]
-    prefix = [*entry, args.client, "--repo", plan["repo"], "--multithread", launcher,
+    selection = [] if launcher == str(account_launcher()) else ["--multithread", launcher]
+    prefix = [*entry, args.client, "--repo", plan["repo"], *selection,
               "--provider", plan["argv"][0], "--resume=" + envelope["session_id"],
               "--timeout", str(args.timeout)]
     if args.max_turns is not None:

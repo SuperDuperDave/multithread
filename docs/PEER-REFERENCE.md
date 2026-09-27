@@ -11,6 +11,13 @@ deliberate follow-up. This reference covers:
 - [Coordination and native verification evidence](#coordination-and-verification-scope)
 - [The reviewed source entry](#use-the-source-entry)
 
+An agent starting a peer call leaves `--multithread` and `--relay` unset; the
+account launcher setup prints is the default. A generated follow-up prefix
+already names any other launcher the call used, so use it unchanged. Launch and
+native hook trust are the person's steps: when a call refuses because hooks are
+not ready, the agent reports the refusal and its printed remedy, and never runs
+`launch`, reviews or changes hook trust, or retries around it.
+
 ## Receipt fields and capture limits
 
 The everyday [result states and assessment](PEER.md#read-the-result-before-continuing)
@@ -390,14 +397,13 @@ hide source files or alter provider capabilities for isolation.
 ## Use the source entry
 
 From the reviewed source checkout, `examples/call_peer.py` invokes the same
-helper against a reviewed installed Multithread selected with `--multithread`
-(`--relay` remains a compatibility spelling). For Codex this must be the account
-launcher setup prints: another path to it takes that spelling in the hook, and
-a different file is refused, because Codex trusts one exact hook command.
+helper against the installed account launcher that setup prints. Leave
+`--multithread` unset. Codex trusts one exact hook command, so a Codex call
+accepts only that launcher.
 
 ```sh
 /usr/bin/python3 -I -S -B examples/call_peer.py codex \
-  --multithread /absolute/reviewed/multithread --repo /absolute/enrolled/peer-checkout \
+  --repo /absolute/enrolled/peer-checkout \
   --task-file task.txt --output-dir /absolute/new-peer-call --json
 ```
 

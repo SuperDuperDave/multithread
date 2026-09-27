@@ -33,6 +33,12 @@ Use `claude` for the other provider. Add `--json` to prepare a launch plan witho
 starting a provider. No source checkout is needed. Its plan does not
 establish native trust, model-visible context or working provider tools.
 
+Launch and the native hook review are the person's steps, in their own
+terminal. An agent reports them with the remedy Multithread prints and never
+runs `launch`, reviews or changes hook trust, or edits provider hook
+configuration. It also leaves `--multithread` and `--relay` unset: Codex trusts
+one exact hook command, the account launcher setup prints.
+
 ## Command and scope
 
 A reviewed hook definition must invoke the absolute account-installed launcher:

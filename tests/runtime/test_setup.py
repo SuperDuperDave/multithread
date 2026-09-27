@@ -281,9 +281,34 @@ class SetupTests(unittest.TestCase):
         self.assertFalse(result["changes_provider_settings"])
         self.assertFalse(result["changes_permissions"])
         output = self.display(result)
-        launch_line = "  Command: " + shlex.join(command)
+        launch_line = "  Your command: " + shlex.join(command)
         self.assertIn(launch_line, output)
+        self.assertNotIn("  Command: " + shlex.join(command), output)
         self.assertLess(output.index(launch_line), output.index("First collaboration,"))
+        action = next(entry for entry in result["next_actions"] if entry["stage"] == "claude")
+        self.assertEqual("person", action["actor"])
+        self.assertIn("in your own interactive terminal", action["action"])
+        self.assertIn("An agent reports this step and never runs it.", action["action"])
+
+    def test_launch_is_only_ever_a_persons_step(self):
+        def prepare(client, repo, launcher, path):
+            if client == "claude":
+                raise setup.provider.LaunchError("synthetic preparation refusal")
+            return self.codex_plan(path)
+        scenarios = (({}, None), ({"stop": "modified"}, None), ({}, OSError("synthetic exec failure")))
+        for statuses, error in scenarios:
+            with (self.subTest(statuses=statuses, error=error),
+                  mock.patch.object(setup.provider, "prepare", side_effect=prepare)):
+                self.hook_statuses, self.listing_error = statuses, error
+                _, result = self.invoke("--codex", "/fixture/codex", "--claude", "/fixture/claude")
+                output = self.display(result)
+                for entry in result["next_actions"]:
+                    command = entry.get("command", [])
+                    launches = len(command) > 1 and command[1] == "launch"
+                    self.assertEqual(launches, entry.get("actor") == "person", entry)
+                self.assertNotIn(" launch claude", output)
+                self.assertTrue(all(line.startswith("  Your command: ") for line in output.splitlines()
+                                    if " launch " in line and line.lstrip().startswith(("Command", "Your command"))))
 
     def test_human_provider_error_is_visible_beside_state_without_erasing_readiness(self):
         def prepare(client, repo, launcher, path):
@@ -300,7 +325,12 @@ class SetupTests(unittest.TestCase):
         self.assertIn("codex: prepared", output)
         self.assertIn("claude: unavailable; synthetic hook plan does not match this checkout", output)
         self.assertIn("Provider sign-in, hook delivery and tool execution: not checked.", output)
-        self.assertIn("--provider /fixture/claude --json", output)
+        # The same plan-only configuration check that launch preparation runs.
+        expected = [self.launcher, "--repo", str(self.repo), "--json", "provider-config",
+                    "--client", "claude", "--launcher-name", "multithread"]
+        self.assertEqual(expected, setup.provider.configuration_command(self.launcher, self.repo, "claude"))
+        self.assertIn("  Command: " + shlex.join(expected), output)
+        self.assertIn("select the reviewed one with --claude", output)
         self.assertEqual("unknown", result["provider_authentication"])
         self.assertTrue(result["provider_started"], "Codex's hook listing started its app server")
         self.assertEqual([(self.codex_plan("/fixture/codex")["argv"], str(self.repo))], self.listings)
@@ -378,6 +408,8 @@ class SetupTests(unittest.TestCase):
     def test_human_paths_and_errors_escape_controls_without_changing_json_or_command_arguments(self):
         selected = "/fixture/provider\x1b[31m\nFAKE: ready\r\u202e"
         message = "Cannot prepare " + selected
+        self.repo = self.base / "checkout\x1b[31m\nFAKE: ready\r\u202e 雪"
+        self.repo.mkdir()
         with mock.patch.object(setup.provider, "prepare", side_effect=setup.provider.LaunchError(message)):
             code, result = self.invoke("--claude", selected)
         self.assertEqual(0, code)
@@ -395,7 +427,7 @@ class SetupTests(unittest.TestCase):
         self.assertIn("claude: unavailable; Cannot prepare", output)
         command_line = next(line for line in output.splitlines() if line.startswith("  Command (JSON argv): "))
         argv = json.loads(command_line.split(": ", 1)[1])
-        self.assertEqual(selected, argv[argv.index("--provider") + 1])
+        self.assertEqual(str(self.repo), argv[argv.index("--repo") + 1])
         self.assertEqual(result["next_actions"][-1]["command"], argv)
 
     def test_multiline_stderr_keeps_each_line_attributed_and_json_unchanged(self):
