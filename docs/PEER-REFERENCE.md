@@ -11,11 +11,12 @@ deliberate follow-up. This reference covers:
 - [Coordination and native verification evidence](#coordination-and-verification-scope)
 - [The reviewed source entry](#use-the-source-entry)
 
-An agent calling a peer leaves `--multithread` and `--relay` unset; the account
-launcher setup prints is the default. Launch and native hook trust are the
-person's steps: when a call refuses because hooks are not ready, the agent
-reports the refusal and its printed remedy, and never runs `launch`, reviews or
-changes hook trust, or retries around it.
+An agent starting a peer call leaves `--multithread` and `--relay` unset; the
+account launcher setup prints is the default. A generated follow-up prefix
+already names any other launcher the call used, so use it unchanged. Launch and
+native hook trust are the person's steps: when a call refuses because hooks are
+not ready, the agent reports the refusal and its printed remedy, and never runs
+`launch`, reviews or changes hook trust, or retries around it.
 
 ## Receipt fields and capture limits
 

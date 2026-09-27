@@ -351,8 +351,9 @@ class CodexProtocolTests(unittest.TestCase):
         self.assertEqual(0, code, result)
         self.assertEqual(identifier, result["session_id"])
         prefix = result["follow_up_preparation"]["argv_prefix"]
+        # The account launcher is the default selection, so the prefix omits it.
         self.assertEqual([str(self.relay), "peer", "codex", "--repo", str(self.repo),
-                          "--multithread", str(self.relay), "--provider", str(self.provider),
+                          "--provider", str(self.provider),
                           "--resume=" + identifier, "--timeout", "2",
                           "--dry-run", "--json", "--task-file"], prefix)
         self.assertNotIn("--max-turns", prefix)

@@ -104,6 +104,14 @@ def codex_launcher(selected):
         + canonical + ".")
 
 
+def configuration_command(launcher, checkout, client):
+    """The plan-only provider-config invocation that launch preparation runs."""
+    command = [str(launcher), "--repo", str(checkout), "--json", "provider-config", "--client", client]
+    if Path(launcher).name == "multithread":
+        command.extend(["--launcher-name", "multithread"])
+    return command
+
+
 def prepare(client, repo, relay, provider):
     if platform.system() != "Linux" or platform.machine() != "x86_64":
         raise LaunchError("This Multithread release requires a supported x86-64 Linux environment; see docs/SUPPORT.md.")
@@ -120,9 +128,7 @@ def prepare(client, repo, relay, provider):
     if client == "codex":
         launcher = codex_launcher(launcher)
     provider_path = executable(provider, client)
-    command = [launcher, "--repo", str(checkout), "--json", "provider-config", "--client", client]
-    if Path(launcher).name == "multithread":
-        command.extend(["--launcher-name", "multithread"])
+    command = configuration_command(launcher, checkout, client)
     try:
         result = subprocess.run(command, cwd=checkout, stdin=subprocess.DEVNULL,
                                 capture_output=True, text=True, timeout=15, check=False)

@@ -221,8 +221,10 @@ def setup_report(repo, *, apply=False, codex=None, claude=None):
             message = str(exc)[:2048] if isinstance(exc, provider.LaunchError) else "Provider launch preparation is unavailable."
             result["providers"][client] = {"state": "unavailable", "executable": path,
                                            "version": "not_checked", "message": message}
-            _next(result, client, "Inspect the reported preparation failure; provider sign-in and trust use the provider's normal interface.",
-                  [launcher, "--repo", selected, "--json", "provider-config", "--client", client])
+            _next(result, client, "Inspect the reported preparation failure. If it names the provider executable, select the "
+                  "reviewed one with --" + client + "; otherwise run this plan-only configuration check. Provider "
+                  "sign-in and trust use the provider's normal interface.",
+                  provider.configuration_command(launcher, selected, client))
             continue
         command = [launcher, "launch", client, "--repo", selected, "--provider", plan["argv"][0]]
         entry = {"state": "prepared", "executable": plan["argv"][0],

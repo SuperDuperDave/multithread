@@ -325,8 +325,12 @@ class SetupTests(unittest.TestCase):
         self.assertIn("codex: prepared", output)
         self.assertIn("claude: unavailable; synthetic hook plan does not match this checkout", output)
         self.assertIn("Provider sign-in, hook delivery and tool execution: not checked.", output)
-        self.assertIn("  Command: " + shlex.join([self.launcher, "--repo", str(self.repo), "--json",
-                                                   "provider-config", "--client", "claude"]), output)
+        # The same plan-only configuration check that launch preparation runs.
+        expected = [self.launcher, "--repo", str(self.repo), "--json", "provider-config",
+                    "--client", "claude", "--launcher-name", "multithread"]
+        self.assertEqual(expected, setup.provider.configuration_command(self.launcher, self.repo, "claude"))
+        self.assertIn("  Command: " + shlex.join(expected), output)
+        self.assertIn("select the reviewed one with --claude", output)
         self.assertEqual("unknown", result["provider_authentication"])
         self.assertTrue(result["provider_started"], "Codex's hook listing started its app server")
         self.assertEqual([(self.codex_plan("/fixture/codex")["argv"], str(self.repo))], self.listings)
