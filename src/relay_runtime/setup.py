@@ -108,10 +108,13 @@ def _verified(observation, healthy, message, *, invalid_state="not_ready"):
     return observation
 
 
-def _next(report, stage, action, command=None):
+def _next(report, stage, action, command=None, *, person=False):
+    """Record one next step; a person step (launch, hook review) is never an agent's."""
     entry = {"stage": stage, "action": action}
     if command is not None:
         entry["command"] = command
+    if person:
+        entry["actor"] = "person"
     report["next_actions"].append(entry)
 
 
@@ -218,8 +221,8 @@ def setup_report(repo, *, apply=False, codex=None, claude=None):
             message = str(exc)[:2048] if isinstance(exc, provider.LaunchError) else "Provider launch preparation is unavailable."
             result["providers"][client] = {"state": "unavailable", "executable": path,
                                            "version": "not_checked", "message": message}
-            _next(result, client, "Inspect launch preparation; provider sign-in and trust use the provider's normal interface.",
-                  [launcher, "launch", client, "--repo", selected, "--provider", path, "--json"])
+            _next(result, client, "Inspect the reported preparation failure; provider sign-in and trust use the provider's normal interface.",
+                  [launcher, "--repo", selected, "--json", "provider-config", "--client", client])
             continue
         command = [launcher, "launch", client, "--repo", selected, "--provider", plan["argv"][0]]
         entry = {"state": "prepared", "executable": plan["argv"][0],
@@ -228,9 +231,11 @@ def setup_report(repo, *, apply=False, codex=None, claude=None):
         if client == "codex":
             entry.update(_codex_hooks(result, plan))
         if entry["state"] in ("needs_hook_review", "needs_hook_configuration"):
-            _next(result, client, entry["hook_trust"]["action"], command)
+            _next(result, client, entry["hook_trust"]["action"], command, person=True)
         else:
-            _next(result, client, "When a provider launch is authorized, run this in an interactive terminal and review its displayed invocation.", command)
+            _next(result, client, "Yours to run in your own interactive terminal when you want this provider with "
+                  "Multithread; review the invocation it displays. An agent reports this step and never runs it.",
+                  command, person=True)
     result["first_collaboration_url"] = "https://github.com/SuperDuperDave/multithread/blob/main/docs/PEER.md#first-collaboration"
     return result
 
@@ -270,7 +275,8 @@ def _display(report):
     for entry in report["next_actions"]:
         print(text(entry["stage"]) + ": " + text(entry["action"]))
         if "command" in entry:
-            provider._display_command("  Command", entry["command"])
+            provider._display_command("  Your command" if entry.get("actor") == "person" else "  Command",
+                                      entry["command"])
     if report.get("first_collaboration_url"):
         print("First collaboration, when you authorize provider use: "
               + text(report["first_collaboration_url"]))

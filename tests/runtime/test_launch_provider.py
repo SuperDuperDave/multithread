@@ -553,5 +553,32 @@ class LaunchProviderTests(unittest.TestCase):
                 run.assert_not_called()
 
 
+class AgentRuleDocumentationTests(unittest.TestCase):
+    """The public guides an agent reads keep launch and hook trust with the person."""
+
+    RULES = {
+        "docs/PEER.md": ("never runs `launch`", "`--multithread` unset"),
+        "docs/PEER-REFERENCE.md": ("never runs `launch`", "`--multithread` and `--relay` unset"),
+        "docs/PROVIDERS.md": ("never runs `launch`", "`--multithread` and `--relay` unset"),
+        "skills/multithread/SKILL.md": ("Never run `multithread launch`", "`--multithread` and `--relay` unset"),
+    }
+
+    def test_agent_facing_guides_state_the_rule(self):
+        for name, phrases in self.RULES.items():
+            text = " ".join((ROOT / name).read_text(encoding="utf-8").split())
+            for phrase in phrases:
+                with self.subTest(guide=name, phrase=phrase):
+                    self.assertIn(phrase, text)
+
+    def test_no_public_example_selects_a_launcher(self):
+        guides = [ROOT / "README.md", *sorted((ROOT / "docs").glob("*.md")),
+                  *sorted((ROOT / "skills").glob("*/SKILL.md"))]
+        for guide in guides:
+            blocks = guide.read_text(encoding="utf-8").split("```")[1::2]
+            for block in blocks:
+                with self.subTest(guide=guide.name):
+                    self.assertNotRegex(block, r"--(?:multithread|relay)[ =]\S")
+
+
 if __name__ == "__main__":
     unittest.main()

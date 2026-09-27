@@ -76,6 +76,37 @@ class PeerFollowUpTests(unittest.TestCase):
         receipt = json.loads((Path(result["evidence_directory"]) / "result.json").read_text())
         self.assertEqual(result["follow_up_preparation"], receipt["follow_up_preparation"])
 
+    def test_account_launcher_is_the_default_so_follow_up_omits_multithread(self):
+        fixture = self.fixture
+        for client in ("claude", "codex"):
+            with (self.subTest(client=client),
+                  mock.patch.object(provider, "account_launcher", return_value=fixture.relay)):
+                prefix = self.preparation(client=client)["argv_prefix"]
+                self.assertEqual([str(fixture.relay), "peer", client, "--repo", str(fixture.repo),
+                                  "--provider", str(fixture.provider)], prefix[:7])
+                self.assertNotIn("--multithread", prefix)
+                self.assertNotIn("--relay", prefix)
+
+    def test_account_launcher_follow_up_prepares_the_same_launcher_without_selection(self):
+        fixture = self.fixture
+        with mock.patch.object(provider, "account_launcher", return_value=fixture.relay):
+            code, result, _ = fixture.invoke()
+            self.assertEqual(0, code, result)
+            prefix = result["follow_up_preparation"]["argv_prefix"]
+            self.assertNotIn("--multithread", prefix)
+            (fixture.base / "relay-argv.json").unlink()
+            stdout = io.StringIO()
+            with (redirect_stdout(stdout),
+                  mock.patch.dict(provider.os.environ, fixture.environment, clear=True)):
+                self.assertEqual(0, provider.peer_main([*prefix[2:], str(fixture.task)]))
+        plan = json.loads(stdout.getvalue())
+        self.assertEqual("call_prepared", plan["state"])
+        self.assertFalse(plan["provider_started"])
+        # The omitted selection resolved to the account launcher the first call used.
+        self.assertEqual(str(fixture.relay),
+                         json.loads((fixture.base / "relay-argv.json").read_text())[0])
+        self.assertEqual("call\n", fixture.calls.read_text())
+
     def test_generated_source_preparation_reads_new_task_without_provider_or_evidence_writes(self):
         fixture = self.fixture
         entry = [sys.executable, "-I", "-S", "-B", str(ROOT / "examples/call_peer.py")]

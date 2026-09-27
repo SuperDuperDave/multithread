@@ -712,9 +712,11 @@ def _follow_up_preparation(args, plan, envelope):
         return None
     # prepare checked this exact hook against the selected launcher. Retain its
     # entry path, as well as the provider's entry, without resolving symlinks.
+    # The account launcher is the default selection, so it needs no --multithread.
     launcher = shlex.split(plan["relay_plan"]["hook_command"])[0]
     entry = args.report_entry if args.report_entry is not None else [launcher, "peer"]
-    prefix = [*entry, args.client, "--repo", plan["repo"], "--multithread", launcher,
+    selection = [] if launcher == str(account_launcher()) else ["--multithread", launcher]
+    prefix = [*entry, args.client, "--repo", plan["repo"], *selection,
               "--provider", plan["argv"][0], "--resume=" + envelope["session_id"],
               "--timeout", str(args.timeout)]
     if args.max_turns is not None:
