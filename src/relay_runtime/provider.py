@@ -213,6 +213,8 @@ def _display_launch(plan):
               + ", so this launch adds no copies: " + ", ".join(_hook_events(plan["provider"])))
         if plan["provider"] == "codex":
             print("Codex runs them once trusted; if it asks, review them in /hooks.")
+        if plan["hooks"].get("note"):
+            print(_display_text(plan["hooks"]["note"]))
     else:
         print("Invocation hooks: " + ", ".join(_hook_events(plan["provider"])))
     print("Each hook runs the following command with a 3-second timeout:")

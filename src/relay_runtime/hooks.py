@@ -199,7 +199,17 @@ def inspect(client, environ=None):
     if not path.parent.is_dir():
         return {**result, "state": "provider_not_found", "events": {}, "unexpected": [], "other_hooks": {}}
     _, value = _read(path)
-    return {**result, **_classify(client, value)}
+    result.update(_classify(client, value))
+    if client == "claude" and isinstance(value, dict) and value.get("disableAllHooks") is True:
+        # Installed is not running: Claude runs no hooks at all. The setting is the person's.
+        result["effective"] = "disabled_by_disableAllHooks"
+    return result
+
+
+def _disabled_note(entry):
+    return (f"Claude Code's disableAllHooks is true in {entry['file']}, so Claude runs none of its hooks, "
+            "Multithread's included. Multithread leaves that setting to you: change it in Claude Code's settings if "
+            "you want hooks to run. Project, local or managed settings with higher precedence can also decide it.")
 
 
 def delivery(client, environ=None):
@@ -211,7 +221,8 @@ def delivery(client, environ=None):
     """
     state = inspect(client, environ)
     if state["state"] == "installed":
-        return {"source": "user", "file": state["file"], "command": state["command"]}
+        return {"source": "user", "file": state["file"], "command": state["command"],
+                **({"effective": state["effective"], "note": _disabled_note(state)} if "effective" in state else {})}
     if state["state"] in ("absent", "provider_not_found"):
         return {"source": "session_flags", "file": None, "command": None}
     raise HooksError(
@@ -544,8 +555,9 @@ def _review(listing, cwd, installed):
             (len(mine) == 1, f"Codex lists {len(mine)} Multithread hooks for this event, not one"),
             (hook.get("source") == "user" and codex_peer._same_path(hook.get("sourcePath"), installed["file"]),
              "the listed hook does not come from " + installed["file"]),
-            (isinstance(hook.get("key"), str) and hook["key"].endswith(suffix),
-             "the listed position differs from the file's"),
+            (isinstance(hook.get("key"), str) and isinstance(hook.get("sourcePath"), str)
+             and hook["key"] == hook["sourcePath"] + suffix,
+             "the listed key does not name this file and the position the file holds"),
             (hook.get("handlerType") == "command" and hook.get("command") == installed["command"],
              "the listed command differs from the one Multithread installed"),
             (hook.get("timeoutSec") == _TIMEOUT and hook.get("async", False) is False
@@ -617,7 +629,8 @@ def _trust_session(executable, installed, result, revoke, expected, timeout):
                     named = {hook["key"]: hook["command"] for hook in listed
                              if hook.get("source") == "user" and hook.get("handlerType") == "command"
                              and hook.get("command") in result["commands"] and isinstance(hook.get("key"), str)
-                             and codex_peer._same_path(hook.get("sourcePath"), installed["file"])}
+                             and codex_peer._same_path(hook.get("sourcePath"), installed["file"])
+                             and hook["key"].startswith(str(hook["sourcePath"]) + ":")}
                     revoked = sorted(key for key in named if isinstance(records.get(key), dict)
                                      and "trusted_hash" in records[key])
                 else:
@@ -762,6 +775,8 @@ def status(clients=("codex", "claude"), environ=None, *, codex=None, listing=Tru
                 + _NAMES[client] + " session in an enrolled repository reaches its ledger, however it was "
                 "started. It shows the exact change and asks first.",
                 "command": _launcher_command("hooks", "install", "--client", client)})
+        if entry.get("effective"):
+            result["next_actions"].append({"client": client, "action": _disabled_note(entry)})
         if client != "codex" or entry["state"] != "installed":
             continue
         trust_state = {"source": "estimated_from_config", "state": "unknown"}
@@ -884,8 +899,11 @@ def coverage_evidence(root, environ=None, *, now=None):
         except (OSError, sqlite3.Error, subprocess.SubprocessError, ValueError):
             entry.update(evidence="unavailable", sessions=[])
         try:
-            installed = inspect(client, environ)["state"]
+            inspected = inspect(client, environ)
+            installed = inspected["state"]
             entry["hooks"] = installed
+            if inspected.get("effective"):
+                entry["effective"] = inspected["effective"]
             if client == "codex" and installed == "installed":
                 entry["trust"] = trust_estimate(environ)
         except (HooksError, OSError):
@@ -918,6 +936,10 @@ def coverage_report(evidence, observed):
                 fix = shlex.join([launcher, "hooks", "status", "--client", client]) + ", which names the file and what to fix"
             elif entry.get("hooks") != "installed":
                 cause, fix = f"Multithread's user-level {_NAMES[client]} hooks are {_condition(str(entry.get('hooks')))}", install
+            elif entry.get("effective") == "disabled_by_disableAllHooks":
+                cause = "Claude Code's disableAllHooks setting is on, so it runs no hooks, Multithread's included"
+                fix = ("change disableAllHooks in Claude Code's settings if you want hooks to run; "
+                       + shlex.join([launcher, "hooks", "status", "--client", client]) + " names the file")
             elif client == "codex" and entry.get("trust") != "trusted":
                 cause = "Codex hasn't trusted Multithread's user-level hooks, so it skips them"
                 fix = (shlex.join([launcher, "hooks", "trust"]) + " (agent-assisted, with your go) or /hooks in a "

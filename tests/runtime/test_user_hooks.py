@@ -352,6 +352,27 @@ class FileTests(HomeCase):
             self.assertIn("could not be read (PermissionError). Nothing was changed.",
                           state["providers"]["codex"]["message"])
 
+    def test_a_disabled_claude_default_is_reported_and_left_alone(self):
+        self.apply("install", ("claude",))
+        value = json.loads(self.file("claude").read_text())
+        value["disableAllHooks"] = True
+        self.file("claude").write_text(json.dumps(value, indent=2) + "\n")
+        before = self.file("claude").read_bytes()
+        state = hooks.inspect("claude")
+        self.assertEqual(("installed", "disabled_by_disableAllHooks"), (state["state"], state["effective"]))
+        note = (f"Claude Code's disableAllHooks is true in {self.file('claude')}, so Claude runs none of its hooks, "
+                "Multithread's included. Multithread leaves that setting to you: change it in Claude Code's settings "
+                "if you want hooks to run. Project, local or managed settings with higher precedence can also decide it.")
+        self.assertEqual(note, hooks.delivery("claude")["note"])
+        result = hooks.status(("claude",))
+        self.assertEqual("needs_attention", result["state"])
+        self.assertEqual([{"client": "claude", "action": note}], result["next_actions"])
+        code, output, _ = CommandLineTests.run_hooks(self, "status", "--client", "claude")
+        self.assertEqual(1, code)
+        self.assertIn("Next: " + note, output)
+        self.assertEqual("unchanged", hooks.change_files("install", ("claude",))["state"])
+        self.assertEqual(before, self.file("claude").read_bytes(), "the setting is never changed")
+
     def test_missing_provider_directory_is_skipped_not_created(self):
         self.claude_home.rmdir()
         result = self.apply("install")
@@ -616,7 +637,10 @@ class TrustTests(HomeCase):
             "hash": ({"Stop": {"currentHash": "sha256:" + "a" * 64}}, "Codex's hash differs"),
             "source": ({"Stop": {"source": "project"}}, "does not come from"),
             "file": ({"Stop": {"sourcePath": str(self.base / "elsewhere.json")}}, "does not come from"),
-            "slot": ({"Stop": {"key": stop[:-3] + "9:0"}}, "listed position differs"),
+            "slot": ({"Stop": {"key": stop[:-3] + "9:0"}}, "listed key does not name this file and the position"),
+            # The slot matches, but the key names another declaring file than the listed source.
+            "foreign key prefix": ({"Stop": {"key": "/elsewhere/hooks.json" + stop[len(self.path):]}},
+                                   "listed key does not name this file and the position"),
             "timeout": ({"Stop": {"timeoutSec": 5}}, "timeout, matcher or execution mode"),
             "matcher": ({"Stop": {"matcher": ".*"}}, "timeout, matcher or execution mode"),
             "managed": ({"Stop": {"isManaged": True}}, "timeout, matcher or execution mode"),
@@ -958,6 +982,13 @@ class CoverageTests(HomeCase):
                     "evidence": "codex_thread_index", "sessions": session, **extra}}}, {"codex": set()})
                 self.assertIn(": " + cause, report["messages"][0])
                 self.assertTrue(report["messages"][0].endswith("Fix: " + fix + "."), report["messages"][0])
+        disabled = hooks.coverage_report({**base, "providers": {"claude": {
+            "evidence": "claude_transcript_names", "sessions": session, "hooks": "installed",
+            "effective": "disabled_by_disableAllHooks"}}}, {"claude": set()})
+        self.assertTrue(disabled["messages"][0].endswith(
+            ": Claude Code's disableAllHooks setting is on, so it runs no hooks, Multithread's included. Fix: change "
+            "disableAllHooks in Claude Code's settings if you want hooks to run; " + str(LAUNCHER)
+            + " hooks status --client claude names the file."), disabled["messages"][0])
         unreadable = hooks.coverage_report({**base, "providers": {"codex": {
             "evidence": "codex_thread_index", "sessions": session, "hooks": "unreadable"}}}, {"codex": set()})
         self.assertTrue(unreadable["messages"][0].endswith(

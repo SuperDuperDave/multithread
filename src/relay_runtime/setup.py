@@ -252,6 +252,9 @@ def setup_report(repo, *, apply=False, codex=None, claude=None):
         elif entry["state"] in ("needs_hook_review", "needs_hook_configuration"):
             _next(result, client, entry["hook_trust"]["action"],
                   [launcher, "hooks", "status"] if user_level else command, person=not user_level)
+        elif user_level and plan["hooks"].get("note"):
+            entry["hook_effect"] = plan["hooks"]["effective"]
+            _next(result, client, plan["hooks"]["note"])
         elif user_level:
             _next(result, client, "Start " + hooks._NAMES[client] + " however you like in this repository (app, "
                   "terminal or IDE): its user-level hooks reach the ledger. launch remains available and adds no "
