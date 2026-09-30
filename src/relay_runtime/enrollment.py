@@ -140,60 +140,107 @@ def _unsafe_mode(path: Path, info: os.stat_result, private: bool) -> bool:
             and not (system_temporary and not private))
 
 
-def _linked_git_directory(checkout: Path) -> Path | None:
-    """A linked worktree's Git directory as its .git file names it, or None."""
+def _open_chain(path: Path, opened: dict[Path, int]) -> list[Path]:
+    """Open path's directories from /, each through its opened parent without following a symlink.
+
+    Returns the directories reached; it ends early at a missing path, a symlink
+    or a file. Descriptors stay in opened, shared by every chain, so each
+    directory is judged once through the parent it was reached from.
+    """
+    if Path("/") not in opened:
+        opened[Path("/")] = os.open("/", _DIRECTORY_FLAGS)
+    chain = [Path("/")]
+    for part in path.parts[1:]:
+        child = chain[-1] / part
+        if child not in opened:
+            try:
+                opened[child] = os.open(part, _DIRECTORY_FLAGS, dir_fd=opened[chain[-1]])
+            except OSError:
+                break
+        chain.append(child)
+    return chain
+
+
+def _has_entry(directory: int, name: str) -> bool:
     try:
-        fd = os.open(checkout / ".git", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+        os.stat(name, dir_fd=directory, follow_symlinks=False)
+        return True
+    except FileNotFoundError:
+        return False
+
+
+def _read_entry(directory: int, name: str) -> str | None:
+    """A small regular file in an opened directory, read without following a symlink."""
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=directory)
     except OSError:
         return None
     try:
         body = os.read(fd, _MAX_JSON + 1) if stat.S_ISREG(os.fstat(fd).st_mode) else b""
     finally:
         os.close(fd)
-    line = os.fsdecode(body).rstrip("\n")
-    if len(body) > _MAX_JSON or not line.startswith("gitdir: "):
-        return None
-    target = Path(line[len("gitdir: "):])
-    return Path(os.path.normpath(target if target.is_absolute() else checkout / target))
+    return os.fsdecode(body).rstrip("\n") if 0 < len(body) <= _MAX_JSON else None
+
+
+def _git_chain(root: Path, opened: dict[Path, int]) -> tuple[list[Path], Path | None]:
+    """The Git directories enrollment checks for this checkout, and its state if present.
+
+    A linked worktree counts only when its .git pointer and Git's backlink name
+    each other, as enrollment requires; both are read from opened directories.
+    """
+    try:
+        marker = os.stat(".git", dir_fd=opened[root], follow_symlinks=False)
+    except OSError:
+        return [], None
+    if stat.S_ISDIR(marker.st_mode):
+        git_dir = common = root / ".git"
+    else:
+        pointer = _read_entry(opened[root], ".git") if stat.S_ISREG(marker.st_mode) else None
+        if pointer is None or not pointer.startswith("gitdir: "):
+            return [], None
+        target = Path(pointer[len("gitdir: "):])
+        git_dir = Path(os.path.normpath(target if target.is_absolute() else root / target))
+        common = git_dir.parent.parent
+        if git_dir.parent.name != "worktrees" or common.name != ".git":
+            return [], None
+    chain = _open_chain(git_dir, opened)
+    if chain[-1] != git_dir or (git_dir != common and _read_entry(opened[git_dir], "gitdir") != str(root / ".git")):
+        return [], None
+    state = common.parent / ".relay"
+    return chain, state if _open_chain(state, opened)[-1] == state else None
 
 
 def unsafe_directories(repo: str | os.PathLike[str], registry_root: Path) -> list[tuple[Path, int, bool]]:
     """Every existing directory enrollment would refuse for its mode, in checking order.
 
-    A diagnostic, so one refusal can name every fix. It follows no symlink,
-    writes, runs and decides nothing: enrollment still validates each directory
-    it holds. The one file it reads is a linked worktree's .git pointer, which
-    names the Git directories enrollment checks next.
+    A diagnostic, so one refusal can name every fix. It writes, runs and
+    decides nothing: enrollment still validates each directory it holds. Each
+    directory is opened through its opened parent without following a symlink,
+    and judged by that descriptor. The requested path must open whole before any
+    Git metadata inside it is read; otherwise the diagnostic adds nothing.
     """
-    requested = Path(os.path.normpath(Path.cwd() / repo))
-    root = next((path for path in (requested, *requested.parents) if os.path.lexists(path / ".git")), None)
-    targets, private = [requested], {registry_root}
-    if root is not None:
-        main = stat.S_ISDIR(os.lstat(root / ".git").st_mode)
-        git_dir = root / ".git" if main else _linked_git_directory(root)
-        common = (git_dir if main else git_dir.parent.parent
-                  if git_dir is not None and git_dir.parent.name == "worktrees" else None)
-        targets += [path for path in (root, git_dir, common) if path is not None]
-        if common is not None:
-            targets.append(common.parent / ".relay")
-            private.add(common.parent / ".relay")
-    targets.append(registry_root)
-    found, reachable = [], {}
-    for target in targets:
-        for path in (*reversed(target.parents), target):
-            if path not in reachable:
-                try:
-                    info = os.lstat(path)
-                except OSError:
-                    info = None
-                # Enrollment refuses a missing path, a symlink or a file for its own reasons.
-                reachable[path] = info is not None and stat.S_ISDIR(info.st_mode)
-                if (reachable[path] and info.st_uid in (0, os.getuid())
-                        and _unsafe_mode(path, info, path in private)):
-                    found.append((path, stat.S_IMODE(info.st_mode), path in private))
-            if not reachable[path]:
-                break
-    return found
+    requested = Path(os.path.abspath(Path.cwd() / repo))
+    opened: dict[Path, int] = {}
+    try:
+        chain = _open_chain(requested, opened)
+        if chain[-1] != requested:
+            return []
+        root = next((path for path in reversed(chain) if _has_entry(opened[path], ".git")), None)
+        git, state = _git_chain(root, opened) if root is not None else ([], None)
+        # The registry path comes from the account, not the checkout; a missing tail is normal.
+        private = {registry_root, state}
+        found, seen = [], set()
+        for path in (*chain, *git, *([state] if state else []), *_open_chain(registry_root, opened)):
+            if path in seen:
+                continue
+            seen.add(path)
+            info = os.fstat(opened[path])
+            if info.st_uid in (0, os.getuid()) and _unsafe_mode(path, info, path in private):
+                found.append((path, stat.S_IMODE(info.st_mode), path in private))
+        return found
+    finally:
+        for fd in opened.values():
+            os.close(fd)
 
 
 def permission_refusal(repo: str | os.PathLike[str], registry_root: Path,

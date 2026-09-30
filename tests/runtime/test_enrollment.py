@@ -327,6 +327,113 @@ class EnrollmentTests(unittest.TestCase):
         self.assertNotIn("\x1b", message)
         self.assertEqual(3, len(message.splitlines()))
 
+    @staticmethod
+    def listed(message):
+        return [Path(shlex.split(line.strip().split("   (")[0])[-1]) for line in message.splitlines()
+                if line.startswith("  chmod ")]
+
+    def unrelated_linked_worktree(self, name):
+        """A group-writable linked worktree elsewhere, and its unsafe directories in checking order."""
+        main = self.base / name / "main"
+        main.mkdir(parents=True)
+        self.git(main, "init", "--template=", "-q")
+        self.git(main, "commit", "--allow-empty", "-q", "-F", "-")
+        linked = self.base / name / "linked"
+        self.git(main, "worktree", "add", "--detach", "-q", str(linked))
+        chain = [self.base / name, linked, main, main / ".git", main / ".git" / "worktrees",
+                 main / ".git" / "worktrees" / "linked"]
+        for path in chain:
+            path.chmod(0o775)
+        return linked, main / ".git" / "worktrees" / "linked", chain
+
+    def test_a_symlink_after_the_refusal_redirects_no_advice(self):
+        # The requested checkout becomes a symlink between the refusal and the
+        # diagnostic. Its target's backlink even names the symlinked path, so
+        # only the diagnostic's own ancestry stands between it and that tree.
+        parent = self.base / "requested-parent"
+        work = parent / "work"
+        work.mkdir(parents=True)
+        self.git(work, "init", "--template=", "-q")
+        parent.chmod(0o775)
+        with self.assertRaises(subject.UnsafeDirectory) as refused:
+            self.registry.enroll(work)
+        self.assertEqual(parent, refused.exception.path)
+        linked, entry, unrelated = self.unrelated_linked_worktree("unrelated")
+        (entry / "gitdir").write_text(str(work / ".git") + "\n")
+        subprocess.run(["/usr/bin/rm", "-rf", str(work)], check=True)
+        work.symlink_to(linked, target_is_directory=True)
+        with mock.patch.object(subject, "_read_entry", wraps=subject._read_entry) as read:
+            message = str(subject.permission_refusal(work, self.registry.root, refused.exception))
+        read.assert_not_called()
+        self.assertEqual([parent], self.listed(message))
+        for path in unrelated:
+            self.assertNotIn(str(path), message)
+
+    def test_a_symlink_below_a_real_checkout_keeps_only_the_refusal(self):
+        # Ancestors above the break are real, and one holds a checkout: its Git
+        # directories still describe nothing the requested path relies on now.
+        sub = self.repo / "sub"
+        (sub / "work").mkdir(parents=True)
+        (self.repo / ".git").chmod(0o775)
+        with self.assertRaises(subject.UnsafeDirectory) as refused:
+            self.registry.enroll(sub / "work")
+        self.assertEqual(self.repo / ".git", refused.exception.path)
+        self.repo.chmod(0o775)
+        subprocess.run(["/usr/bin/rm", "-rf", str(sub)], check=True)
+        sub.symlink_to(self.base, target_is_directory=True)
+        (self.base / "work").mkdir()
+        message = str(subject.permission_refusal(sub / "work", self.registry.root, refused.exception))
+        self.assertEqual([self.repo / ".git"], self.listed(message))
+
+    def test_a_swap_during_the_diagnostic_changes_neither_what_it_reads_nor_judges(self):
+        # The real checkout: a linked worktree under a group-writable folder.
+        outer, work = self.base / "outer", self.base / "outer" / "work"
+        outer.mkdir()
+        self.git(self.repo, "commit", "--allow-empty", "-q", "-F", "-")
+        self.git(self.repo, "worktree", "add", "--detach", "-q", str(work))
+        shared = self.repo / ".git" / "worktrees"
+        for path in (outer, work, shared, shared / "work"):
+            path.chmod(0o775)
+        # Another tree to swap in as `outer`: safe where the checkout is unsafe, and
+        # unsafe Git directories whose backlink names outer/work.
+        other = self.base / "other"
+        (other / "main").mkdir(parents=True)
+        self.git(other / "main", "init", "--template=", "-q")
+        self.git(other / "main", "commit", "--allow-empty", "-q", "-F", "-")
+        self.git(other / "main", "worktree", "add", "--detach", "-q", str(other / "work"))
+        other_entry = other / "main" / ".git" / "worktrees" / "work"
+        (other_entry / "gitdir").write_text(str(work / ".git") + "\n")
+        for path in (other, other / "work"):
+            path.chmod(0o755)
+        for path in (other / "main", other / "main" / ".git", other_entry.parent, other_entry):
+            path.chmod(0o775)
+        original = subject._has_entry
+
+        def swap_first(directory, name):
+            if not outer.is_symlink():
+                outer.rename(self.base / "outer-held")
+                outer.symlink_to(other, target_is_directory=True)
+            return original(directory, name)
+        with mock.patch.object(subject, "_has_entry", side_effect=swap_first):
+            found = [path for path, _, _ in subject.unsafe_directories(work, self.registry.root)]
+        self.assertTrue(outer.is_symlink())
+        # Read and judged through the descriptors opened before the swap.
+        self.assertEqual([outer, work, shared, shared / "work"], found)
+
+    def test_a_pointer_whose_backlink_disagrees_adds_no_git_directories(self):
+        linked, entry, chain = self.unrelated_linked_worktree("forged")
+        found = [path for path, _, _ in subject.unsafe_directories(linked, self.registry.root)]
+        self.assertEqual(chain, found)
+        (entry / "gitdir").write_text(str(self.base / "elsewhere" / ".git") + "\n")
+        found = [path for path, _, _ in subject.unsafe_directories(linked, self.registry.root)]
+        self.assertEqual([self.base / "forged", linked], found)
+        # A pointer whose path runs through a symlink opens no Git directory either.
+        (entry / "gitdir").write_text(str(linked / ".git") + "\n")
+        (self.base / "alias").symlink_to(self.base / "forged", target_is_directory=True)
+        (linked / ".git").write_text(f"gitdir: {self.base / 'alias' / 'main' / '.git' / 'worktrees' / 'linked'}\n")
+        found = [path for path, _, _ in subject.unsafe_directories(linked, self.registry.root)]
+        self.assertEqual([self.base / "forged", linked], found)
+
     def test_unavailable_scan_keeps_the_directory_actually_refused(self):
         refused = subject.UnsafeDirectory(self.repo, 0o770, False)
         with mock.patch.object(subject, "unsafe_directories", side_effect=OSError("artificial")):
