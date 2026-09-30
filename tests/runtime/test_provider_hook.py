@@ -94,8 +94,15 @@ class ProviderHookTests(unittest.TestCase):
         self.assertEqual({"hookEventName", "additionalContext"}, set(output))
         self.assertEqual(event, output["hookEventName"])
         context = output["additionalContext"]
-        self.assertTrue(context.startswith("MULTITHREAD WARNING: this checkout is enrolled, but Multithread's "
-                                           + event + " hook could not reach its ledger (" + because + ")"), context)
+        self.assertTrue(context.startswith(
+            "MULTITHREAD WARNING: this checkout is enrolled, but Multithread's " + event + " hook could not deliver "
+            "verified ledger context this time (" + because + "). This session's Multithread record may be "
+            "incomplete, and this step shows no brief. Tell the person; the fix starts with: "), context)
+        # One failed step never claims the whole session went unrecorded.
+        self.assertNotIn("not being recorded", result.stdout)
+        self.assertTrue(value["systemMessage"].startswith(
+            "Multithread could not deliver verified ledger context for this step (" + because
+            + "); this session's record may be incomplete. Run: "), value["systemMessage"])
         self.assertNotIn("MULTITHREAD BRIEF", context)
         self.assertNotIn("\n", context)
         fix = " setup --repo " + shlex.quote(str(repo or self.fixture.repo)) + " --check"

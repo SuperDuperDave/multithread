@@ -225,7 +225,7 @@ def _enrolled(repo, registry=None):
 
 
 def _hook_warning(args, reason, *, enrolled=None, registry=None):
-    """Make a missed ledger visible: one line for the agent, one for the person.
+    """Make a missed ledger step visible: one line for the agent, one for the person.
 
     Only context-bearing events can carry it; the next prompt repeats it while
     the fault lasts. The text is fixed apart from the checkout path and fix.
@@ -236,11 +236,13 @@ def _hook_warning(args, reason, *, enrolled=None, registry=None):
         return
     fix = shlex.join([str(account_launcher()), "setup", "--repo", str(Path(repo).absolute()), "--check"])
     because = _WARNING_REASONS[reason]
+    # One failed invocation shows only that this step's context is missing:
+    # earlier or later events of the session may still have been recorded.
     context = ("MULTITHREAD WARNING: this checkout is enrolled, but Multithread's " + event + " hook could not "
-               "reach its ledger (" + because + "), so this session is not being recorded and no brief was read. "
-               "Tell the person; the fix starts with: " + fix)
-    print(json.dumps({"systemMessage": "Multithread could not reach this checkout's ledger (" + because
-                      + "); this session is not being recorded. Run: " + fix,
+               "deliver verified ledger context this time (" + because + "). This session's Multithread record may "
+               "be incomplete, and this step shows no brief. Tell the person; the fix starts with: " + fix)
+    print(json.dumps({"systemMessage": "Multithread could not deliver verified ledger context for this step ("
+                      + because + "); this session's record may be incomplete. Run: " + fix,
                       "hookSpecificOutput": {"hookEventName": event, "additionalContext": context}},
                      ensure_ascii=False, separators=(",", ":")))
 
