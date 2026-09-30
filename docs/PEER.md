@@ -167,7 +167,10 @@ not determine the peer's provider.
 
 `--json` returns structured output **and executes the call**. Add `--dry-run`
 to inspect the task hash and native arguments without starting a provider or writing
-call evidence. Unlike `multithread launch`, an explicit peer call has no additional
+call evidence. A dry run does not check readiness, such as Codex's hook trust,
+since that starts the provider: it reports `readiness: not_checked` with the
+`setup --check` command that does, in `readiness_check`. A real Codex call checks
+its hooks before submitting any task. Unlike `multithread launch`, an explicit peer call has no additional
 interactive confirmation prompt. Provider usage must already be authorized.
 Task text goes through stdin as data, never shell evaluation or command-line
 prompt interpolation. Use `--task-file -` to supply it from stdin directly.

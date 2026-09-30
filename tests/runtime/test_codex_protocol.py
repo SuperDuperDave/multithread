@@ -629,6 +629,11 @@ class CodexProtocolTests(unittest.TestCase):
         code, dry, _ = self.invoke("--model", MODEL, "--effort", EFFORT, "--dry-run")
         self.assertEqual(0, code, dry)
         self.assertEqual("call_prepared", dry["state"])
+        # The dry run starts no app server, so Codex's hook trust stays unchecked, and says so.
+        self.assertEqual("not_checked", dry["readiness"])
+        self.assertEqual([str(self.relay), "setup", "--repo", str(self.repo), "--check"], dry["readiness_check"])
+        self.assertIn("readiness was not checked, including Codex's hook trust. Check it with: ",
+                      self.last_diagnostic)
         self.assertEqual((MODEL, EFFORT, "unknown"),
                          (dry["requested_model"], dry["requested_effort"], dry["effective_effort"]))
         # Both settings travel in the turn request, never as native arguments.

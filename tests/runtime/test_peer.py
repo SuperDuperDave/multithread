@@ -418,7 +418,7 @@ class PeerTests(unittest.TestCase):
 
     def test_dry_run_has_no_provider_or_evidence_writes(self):
         evidence = self.base / "dry-evidence"
-        code, result, _ = self.invoke("--dry-run", output=evidence)
+        code, result, errors = self.invoke("--dry-run", output=evidence)
         self.assertEqual(0, code)
         self.assertEqual("call_prepared", result["state"])
         self.assertFalse(result["provider_started"])
@@ -426,6 +426,15 @@ class PeerTests(unittest.TestCase):
         self.assertNotIn("stdout_observation_error", result)
         self.assertFalse(self.calls.exists())
         self.assertFalse(evidence.exists())
+        # A prepared call is not a green light: it says readiness went unchecked, and how to check it.
+        check = [str(self.relay), "setup", "--repo", str(self.repo), "--check"]
+        self.assertEqual(("not_checked", check), (result["readiness"], result["readiness_check"]))
+        self.assertEqual("multithread peer: dry run only: the task and invocation are valid, but readiness was "
+                         "not checked. Check it with: " + shlex.join(check) + "\n", errors)
+        code, result, _ = self.invoke(output=self.base / "real-evidence")
+        self.assertEqual((0, "returned"), (code, result["state"]))
+        self.assertNotIn("readiness", result)
+        self.assertNotIn("readiness_check", result)
 
     def test_legacy_launcher_flag_still_prepares_without_provider_or_evidence_writes(self):
         evidence = self.base / "legacy-dry-evidence"

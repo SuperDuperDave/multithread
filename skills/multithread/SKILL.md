@@ -37,7 +37,8 @@ Choose the interaction that fits the task:
   Give the peer the goal, relevant evidence or revision, scope, acceptance
   criteria, and the contribution sought. Challenge an assumption or inspect a
   concrete question; avoid sending whole project histories by default. A peer
-  dry run inspects the invocation; `peer ... --json` executes it.
+  dry run inspects the invocation without checking readiness (`setup --check`
+  does); `peer ... --json` executes it.
 - For durable coordination between separate sessions and worktrees, use the
   installed `status`, `brief`, and command help with the
   [provider walkthrough](https://github.com/SuperDuperDave/multithread/blob/main/docs/PROVIDERS.md).

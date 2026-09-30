@@ -719,7 +719,7 @@ def peer_main(argv=None, *, report_entry=None):
                         + "; Codex accepts an effort its model advertises. The provider decides what it actually uses")
     parser.add_argument("--live-input", action="store_true", help="enable Claude session input while this call runs; queued input may start later turns within the call timeout. Codex always exposes exact-turn input")
     parser.add_argument("--stream-progress", action="store_true", help="use Claude's native event stream for content-free progress observations, without enabling live input; the default remains final JSON")
-    parser.add_argument("--dry-run", action="store_true", help="validate task/configuration and print a plan; no provider or evidence writes")
+    parser.add_argument("--dry-run", action="store_true", help="validate task/configuration and print a plan; no provider or evidence writes, and no readiness check (setup --check does that)")
     parser.add_argument("--json", action="store_true", help="return a structured result; this DOES launch unless --dry-run is used; exit 0 means a returned turn, so also check needs_attention and task evidence")
     args = parser.parse_args(raw)
     args.report_entry = report_entry
@@ -829,7 +829,14 @@ def _run_peer(args, interruption):
             native = [*plan["argv"], "app-server", "--listen", "stdio://"]
         envelope["repo"] = plan["repo"]
         if args.dry_run:
+            # Readiness starts a provider (Codex's hook listing), which a dry run never
+            # does; a real Codex call checks it before any task. Say so, not green.
+            check = [str(args.relay or account_launcher()), "setup", "--repo", plan["repo"], "--check"]
+            print("multithread peer: dry run only: the task and invocation are valid, but readiness was not "
+                  "checked" + (", including Codex's hook trust" if args.client == "codex" else "")
+                  + ". Check it with: " + _display_text(shlex.join(check)), file=sys.stderr)
             print(json.dumps({**envelope, "state": "call_prepared", "argv": native,
+                              "readiness": "not_checked", "readiness_check": check,
                               "task_sha256": hashlib.sha256(task).hexdigest(),
                               "timeout_seconds": args.timeout}, sort_keys=True))
             return 0
