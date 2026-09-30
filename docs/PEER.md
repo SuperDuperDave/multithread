@@ -179,11 +179,22 @@ tool loop. Choose bounds proportionate
 to the task so the peer has time to inspect evidence and produce a useful
 answer. Multithread makes one invocation and never automatically retries it.
 
-For Claude, `--model opus --effort high` requests those settings for this call
-without changing the account profile. The dry run and private receipts preserve
-the request; a clean follow-up preserves both flags. Native streaming can report
-a model name, though an alias may resolve to another literal name. Effective
-effort is not verified. These options are not available for the Codex peer.
+`--model` and `--effort` request settings for this call without changing the
+account profile; with neither, the provider uses its configured default. Claude
+receives them as native options, so `--model opus --effort high` works as it does
+there; Claude accepts `low`, `medium`, `high`, `xhigh` or `max`. Codex receives
+both with the turn the call starts. Each Codex model advertises its own efforts,
+so Multithread passes the name through and Codex decides whether to accept it.
+The dry run and private receipts preserve the request; a clean follow-up
+preserves both flags.
+
+Claude's native streaming can report a model name, though an alias may resolve
+to another literal name; its effective effort is not verified. Codex reports the
+model and effort its thread uses, recorded as `model_observation` and
+`effective_effort`. A requested setting stays `unknown` until Codex reports it
+after accepting the turn. On a resumed Codex thread the flags apply to this turn
+and, by Codex's definition, to the thread's later turns; a resumed call without
+them keeps whatever settings the thread reports. [Observation details](PEER-REFERENCE.md#receipt-fields-and-capture-limits).
 
 For a review of working-tree changes, `multithread peer packet --repo
 /absolute/repo --path src/example.py --output-file /absolute/new/packet.txt`

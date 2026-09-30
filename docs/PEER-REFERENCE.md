@@ -30,7 +30,7 @@ apply alongside these additional observations.
 | `observed_session_id` | If present on an identity mismatch, the unverified native identity reported by the provider. It is diagnostic, not a resume instruction; inspect the retained raw output. |
 | `resumed` | Whether this call requested resume (`true`) or a fresh session (`false`), not independent proof of restored history or a cache hit. |
 | `provider_version` | Optional provider-reported version from this call's native initialization, with `status`, `version` and `source`. It describes the responding process, not the current installation, model, Multithread release or an earlier turn in a resumed conversation. |
-| `requested_model`, `requested_effort`, `model_observation`, `effective_effort` | Claude call settings requested by the caller. Streaming initialization can report a model name; a different name is `different_name_unverified`, not proof of a model mismatch. A repeated init with no model keeps the last reported name but marks its relation `prior_init_only`. Final-JSON calls lack this native model observation. Effective effort remains `unknown`. |
+| `requested_model`, `requested_effort`, `model_observation`, `effective_effort` | Settings requested by the caller (`null` when omitted) and what the provider reported. `model_observation` holds a reported model name with its `source` and `relation` to the request: `not_requested`, `same_literal` or `different_name_unverified` (a different name is not proof of a mismatch), or `unknown` with source `unavailable` when nothing was reported. `effective_effort` is a provider-reported effort or `unknown`. **Claude:** streaming initialization can report a model (`claude_system_init`); a repeated init with no model keeps the last name but marks its relation `prior_init_only`. Final-JSON calls lack this observation. Effective effort remains `unknown`. **Codex:** the request travels in `turn/start` as `model` and `effort`. The settings Codex reports when it opens the thread (`codex_thread_start`, `codex_thread_resume`) are recorded only for a setting the call left alone, since a requested one replaces them for the turn. A `thread/settings/updated` report received after Codex accepted the turn (`codex_thread_settings`) records both; one received earlier may predate the override and is ignored. A `model/rerouted` notice for the turn (`codex_model_rerouted`) records the model Codex switched to. The latest report wins; an unusable value clears the observation rather than keeping an older one. |
 | `native_progress` | In Claude streaming mode, content-free latest attributed event time and frame counts. Observed activity is not proof of continuing progress or task completion. |
 | `task_delivery`, `native_input_unwritten_bytes` | When recorded, the task's pipe-write observation and the native input queue's remaining byte count. Count scope depends on capture mode; zero does not establish full task delivery. A complete pipe write does not prove native consumption. Missing fields remain unknown. |
 
@@ -139,8 +139,9 @@ session/tool identifiers, hashes, model names and usage maps. It includes the
 recorded call outcome, task-submission and pipe-delivery observations, process exit, attention flag,
 elapsed time, available provider turn/duration/cost estimates, counts of retained
 errors/denials/unsupported native requests and stdout observation limits.
-It can show the requested effort enum and a literal model comparison without
-disclosing the model name or claiming effective effort.
+It can show a requested effort name of at most 16 lowercase letters, and literal
+comparisons with the provider-reported settings (`effort_relation`, `model_relation`),
+without disclosing the reported names or the requested model.
 Starting in v0.4.11, the report also selects `caller_stop_reason`: `timeout`,
 `interrupted` or `shutdown_timeout` have the meanings above; `not_recorded`
 means the field was absent, while `unknown` means its recorded value was

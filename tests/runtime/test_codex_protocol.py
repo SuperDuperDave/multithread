@@ -27,6 +27,9 @@ OTHER_TURN = "40000000-0000-4000-8000-000000000004"
 ANSWER = "Scoped final answer 雪"
 COUNTS = {"totalTokens": 30, "inputTokens": 20, "cachedInputTokens": 5,
           "outputTokens": 10, "reasoningOutputTokens": 3}
+MODEL = "fixture-requested-model"
+EFFORT = "fixture-effort"
+UNOBSERVED = {"source": "unavailable", "reported_model": None, "relation": "unknown"}
 
 
 SERVER = r'''
@@ -152,6 +155,18 @@ def usage_notification(usage, *, thread=THREAD, turn=TURN):
         "threadId": thread, "turnId": turn, "tokenUsage": usage}}
 
 
+def settings_notification(model=MODEL, effort=EFFORT, *, thread=THREAD):
+    return {"method": "thread/settings/updated", "params": {"threadId": thread, "threadSettings": {
+        "model": model, "effort": effort, "modelProvider": "fixture-native-provider", "cwd": "/fixture",
+        "approvalPolicy": "on-request", "approvalsReviewer": "user", "sandboxPolicy": {"type": "readOnly"},
+        "collaborationMode": {"mode": "default"}}}}
+
+
+def reroute_notification(model, *, thread=THREAD, turn=TURN):
+    return {"method": "model/rerouted", "params": {"threadId": thread, "turnId": turn, "fromModel": MODEL,
+                                                   "toModel": model, "reason": "highRiskCyberActivity"}}
+
+
 class CodexProtocolTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(prefix="relay-codex-protocol-", dir="/tmp")
@@ -262,8 +277,12 @@ class CodexProtocolTests(unittest.TestCase):
         self.assertEqual(self.task.read_text(), requests[4]["params"]["input"][0]["text"])
         self.assertEqual('ready', result['hook_readiness']['state'])
         for request in requests:
-            self.assertFalse({"sandbox", "sandboxPolicy", "approvalPolicy", "approvalsReviewer", "model", "config"}
-                             & set(request.get("params", {})))
+            self.assertFalse({"sandbox", "sandboxPolicy", "approvalPolicy", "approvalsReviewer", "model",
+                              "effort", "config"} & set(request.get("params", {})))
+        # With no request, the turn keeps the thread's own settings, as Codex reported them.
+        self.assertEqual({"source": "codex_thread_start", "reported_model": "fixture-native-selection",
+                          "relation": "not_requested"}, result["model_observation"])
+        self.assertEqual("unknown", result["effective_effort"])
         self.assertFalse((self.repo / "injected").exists())
         self.assertEqual(self.task.read_bytes(), (directory / "task.txt").read_bytes())
         raw_output = (directory / "stdout.json").read_bytes()
@@ -320,6 +339,130 @@ class CodexProtocolTests(unittest.TestCase):
         resume = next(request for request in requests if request.get("method") == "thread/resume")
         self.assertEqual(THREAD, resume["params"]["threadId"])
         self.assertNotIn("thread/start", [request.get("method") for request in requests])
+        self.assertEqual({"source": "codex_thread_resume", "reported_model": "fixture-native-selection",
+                          "relation": "not_requested"}, result["model_observation"])
+
+    def test_requested_settings_travel_with_the_turn_on_new_and_resumed_threads(self):
+        for resume in (None, THREAD):
+            with self.subTest(resume=resume):
+                self.configure(thread_result_updates={"reasoningEffort": "fixture-default-effort"})
+                code, result, directory = self.invoke("--model", MODEL, "--effort", EFFORT,
+                                                      *(("--resume", resume) if resume else ()))
+                self.assertEqual(0, code, result)
+                self.assertFalse(result["needs_attention"])
+                requests = self.recorded_requests()
+                opened = next(row for row in requests if row["method"] in ("thread/start", "thread/resume"))
+                self.assertEqual({"cwd": str(self.repo), **({"threadId": resume} if resume else {})},
+                                 opened["params"])
+                turn = next(row for row in requests if row["method"] == "turn/start")
+                self.assertEqual({"threadId": THREAD, "model": MODEL, "effort": EFFORT,
+                                  "input": [{"type": "text", "text": self.task.read_text()}]}, turn["params"])
+                request = json.loads((directory / "request.json").read_text())
+                for record in (result, request):
+                    self.assertEqual((MODEL, EFFORT), (record["requested_model"], record["requested_effort"]))
+                # The opened thread's settings predate the override, so nothing is claimed for this turn.
+                self.assertEqual(UNOBSERVED, result["model_observation"])
+                self.assertEqual("unknown", result["effective_effort"])
+                prefix = result["follow_up_preparation"]["argv_prefix"]
+                self.assertEqual([MODEL, EFFORT], [prefix[prefix.index(flag) + 1] for flag in ("--model", "--effort")])
+
+    def test_the_opened_thread_reports_only_the_setting_the_call_leaves_alone(self):
+        self.configure(thread_result_updates={"reasoningEffort": EFFORT})
+        code, result, _ = self.invoke("--model", MODEL)
+        self.assertEqual(0, code, result)
+        turn = next(row for row in self.recorded_requests() if row["method"] == "turn/start")
+        self.assertEqual(MODEL, turn["params"]["model"])
+        self.assertNotIn("effort", turn["params"])
+        self.assertEqual(UNOBSERVED, result["model_observation"])
+        self.assertEqual(EFFORT, result["effective_effort"])
+        code, result, _ = self.invoke("--effort", EFFORT)
+        self.assertEqual(0, code, result)
+        turn = next(row for row in self.recorded_requests() if row["method"] == "turn/start")
+        self.assertEqual(EFFORT, turn["params"]["effort"])
+        self.assertNotIn("model", turn["params"])
+        self.assertEqual({"source": "codex_thread_start", "reported_model": "fixture-native-selection",
+                          "relation": "not_requested"}, result["model_observation"])
+        self.assertEqual("unknown", result["effective_effort"])
+
+    def test_settings_reported_after_the_turn_is_accepted_describe_the_turn(self):
+        cases = ((settings_notification(), MODEL, "same_literal", EFFORT),
+                 (settings_notification("fixture-other-model", "fixture-other-effort"),
+                  "fixture-other-model", "different_name_unverified", "fixture-other-effort"))
+        for event, model, relation, effort in cases:
+            with self.subTest(relation=relation):
+                self.configure(events=[event, item(), completed()])
+                code, result, _ = self.invoke("--model", MODEL, "--effort", EFFORT)
+                self.assertEqual(0, code, result)
+                self.assertEqual("returned", result["state"])
+                self.assertFalse(result["needs_attention"])
+                self.assertEqual({"source": "codex_thread_settings", "reported_model": model,
+                                  "relation": relation}, result["model_observation"])
+                self.assertEqual(effort, result["effective_effort"])
+
+    def test_settings_before_acceptance_or_for_another_thread_are_not_claimed(self):
+        for spec in ({"before_turn_response": [settings_notification()]},
+                     {"events": [settings_notification(thread=OTHER_THREAD), item(), completed()]}):
+            with self.subTest(spec=list(spec)):
+                self.configure(**spec)
+                code, result, _ = self.invoke("--model", MODEL, "--effort", EFFORT)
+                self.assertEqual(0, code, result)
+                self.assertEqual(ANSWER, result["result"])
+                self.assertEqual(UNOBSERVED, result["model_observation"])
+                self.assertEqual("unknown", result["effective_effort"])
+
+    def test_an_unusable_settings_report_clears_rather_than_keeps_an_earlier_claim(self):
+        unreadable = settings_notification()
+        unreadable["params"]["threadSettings"] = [MODEL, EFFORT]
+        for event in (unreadable, settings_notification(None, None), settings_notification("", "x\ny")):
+            with self.subTest(event=event["params"]["threadSettings"]):
+                self.configure(thread_result_updates={"reasoningEffort": EFFORT},
+                               events=[event, item(), completed()])
+                code, result, _ = self.invoke()
+                self.assertEqual(0, code, result)
+                self.assertFalse(result["needs_attention"])
+                self.assertEqual(UNOBSERVED, result["model_observation"])
+                self.assertEqual("unknown", result["effective_effort"])
+
+    def test_a_reroute_of_this_turn_replaces_the_model_observation(self):
+        rerouted = {"source": "codex_model_rerouted", "reported_model": "fixture-rerouted-model",
+                    "relation": "different_name_unverified"}
+        cases = (({"events": [settings_notification(), reroute_notification("fixture-rerouted-model"),
+                              item(), completed()]}, rerouted),
+                 # Notifications naming the turn before its acceptance are replayed in order.
+                 ({"before_turn_response": [reroute_notification("fixture-rerouted-model")]}, rerouted),
+                 ({"events": [settings_notification(),
+                              reroute_notification("fixture-rerouted-model", turn=OTHER_TURN),
+                              item(), completed()]},
+                  {"source": "codex_thread_settings", "reported_model": MODEL, "relation": "same_literal"}))
+        for spec, observation in cases:
+            with self.subTest(observation=observation["source"]):
+                self.configure(**spec)
+                code, result, _ = self.invoke("--model", MODEL)
+                self.assertEqual(0, code, result)
+                self.assertEqual(observation, result["model_observation"])
+
+    def test_codex_effort_is_the_models_own_vocabulary(self):
+        code, dry, _ = self.invoke("--model", MODEL, "--effort", EFFORT, "--dry-run")
+        self.assertEqual(0, code, dry)
+        self.assertEqual("call_prepared", dry["state"])
+        self.assertEqual((MODEL, EFFORT, "unknown"),
+                         (dry["requested_model"], dry["requested_effort"], dry["effective_effort"]))
+        # Both settings travel in the turn request, never as native arguments.
+        self.assertEqual([str(self.provider), *self.native_arguments, "app-server", "--listen", "stdio://"],
+                         dry["argv"])
+        self.assertFalse(self.calls.exists())
+        # Claude keeps its own list; neither provider takes an option-like or spaced name.
+        for client, effort, reason in (("claude", EFFORT, "Claude accepts low, medium, high, xhigh, max"),
+                                       ("codex", "--fixture", "effort name"), ("codex", "two words", "effort name"),
+                                       ("codex", "", "effort name")):
+            with self.subTest(client=client, effort=effort):
+                errors = io.StringIO()
+                with redirect_stderr(errors), self.assertRaises(SystemExit) as raised:
+                    peer.peer_main([client, "--repo", str(self.repo), "--provider", str(self.provider),
+                                    "--task-file", str(self.task), "--effort=" + effort, "--dry-run"])
+                self.assertEqual(2, raised.exception.code)
+                self.assertIn(reason, errors.getvalue())
+                self.assertFalse(self.calls.exists())
 
     def test_streaming_wait_advertises_observed_target_without_echoing_native_content(self):
         self.configure(event_delay=0.24)

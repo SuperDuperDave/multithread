@@ -154,6 +154,19 @@ class PeerTests(unittest.TestCase):
         self.assertEqual("opus", prefix[prefix.index("--model") + 1])
         self.assertEqual("high", prefix[prefix.index("--effort") + 1])
 
+    def test_claude_effort_choices_are_unchanged(self):
+        for effort in ("low", "medium", "high", "xhigh", "max"):
+            with self.subTest(effort=effort):
+                code, dry, _ = self.invoke("--effort", effort, "--dry-run")
+                self.assertEqual(0, code)
+                self.assertEqual(["--effort", effort], dry["argv"][-4:-2])
+        for effort in ("ultra", "HIGH", "--permission-mode"):
+            with self.subTest(effort=effort), redirect_stderr(io.StringIO()), \
+                    self.assertRaises(SystemExit) as raised:
+                peer.peer_main(["claude", "--task-file", str(self.task), "--effort=" + effort])
+            self.assertEqual(2, raised.exception.code)
+        self.assertFalse(self.calls.exists())
+
     def test_model_name_cannot_become_a_native_option(self):
         with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as raised:
             peer.peer_main(["claude", "--task-file", str(self.task), "--model=--permission-mode"])

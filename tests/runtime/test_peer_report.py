@@ -21,7 +21,7 @@ from relay_runtime import peer_control, provider
 
 CANARY = "ARTIFICIAL-PRIVATE-REPORT-CANARY"
 CALL_FIELDS = {
-    "provider", "provider_version", "requested_effort", "model_relation",
+    "provider", "provider_version", "requested_effort", "effort_relation", "model_relation",
     "state", "provider_started", "needs_attention", "process_exit_code",
     "elapsed_seconds", "provider_turns", "provider_duration_ms", "estimated_cost_usd",
     "actual_billed_cost", "permission_denial_count", "provider_error_count",
@@ -45,6 +45,35 @@ class PeerReportTests(unittest.TestCase):
                 self.assertEqual(observation, call["provider_version"])
                 _, output = self.invoke(structured=False)
                 self.assertIn("Recorded provider version: 1.2.3 (provider-reported; " + source + ")", output)
+
+    def test_effort_and_model_comparisons_are_reported_without_reported_names(self):
+        cases = (
+            ({}, None, "unknown"),
+            ({"requested_effort": "high", "effective_effort": "unknown"}, "high", "unknown"),
+            ({"requested_effort": None, "effective_effort": CANARY}, None, "not_requested"),
+            ({"requested_effort": "fixtureeffort", "effective_effort": "fixtureeffort"},
+             "fixtureeffort", "same_literal"),
+            ({"requested_effort": "high", "effective_effort": CANARY}, "high", "different_name_unverified"),
+            ({"requested_effort": CANARY, "effective_effort": CANARY}, None, "same_literal"),
+            ({"requested_effort": "high", "effective_effort": None}, "high", "unknown"),
+            ({"requested_effort": "high", "effective_effort": ["high"]}, "high", "unknown"),
+            ({"requested_effort": ["high"], "effective_effort": "high"}, None, "unknown"),
+        )
+        for client in ("claude", "codex"):
+            for changes, requested, relation in cases:
+                with self.subTest(client=client, changes=changes):
+                    call = self.reported(provider=client, **changes)
+                    self.assertEqual((requested, relation), (call["requested_effort"], call["effort_relation"]))
+                    _, output = self.invoke(structured=False)
+                    if relation != "unknown":
+                        self.assertIn("Effort observation: " + relation, output)
+                    if requested is not None:
+                        self.assertIn("Requested effort: " + requested, output)
+            observation = {"source": "codex_thread_settings", "reported_model": CANARY, "relation": "same_literal"}
+            call = self.reported(provider=client, model_observation=observation)
+            self.assertEqual("same_literal", call["model_relation"])
+            _, output = self.invoke(structured=False)
+            self.assertIn("Model observation: same_literal", output)
 
     def test_missing_or_unrecognized_version_preserves_call_and_uncertainty(self):
         for client, source in (("codex", "codex_initialize_user_agent"), ("claude", "claude_system_init")):

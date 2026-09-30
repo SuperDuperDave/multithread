@@ -2,7 +2,8 @@
 
 The caller owns the process and cleanup. This module owns only its JSONL pipes,
 private stdout observation, and native response interpretation. Native request
-acceptance never substitutes for a durable Multithread acknowledgement.
+acceptance never substitutes for a durable Multithread acknowledgement. A model
+or effort the caller requested travels with the turn; Codex decides what it uses.
 """
 
 import json
@@ -17,7 +18,7 @@ import time
 from .native_io import MAX_OUTPUT as _MAX_OUTPUT, Observation, ProtocolError as _ProtocolError, decode, identity as _identity
 from .native_io import (USAGE_SCOPES, measurement_error, measurement_number,
                         measurement_fields, measurement_scope, replace_measurement_errors,
-                        provider_version_observation)
+                        provider_version_observation, setting_relation)
 
 
 _MAX_PENDING = 128
@@ -250,6 +251,18 @@ class _Driver:
         self.pending[identifier] = (method, control_id)
         self.send({"id": identifier, "method": method, "params": params})
 
+    def observe(self, source, settings):
+        """Replace each setting a native report covers; an invalid value clears the claim."""
+        if "model" in settings:
+            model = settings["model"]
+            self.envelope["model_observation"] = (
+                {"source": source, "reported_model": model,
+                 "relation": setting_relation(self.envelope.get("requested_model"), model)}
+                if _identity(model) else {"source": "unavailable", "reported_model": None, "relation": "unknown"})
+        if "effort" in settings:
+            effort = settings["effort"]
+            self.envelope["effective_effort"] = effort if _identity(effort) else "unknown"
+
     def detail(self, collection, value):
         if len(collection) < _MAX_DETAILS:
             collection.append(value)
@@ -347,10 +360,18 @@ class _Driver:
             reviewer = result.get("approvalsReviewer")
             if reviewer in ("user", "auto_review", "guardian_subagent"):
                 self.envelope["native_approvals_reviewer"] = reviewer
+            # The same turn request carries any override on a new or resumed
+            # thread. The opened thread's settings describe only what it keeps.
+            requested = {"model": self.envelope.get("requested_model"),
+                         "effort": self.envelope.get("requested_effort")}
+            reported = {"model": result.get("model"), "effort": result.get("reasoningEffort")}
+            self.observe("codex_" + method.replace("/", "_"),
+                         {key: value for key, value in reported.items() if requested[key] is None})
+            turn = {"threadId": self.session, "input": [{"type": "text", "text": self.task}]}
+            turn.update((key, value) for key, value in requested.items() if value is not None)
             self.turn_requested = True
             self.envelope["task_submission"] = "requested"
-            self.request("turn/start", {"threadId": self.session,
-                                       "input": [{"type": "text", "text": self.task}]})
+            self.request("turn/start", turn)
         elif method == "turn/start":
             turn = self.validate_turn(result.get("turn"))
             self.turn = turn["id"]
@@ -397,10 +418,19 @@ class _Driver:
         if not isinstance(params, dict):
             raise _ProtocolError("Malformed native notification; inspect retained output.")
         relevant = ("turn/started", "turn/completed", "item/completed", "item/agentMessage/delta",
-                    "thread/tokenUsage/updated", "error")
+                    "thread/tokenUsage/updated", "error", "thread/settings/updated", "model/rerouted")
         if method not in relevant:
             return
         if params.get("threadId") != self.session:
+            return
+        if method == "thread/settings/updated":
+            # Thread settings carry no turn. One sent before Codex accepted this
+            # call's turn may predate its override, so only a later one counts.
+            if self.turn is not None:
+                settings = params.get("threadSettings")
+                settings = settings if isinstance(settings, dict) else {}
+                self.observe("codex_thread_settings", {"model": settings.get("model"),
+                                                       "effort": settings.get("effort")})
             return
         if self.turn is None:
             if self.turn_requested:
@@ -448,6 +478,8 @@ class _Driver:
                     or type(params.get("willRetry")) is not bool):
                 raise _ProtocolError("Malformed native error observation; inspect retained output.")
             self.detail(self.errors, error["message"][:2000])
+        elif method == "model/rerouted":
+            self.observe("codex_model_rerouted", {"model": params.get("toModel")})
         elif method == "thread/tokenUsage/updated":
             usage = params.get("tokenUsage")
             names = ("inputTokens", "outputTokens", "cachedInputTokens", "reasoningOutputTokens", "totalTokens")
