@@ -250,7 +250,12 @@ With user-level hooks installed, `launch` and peer calls add no invocation copy,
 so each event runs once; a partial or altered installation makes them refuse
 and name the fix. To take the hooks out, run `hooks trust --revoke` (Codex),
 then `hooks remove`. Prefer these fresh, guarded plans to restoring a kept copy:
-a copy also erases anything written to the file since.
+a copy also erases anything written to the file since. An agent that keeps its
+own copies before a change puts them in a directory it has just created, owned
+by you and closed to others; `mkdir -m 700 -p` leaves an existing directory's
+mode as it was, so it checks the owner, the mode and that the path is not a
+symbolic link. A settings file that does not exist is recorded as absent, not
+as a failed copy.
 
 To retire another tool's hooks that you no longer want, for example an older
 lifecycle dispatcher, name each exact command with `--command`, first for its
@@ -266,6 +271,17 @@ Each shows its plan: the trust records Codex lists for exactly that command
 it takes out with every other hook left in place and any that move named.
 Apply each with `--yes --expected-plan`. Do this before `hooks install`, so the
 positions Codex keys trust to are settled first.
+
+### Confirm delivery in a real session
+
+A trusted listing, or a row in the ledger, does not show that a session
+received its brief. To check delivery end to end, note `last_seq` from
+`~/.local/bin/multithread --repo "$PWD" --json status`, start a new
+conversation in the enrolled checkout and note its session ID. Then confirm
+both halves: `~/.local/bin/multithread --repo "$PWD" --json events --after
+LAST_SEQ` shows `session.started` for that exact session ID, and the session
+can quote the `MULTITHREAD AGENT CONTRACT v1` line from its own context. If
+either is missing, `hooks status` and `setup --check` name what to fix.
 
 ### When a session cannot reach its ledger
 

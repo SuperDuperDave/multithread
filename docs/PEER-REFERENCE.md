@@ -14,10 +14,11 @@ deliberate follow-up. This reference covers:
 An agent starting a peer call leaves `--multithread` and `--relay` unset; the
 account launcher setup prints is the default. A generated follow-up prefix
 already names any other launcher the call used, so use it unchanged. Launch and
-native hook trust are the person's steps: when a call refuses because hooks are
-not ready, the agent reports the refusal and its printed remedy, and never runs
-`launch` or retries around it. It changes hook trust only with `multithread
-hooks trust`, when the person chose [agent-assisted trust](SETUP.md#choose-how-codex-trusts-the-hooks).
+the manual `/hooks` review are the person's steps; `multithread hooks trust` is
+available to the agent when the person chose
+[agent-assisted trust](SETUP.md#choose-how-codex-trusts-the-hooks). When a call
+refuses because hooks are not ready, the agent reports the refusal and its
+printed remedy, and never runs `launch` or retries around it.
 
 ## Receipt fields and capture limits
 

@@ -73,9 +73,10 @@ and review the exact generated commands. One review covers every enrolled
 checkout and worktree; a changed hook definition can need review again. Listing a trusted hook does not prove it ran. Before any
 task, a Codex peer call refuses when a hook is not trusted and names each
 unready event with the one step that resolves it; `setup --check` reports the
-same listing. That step belongs to the person: an agent reports the refusal and
-its remedy, and never runs `launch`. It changes hook trust only with
-`multithread hooks trust`, when the person chose agent-assisted trust. Leave
+same listing. Launch and the manual `/hooks` review are the person's steps;
+`multithread hooks trust` is available to the agent when the person chose
+agent-assisted trust. Otherwise the agent reports the refusal and its remedy,
+and never runs `launch`. Leave
 `--multithread` unset; a Codex call accepts only the account launcher setup
 prints, gives another path to it that spelling, and refuses a different file.
 

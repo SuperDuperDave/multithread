@@ -564,11 +564,14 @@ class AgentRuleDocumentationTests(unittest.TestCase):
     }
 
     # An agent changes hook settings or trust only through the reviewed commands.
+    TRUST_ROUTE = ("Launch and the manual `/hooks` review are the person's steps; "
+                   "`multithread hooks trust` is available to the agent when the person chose")
     HOOK_RULES = {
         "docs/SETUP.md": "It never edits hook files or Codex's `config.toml` directly",
         "docs/PROVIDERS.md": "it never edits hook files or Codex's `config.toml` directly",
         "skills/multithread/SKILL.md": "Never edit hook files or Codex's `config.toml` directly",
-        "docs/PEER-REFERENCE.md": "It changes hook trust only with `multithread hooks trust`, when the person chose",
+        "docs/PEER-REFERENCE.md": TRUST_ROUTE,
+        "docs/PEER.md": TRUST_ROUTE,
     }
 
     def test_agent_facing_guides_state_the_hook_rule(self):
