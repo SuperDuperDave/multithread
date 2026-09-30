@@ -5,7 +5,7 @@ native Codex/Claude collaboration. No Multithread source checkout is needed.
 The path to a first result is:
 
 1. [Install and enroll](#install-and-enroll), or give your agent the [setup prompt](#ask-your-coding-agent).
-2. [Review native trust](#review-native-trust) for the chosen repository and provider.
+2. [Connect every session](#connect-every-session): install the user-level hooks once and choose how Codex trusts them.
 3. [Request one collaboration](#start-collaborating), assess its result, then choose any exact-session follow-up.
 
 These commands use the current `multithread` entry point. For older releases and
@@ -57,9 +57,10 @@ run the printed read-only repository check before retrying enrollment.
 
 Use the exact launcher path printed by the installer, normally
 `~/.local/bin/multithread`. Account paths come from the OS account database.
-Multithread does not edit shell `PATH`, provider settings, permissions or sign-ins,
-and setup starts no model session: its only provider execution is Codex's
-read-only hook listing.
+Installation and setup do not edit shell `PATH`, provider settings, permissions
+or sign-ins, and start no model session: setup's only provider execution is
+Codex's read-only hook listing. Provider hook settings change only through
+[`multithread hooks`](#connect-every-session), after you approve its exact plan.
 
 For a fixed published version, replace `releases/latest/download/install.py` in
 the command with `releases/download/v0.4.4/install.py` after confirming that tag
@@ -83,13 +84,22 @@ commit and digests. I authorize that reviewed account-local installation or
 update, this repository's enrollment, and launch preparation for my existing
 Codex and Claude installations. Use --yes with the reviewed installer selection
 and --enroll-repo with this repository's absolute path.
-Preserve existing work, ledger state, provider settings, sign-ins and permissions.
-Do not replace an unknown command, provision providers, repair the OS, change
-global settings or launch model sessions. No Multithread source checkout is needed.
-Finish with verified runtime/repository readiness, each provider's preparation
-state, exact next launch commands and any remaining native action. Then point
-me to the first-collaboration prompt in docs/PEER.md#first-collaboration.
+Then install Multithread's user-level hooks with multithread hooks install:
+show me its plan, and apply exactly that plan. For Codex hook trust I choose
+agent-assisted: run multithread hooks trust, show me its plan, and record exactly
+that. Preserve existing work, ledger state, other hooks, provider settings,
+sign-ins and permissions. Do not replace an unknown command, provision
+providers, repair the OS, change other global settings or launch model sessions.
+No Multithread source checkout is needed. Finish with verified runtime/repository
+readiness, multithread hooks status, each provider's preparation state and any
+remaining step that is mine. Then point me to the first-collaboration prompt in
+docs/PEER.md#first-collaboration.
 ```
+
+To review Codex hook trust yourself, replace `agent-assisted: run multithread
+hooks trust, show me its plan, and record exactly that` with `manual: give me
+the exact /hooks steps`. Either way the agent shows you every plan before it
+changes a provider file.
 
 The agent should continue through the authorized steps it can verify. If the
 repository is ambiguous, establish the intended target before enrollment.
@@ -169,7 +179,8 @@ Select reviewed provider paths explicitly when necessary:
 |---|---|---|
 | Runtime verified | Healthy installed status and exact release/activation identity | Any installation refusal needs its specific inspection or recovery action. |
 | Repository verified | Enrollment, exact Git identity, healthy integrity check and matching ledger status | Preserve state on refusal or unavailable observation; do not delete or forge enrollment markers. |
-| Provider prepared | Executable path and matching invocation plan; for Codex, all five Multithread hooks listed as trusted for this checkout | Provider version, sign-in and tool capability are not checked. `needs_hook_review` names each event Codex lists as untrusted, modified or disabled; `needs_hook_configuration` names hooks that are missing, duplicated or not as generated. A missing provider can be installed or located through its normal interface. |
+| Provider prepared | Executable path, where its hooks come from (`hook_source`: `user` for the installed user-level hooks, `session_flags` when only launch and peer pass them) and a matching plan; for Codex, all five Multithread hooks listed as trusted for this checkout | Provider version, sign-in and tool capability are not checked. `needs_hook_review` names each event Codex lists as untrusted, modified or disabled; `needs_hook_configuration` names hooks that are missing, duplicated or not as installed. A missing provider can be installed or located through its normal interface. |
+| Coverage | `hook_coverage`: recent Codex and Claude sessions in this repository that left no ledger events, with the cause and fix | See [when a session cannot reach its ledger](#when-a-session-cannot-reach-its-ledger). |
 | Hook/context delivery | Not checked by setup | Observe the Multithread context in an authorized native session. A generated plan or zero hook exit does not prove delivery. |
 | Provider tools | Not checked by setup | Observe an authorized native tool action. Tool execution alone does not establish a completed collaboration workflow. |
 
@@ -181,10 +192,81 @@ repository setup unresolved. After a timeout or uncertain enrollment result,
 run the printed read-only check before deciding whether to retry. Keep local
 diagnostics private and sanitize anything shared.
 
+## Connect every session
+
+Hooks connect a Codex or Claude session to its checkout's ledger: the session
+records its lifecycle and receives the coordination brief. Installed once for
+your account, they reach every session in an enrolled repository however it was
+started: the Codex app, a terminal, an IDE, `launch` or a peer call. In a
+repository you have not enrolled they do nothing.
+
+```sh
+~/.local/bin/multithread hooks install
+```
+
+Install shows the exact change to Codex's `~/.codex/hooks.json` and Claude
+Code's `~/.claude/settings.json` (`$CODEX_HOME` and `$CLAUDE_CONFIG_DIR` when
+set), then asks you to type `install`. It appends one handler for each
+lifecycle event after any existing hooks, so every other hook keeps its place
+and Codex keeps trusting it. It never edits, reorders or removes another hook,
+reports the ones it leaves in place, and keeps a private copy of each file it
+changes beside it. An agent first runs `hooks install --json` to show you the
+plan, then applies exactly that plan with `--yes --expected-plan
+<plan_sha256>`; a file that changed in between refuses.
+
+### Choose how Codex trusts the hooks
+
+Codex runs a user hook only after its exact definition is trusted. Claude Code
+has no per-hook trust. Choose one route:
+
+- **Manual.** Use a terminal: Codex's terminal `/hooks` review records trust,
+  and the desktop app's hook screen may not
+  ([openai/codex#47283](https://github.com/openai/codex/issues/47283)). Run
+  `codex` in your home directory, type `/hooks`, and for SessionStart,
+  UserPromptSubmit, Stop, SessionEnd and Interrupt trust the hook from
+  `~/.codex/hooks.json` whose command is exactly the one `hooks status` prints.
+  Leave other hooks as you choose.
+- **Agent-assisted.** Your agent runs `~/.local/bin/multithread hooks trust`.
+  It asks Codex itself to list the hooks, then checks each one's source file,
+  position, event, exact command, timeout and matcher, and Codex's own hash
+  against the hash of the definition Multithread installed. Any difference
+  refuses the whole plan. The plan shows each hook's key and hash; once
+  approved, it records trust through Codex's configuration API, the same
+  `hooks.state` write Codex's own `/hooks` review makes, guarded by the
+  configuration version it read. It never includes another hook, and
+  `hooks trust --revoke` removes exactly the records holding Multithread's
+  hashes.
+
+`~/.local/bin/multithread hooks status` reports installation and trust for
+both providers, each hook command, and the next step. A Codex conversation
+that started earlier may keep running without them: start a new one after
+trusting. Claude Code normally picks up hook changes in a running session.
+
+With user-level hooks installed, `launch` and peer calls add no invocation copy,
+so each event runs once; a partial or altered installation makes them refuse
+and name the fix. To take the hooks out, run `hooks trust --revoke` (Codex),
+then `hooks remove`.
+
+### When a session cannot reach its ledger
+
+In an enrolled checkout, a hook that cannot reach its ledger says so. The agent
+receives one `MULTITHREAD WARNING` line with the reason and the fix, to tell
+you, and you see a short notice. A repository nobody enrolled stays silent.
+
+`doctor` also looks for silence. It compares the Codex and Claude sessions that
+worked in this repository and its worktrees in the last 24 hours with the
+ledger, and names any that left no events, with the cause and the fix, for
+example that the user-level hooks are not installed or that Codex has not
+trusted them. It reads session records for identity, directory and time only,
+never their content. `status` and `brief` repeat each finding as one warning
+line, and `setup --check` shows it as coverage.
+
 ## Review native trust
 
-To start an interactive session with invocation-only Multithread hooks, run the exact
-command setup printed. With the usual launcher and provider on `PATH`:
+With [user-level hooks](#connect-every-session) installed, start providers
+however you like. Without them, `launch` passes invocation-only hooks for one
+interactive session: run the exact command setup printed. With the usual
+launcher and provider on `PATH`:
 
 ```sh
 ~/.local/bin/multithread launch codex --repo "$PWD"
@@ -208,12 +290,14 @@ noninteractive peer mode does not show the interactive workspace trust dialog;
 review the repository and its provider configuration before calling. See
 [provider-specific preparation](PEER.md#before-calling).
 
-Launch and native hook review are the person's steps. An agent, whether
-authorized for setup or for peer calls, never runs `multithread launch` and
-never reviews, grants or edits hook trust or provider hook configuration; it
-reports the printed launch command and any remaining review for the user.
-Peer calls require authorization for that use. A prepared plan or a listed
-trusted hook does not prove hook delivery or native tool execution.
+Launch is the person's step: an agent never runs `multithread launch`, and
+reports the printed command instead. An agent changes provider hook settings or
+Codex trust only through `multithread hooks install`, `trust` or `remove`, only
+after the person chose that route, and shows the exact plan first. It never
+edits hook files or Codex's `config.toml` directly, never runs Codex's `/hooks`
+review for the person, and reports any remaining native step. Peer calls
+require authorization for that use. A prepared plan or a listed trusted hook
+does not prove hook delivery or native tool execution.
 
 ## Start collaborating
 

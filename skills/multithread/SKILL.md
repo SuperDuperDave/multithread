@@ -19,13 +19,16 @@ installation, enrollment, readiness, or native trust review, follow the current
 Codex lists the Multithread hooks as trusted, not provider authentication, hook
 delivery, tool capability, or a completed collaboration.
 
-Launch and hook trust are the person's steps. Never run `multithread launch`,
-and never review, grant or edit native hook trust or provider hook
-configuration, including Codex's `/hooks` review and its `config.toml`. Leave
-`--multithread` and `--relay` unset: Codex trusts one exact hook command, the
-account launcher setup prints. When a peer call or setup check says hooks are
-not ready, stop and report its refusal and the remedy it prints to the person;
-do not relaunch, retry or work around it.
+Launch is the person's step: never run `multithread launch`. Change provider
+hook settings or Codex hook trust only through `multithread hooks install`,
+`trust` or `remove`, only when the person chose that route, and show them the
+`--json` plan before applying it with `--yes --expected-plan`. Never edit hook
+files or Codex's `config.toml` directly, and never run Codex's `/hooks` review
+for them. Leave `--multithread` and `--relay` unset: Codex trusts one exact hook
+command, the account launcher setup prints. When a peer call or setup check says
+hooks are not ready, stop and report its refusal and the remedy it prints to the
+person; do not relaunch, retry or work around it. If your context begins with a
+`MULTITHREAD WARNING`, tell the person and give them the fix it names.
 
 Choose the interaction that fits the task:
 

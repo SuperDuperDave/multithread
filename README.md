@@ -77,9 +77,13 @@ observed in a native session.
 
 ## Collaborate
 
-First, complete any required [native sign-in and trust review](docs/SETUP.md#review-native-trust)
-through the provider's normal interface. To start an interactive Codex or Claude
-session with Multithread hooks, use the exact launch command printed by setup, or:
+First, [connect every session](docs/SETUP.md#connect-every-session): `multithread
+hooks install` adds Multithread's user-level hooks after you approve its plan,
+so any Codex or Claude session in an enrolled repository reaches its ledger,
+however you start it. Codex then asks you to trust them, by hand in `/hooks` or
+through your agent with `multithread hooks trust`. Without user-level hooks,
+start an interactive session with invocation-only hooks using the exact launch
+command printed by setup, or:
 
 ```sh
 ~/.local/bin/multithread launch codex --repo "$PWD"
@@ -88,7 +92,8 @@ session with Multithread hooks, use the exact launch command printed by setup, o
 Use `claude` for the other provider. Review the invocation and type `launch`;
 adding `--json` prepares the plan without starting a session. Launch and Codex's
 `/hooks` review are yours, in your own terminal: a coding agent never runs
-`launch` or changes hook trust, and reports a refused peer call with the remedy
+`launch`, changes hook settings or trust only through `multithread hooks` after
+you chose that and saw its plan, and reports a refused peer call with the remedy
 it prints.
 
 Then give your agent the copyable [first-collaboration prompt](docs/PEER.md#first-collaboration).

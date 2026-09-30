@@ -16,7 +16,8 @@ account launcher setup prints is the default. A generated follow-up prefix
 already names any other launcher the call used, so use it unchanged. Launch and
 native hook trust are the person's steps: when a call refuses because hooks are
 not ready, the agent reports the refusal and its printed remedy, and never runs
-`launch`, reviews or changes hook trust, or retries around it.
+`launch` or retries around it. It changes hook trust only with `multithread
+hooks trust`, when the person chose [agent-assisted trust](SETUP.md#choose-how-codex-trusts-the-hooks).
 
 ## Receipt fields and capture limits
 

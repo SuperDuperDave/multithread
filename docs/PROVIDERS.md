@@ -16,10 +16,15 @@ Follow the [two-worktree walkthrough](#try-a-review-across-two-worktrees) to try
 the integration with your own provider access and reviewed permissions.
 
 Installing Multithread does not install hooks, trust code, change provider permissions,
-launch providers, or acknowledge work. Do not add the new handler alongside an
-existing Multithread lifecycle/brief handler: duplicate handlers may create duplicate
-observations and repeated context. Invocation-only arguments provide opt-in
-without persistent provider-setting edits; native review remains separate.
+launch providers, or acknowledge work. Hooks reach sessions in two ways:
+[user-level hooks](SETUP.md#connect-every-session), which `multithread hooks
+install` adds to the provider's user settings after you approve its plan and
+which reach every session in an enrolled checkout, or invocation-only arguments
+that `launch` and peer pass to the one session they start. Each event runs one
+Multithread handler: with user-level hooks installed, launch and peer pass no
+invocation copy, and a partial or altered installation makes them refuse. Do
+not add a Multithread handler by hand beside either; a duplicate creates
+duplicate observations and repeated context.
 
 For a first installation, use the [setup guide](SETUP.md). Once the repository
 is enrolled, the installed interactive launch command prepares the hooks and
@@ -33,11 +38,13 @@ Use `claude` for the other provider. Add `--json` to prepare a launch plan witho
 starting a provider. No source checkout is needed. Its plan does not
 establish native trust, model-visible context or working provider tools.
 
-Launch and the native hook review are the person's steps, in their own
+Launch and the native `/hooks` review are the person's steps, in their own
 terminal. An agent reports them with the remedy Multithread prints and never
-runs `launch`, reviews or changes hook trust, or edits provider hook
-configuration. It also leaves `--multithread` and `--relay` unset: Codex trusts
-one exact hook command, the account launcher setup prints.
+runs `launch`. It changes provider hook settings or Codex trust only through
+`multithread hooks install`, `trust` or `remove`, after the person chose that
+route, showing the exact plan first; it never edits hook files or Codex's
+`config.toml` directly. It also leaves `--multithread` and `--relay` unset:
+Codex trusts one exact hook command, the account launcher setup prints.
 
 ## Command and scope
 
@@ -45,8 +52,15 @@ A reviewed hook definition must invoke the absolute account-installed launcher:
 
 ```text
 /ABSOLUTE/ACCOUNT/HOME/.local/bin/multithread provider-hook --client codex
+/ABSOLUTE/ACCOUNT/HOME/.local/bin/multithread --repo "$CLAUDE_PROJECT_DIR" provider-hook --client claude
 /ABSOLUTE/ACCOUNT/HOME/.local/bin/multithread --repo /ABSOLUTE/ENROLLED/CHECKOUT provider-hook --client claude
 ```
+
+The Codex command is the same text whether it sits in `~/.codex/hooks.json` or
+arrives as an invocation flag. The second line is Claude's user-level command:
+Claude's working directory follows `cd`, so the hook anchors to the directory
+the session started in, which Claude exports as `CLAUDE_PROJECT_DIR`. The third
+is the invocation-only Claude command that launch and peer pass.
 
 Shell-quote each actual argument; the paths above are placeholders, not runnable
 commands. Enrollment must already exist from an explicit `init`. Without
@@ -122,12 +136,29 @@ with unchanged identity/mode/size, while DB/WAL and every other fixture object
 remained unchanged. Separate negative tests attempt database-file writes and
 mutating SQL.
 
-Missing enrollment, malformed input, unsupported state or failed observation
-returns exit zero with no context and a generic diagnostic. Unknown event names
-are silently ignored. Exit zero is provider fail-open behavior, **not** evidence
-of a successful ledger operation or an empty inbox. Installation/argument errors,
-external termination and provider-enforced timeouts can still fail before this
-handler completes. It creates no failure log and never repairs state.
+Every failure returns exit zero, so the provider session continues, with a
+generic diagnostic on stderr. In a checkout that was never enrolled, that is
+all: no context, no notice. In an enrolled checkout, a SessionStart or
+UserPromptSubmit hook that could not reach its ledger (malformed input,
+unverifiable enrollment, an unavailable runtime, or a ledger that refused or
+failed) returns one visible warning instead of context:
+
+```text
+MULTITHREAD WARNING: this checkout is enrolled, but Multithread's SessionStart hook could not reach its ledger (REASON), so this session is not being recorded and no brief was read. Tell the person; the fix starts with: /ABSOLUTE/ACCOUNT/HOME/.local/bin/multithread setup --repo /ABSOLUTE/CHECKOUT --check
+```
+
+It also carries a `systemMessage` for the person. REASON is one of: the
+provider's hook input could not be used; its enrollment could not be verified;
+the installed runtime could not run its ledger worker; the ledger refused or
+could not complete this step. "Enrolled" means positive evidence: the Git
+enrollment marker or the account's enrollment record exists. Stop, SessionEnd
+and Interrupt carry no context, so their failures stay on stderr; `doctor`
+[finds the sessions that left no events](SETUP.md#when-a-session-cannot-reach-its-ledger).
+Unknown event names are silently ignored. Exit zero is provider fail-open
+behavior, **not** evidence of a successful ledger operation or an empty inbox.
+Installation/argument errors, external termination and provider-enforced
+timeouts can still fail before this handler completes. It creates no failure
+log and never repairs state.
 
 Without a stable prompt identifier, startup/end observations are at-least-once:
 each invocation receives a fresh nonce. This permits resume after Git changes
@@ -379,7 +410,8 @@ probe and executable hashes.
 The exact native experimental schema exposes155 client request variants and
 only hooks/list as a dedicated hook method, not a hook trust/revoke API. Native
 CLI /hooks review remains a separately witnessed step, not an invented RPC or
-raw trust-file edit. These historical probes did not verify model context,
+raw trust-file edit. [A later observation](#hook-trust-through-codexs-configuration-api)
+found how that review records trust through the general configuration API. These historical probes did not verify model context,
 exact session resume or controller-created Git commits; the bounded workflow
 above has separate evidence for those steps. The receipts linked in this section retain
 their original scope and contain no authenticated model run.
@@ -408,6 +440,33 @@ The native mechanisms are also described in the official documentation:
 [Claude permissions](https://code.claude.com/docs/en/permissions).
 Newer documented Claude fields are not assumed present in2.0.5; `--bare` is not
 a subscription-preserving isolation shortcut.
+
+## Hook trust through Codex's configuration API
+
+Codex 0.159.2 records hook trust in the user `config.toml` as
+`[hooks.state."KEY"] trusted_hash = "HASH"`. KEY is the declaring file, event
+label, matcher-group index and handler index, for example
+`/ABSOLUTE/HOME/.codex/hooks.json:session_start:1:0`. HASH is `sha256:` over
+compact, key-sorted JSON of the event label and a matcher group holding only
+that handler as Codex normalized it (type, command, timeout, async, and any
+matcher, status message or context limit); the declaring file and position are
+not part of it. Codex's own terminal `/hooks` review writes this through the
+app server: `config/batchWrite` with one `hooks.state` edit, merge strategy
+`upsert`, mapping each listed hook's `key` to `{"trusted_hash": currentHash}`
+(`codex-rs/tui/src/hooks_rpc.rs` at `rust-v0.159.2`). `hooks/list` reports
+each hook's `key`, `currentHash`, `source`, `sourcePath` and `trustStatus`;
+`config/read` with `includeLayers` reports the user layer's version, which
+`config/batchWrite` accepts as `expectedVersion` and refuses when stale; a
+`null` value on `hooks.state."KEY".trusted_hash` removes the record.
+
+Against Codex 0.159.2 in a disposable `CODEX_HOME`, with no model request or
+thread: the hash derived independently matched `currentHash` for all five
+Multithread events; the upsert moved exactly those five to `trusted`; appended
+hooks left an earlier hook's key and status unchanged; a stale
+`expectedVersion` was refused; and the `null` edit returned one hook to
+`untrusted`. `multithread hooks trust` uses exactly this route, only for hooks
+whose listed fields and hash match what Multithread installed. Other Codex
+versions can change these internals; a mismatch refuses rather than guesses.
 
 Use the [acceptance matrix](engineering/REQUIREMENTS.md) for the remaining
 release checks. Preserve unrelated settings and account state when configuring

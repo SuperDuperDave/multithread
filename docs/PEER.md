@@ -64,15 +64,18 @@ tool readiness. Review the chosen repository and provider configuration first:
 Claude print mode loads normal instructions, hooks, skills and configured MCP
 servers, and does not show its interactive workspace trust dialog.
 The Codex adapter uses the stable App Server interface. The v0.3 native
-source-entry observations use Codex 0.153.4 and Claude Code 2.1.269. Codex hook
-trust remains a separate native review: use `multithread launch codex` in any
-enrolled checkout, open `/hooks`, and review the exact generated commands. One
-review covers every enrolled checkout and worktree; a changed hook definition
-can need review again. Listing a trusted hook does not prove it ran. Before any
+source-entry observations use Codex 0.153.4 and Claude Code 2.1.269. With
+[user-level hooks](SETUP.md#connect-every-session) installed, a peer call uses
+them and passes no copy; trust them once by hand in `/hooks` or with
+`multithread hooks trust`. Otherwise Codex hook trust is a separate native
+review: use `multithread launch codex` in any enrolled checkout, open `/hooks`,
+and review the exact generated commands. One review covers every enrolled
+checkout and worktree; a changed hook definition can need review again. Listing a trusted hook does not prove it ran. Before any
 task, a Codex peer call refuses when a hook is not trusted and names each
 unready event with the one step that resolves it; `setup --check` reports the
 same listing. That step belongs to the person: an agent reports the refusal and
-its remedy, and never runs `launch` or changes hook trust itself. Leave
+its remedy, and never runs `launch`. It changes hook trust only with
+`multithread hooks trust`, when the person chose agent-assisted trust. Leave
 `--multithread` unset; a Codex call accepts only the account launcher setup
 prints, gives another path to it that spelling, and refuses a different file.
 

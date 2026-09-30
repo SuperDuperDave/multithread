@@ -93,6 +93,12 @@ primary-source rationale, test evidence and limits.
   worker, then invokes the provider with its normal environment and permissions.
   Process return is separate from ledger acknowledgement and workflow completion;
   see [peer calls](PEER.md). It does not provision the provider or OS.
+- User-level hook management (`multithread hooks`) also runs outside the
+  worker. It edits only its own entries in the provider's user hook file, after
+  approval of an exact plan, and records Codex trust only through Codex's own
+  configuration API. Coverage evidence for `doctor`, `status` and `brief` is
+  gathered before the worker starts, as provider session identities, directories
+  and times; the confined worker compares them with the ledger.
 - One trusted local OS account is the initial model. Agent labels are not
   credentials, and local coordination is not a multi-user authorization system.
 - The exercised worker profile is x86-64 Linux/WSL with Python3.12, LandlockABI3+,
