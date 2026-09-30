@@ -28,6 +28,7 @@ import sys
 from relay_core.protocol import (ValidationError, canonical_agent, canonical_wake_message_id,
                                  canonical_wake_ref, canonical_wake_role, canonical_wake_thread)
 from . import account_launcher, hooks
+from .enrollment import NotEnrolled
 
 SOCKET = Path("app-server-control") / "app-server-control.sock"
 EXIT_CODES = {"STEERED": 0, "QUEUED": 0, "DELIVERED TO INBOX": 0, "DRY RUN": 0, "BOUND": 0, "ALREADY BOUND": 0,
@@ -344,6 +345,9 @@ def _ledger_next(code, repo, again):
     """The one step that helps after a ledger refusal."""
     if not _is_checkout(repo):
         return "Run it from an enrolled checkout, or pass --repo <checkout>."
+    if code == NotEnrolled.exit_code:
+        return (f"If this is the checkout you want Multithread in, enroll it with "
+                f"`{_launcher('setup', '--repo', str(repo), '--apply')}`, then {again}.")
     if code in (64, 73):
         return "Correct that and run this again."
     return f"Check the ledger with `{_launcher('--repo', str(repo), 'doctor')}`, then {again}."

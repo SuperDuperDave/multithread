@@ -874,6 +874,23 @@ class WakeLedgerTests(WakeCase):
                          result["next"])
         self.assertEqual([], self.codex_calls())
 
+    def test_an_unenrolled_checkout_is_pointed_at_enrollment_not_doctor(self):
+        refusal = (f"this checkout is not enrolled: {json.dumps(str(self.repo))}. If this is the repository you "
+                   f"want Multithread in, enroll it with: {LAUNCHER} setup --repo {self.repo} --apply")
+        self.ledger = lambda repo, *arguments: (78, None, refusal)
+        enroll = (f"If this is the checkout you want Multithread in, enroll it with "
+                  f"`{LAUNCHER} setup --repo {self.repo} --apply`, then ")
+        result = self.wake()
+        self.assertEqual(("NOT SENT", 4), (result["status"], result["exit_code"]))
+        self.assertEqual(f"The ledger at {self.repo} couldn't record this wake: {refusal}. Nothing was sent.",
+                         result["happened"])
+        self.assertEqual(enroll + "run this again.", result["next"])
+        code, out = self.bind()
+        self.assertEqual(4, code)
+        self.assertTrue(out.endswith("Next: " + enroll + "run bind again.\n"), out)
+        self.assertEqual([], self.codex_calls())
+        self.assertEqual(0, self.daemon.connections)
+
     def test_a_folder_outside_git_names_the_way_back(self):
         folder = self.base / "relay-notes"
         folder.mkdir()
