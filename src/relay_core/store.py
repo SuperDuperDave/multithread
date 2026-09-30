@@ -623,6 +623,18 @@ class RelayStore:
         ).fetchall()
         return [self._event_row(row) for row in rows]
 
+    def observed_sessions(self, agent: str, sessions: list[str]) -> set[str]:
+        """Which of these provider sessions left any event here as this agent."""
+        sessions = [session for session in sessions if isinstance(session, str)][:256]
+        if not sessions:
+            return set()
+        marks = ",".join("?" * len(sessions))
+        rows = self._execute(
+            f"SELECT DISTINCT session FROM events WHERE agent = ? AND session IN ({marks})",
+            (agent, *sessions),
+        ).fetchall()
+        return {row[0] for row in rows}
+
     def active_claims(self) -> list[dict[str, Any]]:
         rows = self._execute(
             """

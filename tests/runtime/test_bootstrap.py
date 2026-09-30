@@ -47,6 +47,9 @@ class BootstrapTests(unittest.TestCase):
         self.assertNotIn("relay_runtime/agent.py", historical)
         self.assertNotIn("relay_runtime/review_packet.py", historical)
         self.assertIn("relay_runtime/agent.py", subject.PAYLOAD_FILES)
+        # v0.4.16 and v0.4.17 shipped agent and review_packet, before hooks.
+        self.assertEqual(subject.PAYLOAD_FILES - {"relay_runtime/hooks.py"},
+                         subject._PUBLISHED_V0417_PAYLOAD_FILES)
         for names in subject._RELEASE_PAYLOAD_SETS:
             payload = {name: b"# synthetic released module\n" for name in names}
             manifest = subject._payload_manifest(payload, release_management=True)

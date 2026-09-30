@@ -38,6 +38,7 @@ PAYLOAD_MODULES = {
     "relay_runtime.agent": "relay_runtime/agent.py",
     "relay_runtime.codex_peer": "relay_runtime/codex_peer.py",
     "relay_runtime.claude_peer": "relay_runtime/claude_peer.py",
+    "relay_runtime.hooks": "relay_runtime/hooks.py",
     "relay_runtime.native_io": "relay_runtime/native_io.py",
     "relay_runtime.peer_control": "relay_runtime/peer_control.py",
     "relay_runtime.review_packet": "relay_runtime/review_packet.py",
@@ -62,8 +63,11 @@ _PUBLISHED_V0415_PAYLOAD_FILES = frozenset({
     "relay_runtime/native_io.py", "relay_runtime/peer_control.py",
     "relay_runtime/setup.py", "relay_runtime/update.py",
 })
-_RELEASE_PAYLOAD_SETS = (_LEGACY_PAYLOAD_FILES, _PEER_PAYLOAD_FILES,
-                         _SETUP_PAYLOAD_FILES, _PUBLISHED_V0415_PAYLOAD_FILES, PAYLOAD_FILES)
+_PUBLISHED_V0417_PAYLOAD_FILES = _PUBLISHED_V0415_PAYLOAD_FILES | {
+    "relay_runtime/agent.py", "relay_runtime/review_packet.py",
+}
+_RELEASE_PAYLOAD_SETS = (_LEGACY_PAYLOAD_FILES, _PEER_PAYLOAD_FILES, _SETUP_PAYLOAD_FILES,
+                         _PUBLISHED_V0415_PAYLOAD_FILES, _PUBLISHED_V0417_PAYLOAD_FILES, PAYLOAD_FILES)
 _HEX = re.compile(r"[0-9a-f]{64}\Z")
 _ID = re.compile(r"[0-9a-f]{32}\Z")
 _MAX_MEMBER = 1024 * 1024

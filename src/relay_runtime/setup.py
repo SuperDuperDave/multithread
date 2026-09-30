@@ -16,6 +16,7 @@ import sys
 import tempfile
 
 from . import codex_peer
+from . import hooks
 from . import provider
 from . import account_launcher
 from .native_io import ProtocolError
@@ -108,29 +109,35 @@ def _verified(observation, healthy, message, *, invalid_state="not_ready"):
     return observation
 
 
-def _next(report, stage, action, command=None, *, person=False):
-    """Record one next step; a person step (launch, hook review) is never an agent's."""
+def _next(report, stage, action, command=None, *, person=False, options=None):
+    """Record one next step; a person step (launch, hook review) is never an agent's.
+
+    Options offer the person a choice of route, each naming who acts.
+    """
     entry = {"stage": stage, "action": action}
     if command is not None:
         entry["command"] = command
     if person:
         entry["actor"] = "person"
+    if options:
+        entry["options"] = options
     report["next_actions"].append(entry)
 
 
 def _codex_hooks(report, plan):
     """Ready only when a Codex peer call's hook gate would pass for this checkout."""
     expected = plan["relay_plan"]["hook_command"]
+    user_file = plan["hooks"]["file"]
     try:
         listing = codex_peer.list_hooks(plan["argv"], plan["repo"],
                                         on_start=lambda: report.update(provider_started=True))
-        readiness = codex_peer.hook_readiness(listing, plan["repo"], expected)
+        readiness = codex_peer.hook_readiness(listing, plan["repo"], expected, user_file)
     except (ProtocolError, OSError, subprocess.SubprocessError):
         return {"state": "unavailable", "hook_trust": {"state": "unavailable"},
                 "message": "Codex's hook listing is unavailable; a Codex peer call checks the same listing before any task."}
     if readiness["state"] == "ready":
         return {"hook_trust": readiness}
-    problem, action = codex_peer.hook_remedy(readiness, plan["repo"], expected)
+    problem, action = codex_peer.hook_remedy(readiness, plan["repo"], expected, user_file)
     state = "needs_hook_review" if readiness["state"] == "needs_review" else "needs_hook_configuration"
     return {"state": state, "message": problem + "; Codex peer calls refuse until then",
             "hook_trust": {**readiness, "action": action}}
@@ -180,6 +187,8 @@ def setup_report(repo, *, apply=False, codex=None, claude=None):
             invalid_state="uncertain")
     doctor = _observe(base + ["doctor"])
     diagnostics = doctor.get("data", {})
+    if isinstance(diagnostics.get("hook_coverage"), dict):
+        result["hook_coverage"] = diagnostics["hook_coverage"]
     doctor_ok = (diagnostics.get("ok") is True and diagnostics.get("integrity") == "ok"
                  and all(isinstance(diagnostics.get(key), str) and Path(diagnostics[key]).is_absolute()
                          for key in ("repo_root", "git_common_dir", "database")))
@@ -227,17 +236,36 @@ def setup_report(repo, *, apply=False, codex=None, claude=None):
                   provider.configuration_command(launcher, selected, client))
             continue
         command = [launcher, "launch", client, "--repo", selected, "--provider", plan["argv"][0]]
+        user_level = plan["hooks"]["source"] == "user"
         entry = {"state": "prepared", "executable": plan["argv"][0],
-                 "version": "not_checked", "plan": plan, "launch_command": command}
+                 "version": "not_checked", "plan": plan, "launch_command": command,
+                 "hook_source": plan["hooks"]["source"]}
         result["providers"][client] = entry
         if client == "codex":
             entry.update(_codex_hooks(result, plan))
-        if entry["state"] in ("needs_hook_review", "needs_hook_configuration"):
-            _next(result, client, entry["hook_trust"]["action"], command, person=True)
+        if entry["state"] == "needs_hook_review" and user_level:
+            installed = {"file": plan["hooks"]["file"], "command": plan["hooks"]["command"]}
+            _next(result, client, entry["hook_trust"]["action"], options=[
+                {"mode": "manual", "actor": "person", "steps": hooks.manual_steps(installed)},
+                {"mode": "agent_assisted", "actor": "agent, only after the person chose this mode",
+                 "command": [launcher, "hooks", "trust"]}])
+        elif entry["state"] in ("needs_hook_review", "needs_hook_configuration"):
+            _next(result, client, entry["hook_trust"]["action"],
+                  [launcher, "hooks", "status"] if user_level else command, person=not user_level)
+        elif user_level:
+            _next(result, client, "Start " + hooks._NAMES[client] + " however you like in this repository (app, "
+                  "terminal or IDE): its user-level hooks reach the ledger. launch remains available and adds no "
+                  "second copy.", command, person=True)
         else:
             _next(result, client, "Yours to run in your own interactive terminal when you want this provider with "
                   "Multithread; review the invocation it displays. An agent reports this step and never runs it.",
                   command, person=True)
+        if not user_level:
+            # prepare refuses a partial installation, so none is installed here.
+            _next(result, client, "Sessions you start yourself (the " + hooks._NAMES[client] + " app, terminal or "
+                  "IDE) reach this ledger only after Multithread's user-level hooks are installed. Install shows "
+                  "the exact change and asks first; the person or an agent they authorized runs it.",
+                  [launcher, "hooks", "install", "--client", client])
     result["first_collaboration_url"] = "https://github.com/SuperDuperDave/multithread/blob/main/docs/PEER.md#first-collaboration"
     return result
 
@@ -245,7 +273,10 @@ def setup_report(repo, *, apply=False, codex=None, claude=None):
 def _display(report):
     text = provider._display_text
     codex = report["providers"]["codex"]["state"]
+    user_codex = report["providers"]["codex"].get("hook_source") == "user"
     print("Multithread setup needs attention." if report["state"] != "ready" else
+          "Multithread is ready for this repository; Codex skips its hooks until they are trusted."
+          if codex == "needs_hook_review" and user_codex else
           "Multithread is ready for this repository; Codex peer calls need one hook review first."
           if codex == "needs_hook_review" else
           "Multithread is ready for this repository; Codex hooks need attention before peer calls."
@@ -269,7 +300,13 @@ def _display(report):
         summary = text(client) + ": " + text(entry["state"])
         if isinstance(entry.get("message"), str) and entry["message"]:
             summary += "; " + text(entry["message"])
+        if entry.get("hook_source"):
+            summary += "; hooks: " + ("user-level, for every session" if entry["hook_source"] == "user"
+                                      else "passed by launch and peer only")
         print(summary)
+    coverage = report.get("hook_coverage") or {}
+    for message in coverage.get("messages", ()):
+        print("Coverage: " + text(message))
     print("Provider sign-in, hook delivery and tool execution: not checked.")
     print(text(report["path_note"]))
     if report["launcher"]:
@@ -279,6 +316,12 @@ def _display(report):
         if "command" in entry:
             provider._display_command("  Your command" if entry.get("actor") == "person" else "  Command",
                                       entry["command"])
+        for option in entry.get("options", ()):
+            print("  " + text(option["mode"].replace("_", "-")) + " (" + text(option["actor"]) + "):")
+            for step in option.get("steps", ()):
+                print("    - " + text(step))
+            if "command" in option:
+                provider._display_command("    Command", option["command"])
     if report.get("first_collaboration_url"):
         print("First collaboration, when you authorize provider use: "
               + text(report["first_collaboration_url"]))

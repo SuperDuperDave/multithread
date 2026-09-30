@@ -7,12 +7,15 @@ internal Registry instance; this is not a supported public installation switch.
 
 import argparse
 from contextlib import contextmanager
+import hashlib
 import json
 import os
 from pathlib import Path
 import pwd
 import shlex
 import signal
+import sqlite3
+import subprocess
 import sys
 import tempfile
 import threading
@@ -61,6 +64,7 @@ def _parser():
             config.add_argument("--launcher-name", choices=("multithread", "relay"), default="relay",
                                 help="exact installed hook entry for Claude; native helpers select multithread. Default relay preserves the existing configuration API. Codex always uses multithread")
             for name, description in (("agent", "use an optional account-registered agent adapter"),
+                                      ("hooks", "install, trust and check user-level provider hooks for every session"),
                                       ("launch", "review hooks and start an interactive native provider"),
                                       ("peer", "call Codex or Claude and return its result to this task"),
                                       ("setup", "check readiness or explicitly enroll this repository"),
@@ -78,7 +82,7 @@ def _readonly(args):
         args.command == "ratchet" and args.ratchet_command == "review")
 
 
-def _provider_input(client, *, from_cwd=False):
+def _provider_input(client, *, from_cwd=False, seen=None):
     # Parse before admission solely to choose the read-only worker profile.
     # Payload paths, prompts, tool data and credentials confer no authority and
     # are discarded. Only --repo or the real process cwd selects enrollment.
@@ -88,6 +92,8 @@ def _provider_input(client, *, from_cwd=False):
         raise ValidationError("provider hook requires an event name")
     if name not in _PROVIDER_EVENTS or (name == "Interrupt" and client != "codex"):
         return None
+    if seen is not None:
+        seen["event"] = name
     if from_cwd and "cwd" in payload:
         # The process directory selects enrollment; the provider's stated
         # session directory can only veto a mismatch, never select a checkout.
@@ -185,6 +191,81 @@ def _provider_configuration(args):
     }
 
 
+_WARNED_EVENTS = frozenset({"SessionStart", "UserPromptSubmit"})
+_WARNING_REASONS = {
+    "input": "the provider's hook input could not be used",
+    "enrollment": "its enrollment could not be verified",
+    "runtime": "the installed runtime could not run its ledger worker",
+    "ledger": "the ledger refused or could not complete this step",
+}
+
+
+def _enrolled(repo, registry=None):
+    """Positive evidence that this checkout was enrolled; nothing is opened or created.
+
+    Only a visible warning depends on this. Absence or any doubt stays quiet,
+    so repositories nobody enrolled never hear from Multithread.
+    """
+    try:
+        completed = subprocess.run(
+            ["/usr/bin/git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
+             "-C", str(repo), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+            env={"PATH": "/usr/bin:/bin", "HOME": "/nonexistent", "LC_ALL": "C",
+                 "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1",
+                 "GIT_TERMINAL_PROMPT": "0", "GIT_OPTIONAL_LOCKS": "0"},
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=2, check=True)
+        common = Path(completed.stdout.strip())
+        if not common.is_absolute():
+            return False
+        record = hashlib.sha256(os.fsencode(str(common))).hexdigest() + ".json"
+        return ((common / "relay-enrollment.json").exists()
+                or ((registry or Registry.for_account()).root / record).exists())
+    except (OSError, ValueError, subprocess.SubprocessError, EnrollmentError):
+        return False
+
+
+def _hook_warning(args, reason, *, enrolled=None, registry=None):
+    """Make a missed ledger visible: one line for the agent, one for the person.
+
+    Only context-bearing events can carry it; the next prompt repeats it while
+    the fault lasts. The text is fixed apart from the checkout path and fix.
+    """
+    event = getattr(args, "provider_event", None)
+    repo = args.repo or os.getcwd()
+    if event not in _WARNED_EVENTS or not (_enrolled(repo, registry) if enrolled is None else enrolled):
+        return
+    fix = shlex.join([str(account_launcher()), "setup", "--repo", str(Path(repo).absolute()), "--check"])
+    because = _WARNING_REASONS[reason]
+    context = ("MULTITHREAD WARNING: this checkout is enrolled, but Multithread's " + event + " hook could not "
+               "reach its ledger (" + because + "), so this session is not being recorded and no brief was read. "
+               "Tell the person; the fix starts with: " + fix)
+    print(json.dumps({"systemMessage": "Multithread could not reach this checkout's ledger (" + because
+                      + "); this session is not being recorded. Run: " + fix,
+                      "hookSpecificOutput": {"hookEventName": event, "additionalContext": context}},
+                     ensure_ascii=False, separators=(",", ":")))
+
+
+def _coverage_evidence(access, environ):
+    """Recent provider sessions here, gathered before the worker is confined."""
+    try:
+        from . import hooks
+        return hooks.coverage_evidence(access.workspace.root, environ)
+    except Exception:  # Coverage is an observation; its failure never blocks the ledger.
+        return {"state": "unavailable"}
+
+
+def _coverage(ledger, args):
+    evidence = getattr(args, "hook_coverage", None)
+    if evidence is None:
+        return None
+    if evidence.get("state") != "observed":
+        return {"state": "unavailable", "messages": []}
+    from . import hooks
+    observed = {client: ledger.observed_sessions(client, [item["session"] for item in entry["sessions"]])
+                for client, entry in evidence["providers"].items()}
+    return hooks.coverage_report(evidence, observed)
+
+
 def _provider_worker(args):
     payload = args.provider_payload
     name = payload["hook_event_name"]
@@ -266,7 +347,16 @@ def _worker(access, args, argv):
     if read_only:
         with RelayStore.open_readonly(repo=args.repo) as ledger:
             result = core_cli._dispatch(ledger, args)
+            try:
+                coverage = _coverage(ledger, args)
+            except (RelayError, sqlite3.Error):
+                coverage = {"state": "unavailable", "messages": []}
+        if coverage is not None and args.command == "doctor":
+            result["hook_coverage"] = coverage
         core_cli._print_result(args, result)
+        if coverage is not None and args.command in {"status", "brief"}:
+            for message in coverage.get("messages", ()):
+                print("multithread: warning: " + message, file=sys.stderr)
         return 0
     return core_cli.main(argv)
 
@@ -325,6 +415,9 @@ def _run_worker(access, args, argv):
                 raise StateError("worker output exceeded the receipt bound; outcome may be uncertain")
             receipts.append((destination, body.decode("utf-8", errors="replace")))
         access.verify()
+        if code != 0 and args.command == "provider-hook":
+            # Admission passed, so this checkout is enrolled: say so visibly.
+            _hook_warning(args, "ledger", enrolled=True)
         if code == 0 and args.command == "init":
             access.publish_initialized()
             print(json.dumps({"ok": True, "enrollment_id": access.enrollment.enrollment_id,
@@ -352,14 +445,19 @@ def main(argv=None, *, registry=None, command_alias_check=None):
             boundary += 1
         else:
             break
-    helper = boundary < len(raw) and raw[boundary] in {"agent", "setup", "update"}
+    helper = boundary < len(raw) and raw[boundary] in {"agent", "hooks", "setup", "update"}
     args = _parser().parse_args(raw[:boundary + 1] if helper else raw)
     if helper:
         args.provider_args = raw[boundary + 1:]
+    # Provider settings live where the provider reads them; capture that before
+    # the closed environment replaces HOME.
+    provider_environ = {name: os.environ[name] for name in ("HOME", "CODEX_HOME", "CLAUDE_CONFIG_DIR")
+                        if name in os.environ}
+    stage = "input"
     try:
         if args.state_home is not None or "RELAY_HOME" in os.environ:
             raise StateError("installed Multithread refuses state-directory overrides")
-        if args.command in {"agent", "launch", "peer", "setup", "update"}:
+        if args.command in {"agent", "hooks", "launch", "peer", "setup", "update"}:
             # A compatibility invocation must verify the preferred alias before
             # any helper executes it. Keep hooks and read-only runtime diagnosis
             # outside this check; an unavailable observation stays nonblocking.
@@ -373,23 +471,29 @@ def main(argv=None, *, registry=None, command_alias_check=None):
             # never launch a provider in the worker's closed environment/Landlock.
             from .provider import launch_main, peer_main
             from .agent import agent_main
+            from .hooks import hooks_main
             from .setup import setup_main
             from .update import update_main
             forwarded = list(args.provider_args)
             if args.native_help:
                 forwarded += ["--help"]
-            if args.repo is not None and (args.command != "agent" or
-                                          forwarded[:2] not in (["muse", "list"], ["muse", "inspect"],
-                                                                 ["muse", "register"], ["muse", "remove"])):
+            if args.repo is not None and args.command != "hooks" and (
+                    args.command != "agent" or forwarded[:2] not in (
+                        ["muse", "list"], ["muse", "inspect"], ["muse", "register"], ["muse", "remove"])):
                 forwarded += ["--repo", args.repo]
             if args.json and args.command != "agent":
                 forwarded += ["--json"]
-            return {"agent": agent_main, "launch": launch_main, "peer": peer_main,
+            return {"agent": agent_main, "hooks": hooks_main, "launch": launch_main, "peer": peer_main,
                     "setup": setup_main, "update": update_main}[args.command](forwarded)
         if args.command == "provider-hook":
-            args.provider_payload = _provider_input(args.client, from_cwd=args.repo is None)
+            seen = {}
+            try:
+                args.provider_payload = _provider_input(args.client, from_cwd=args.repo is None, seen=seen)
+            finally:
+                args.provider_event = seen.get("event")
             if args.provider_payload is None:
                 return 0
+        stage = "admission"
         if threading.active_count() != 1:
             raise StateError("installed dispatcher requires a single-threaded fresh process")
         abi_version()  # Preflight BEFORE any explicit enrollment writes.
@@ -410,12 +514,19 @@ def main(argv=None, *, registry=None, command_alias_check=None):
             if args.command == "init":
                 selected_registry.enroll(repo)
             with Admission(selected_registry, repo, initialize=args.command == "init") as access:
+                if args.command in {"doctor", "status", "brief"}:
+                    args.hook_coverage = _coverage_evidence(access, provider_environ)
                 return _run_worker(access, args, raw)
     except (RelayError, EnrollmentError, ConfinementError, OSError) as exc:
         # Hook observation degrades without blocking provider work or trying
-        # to create a failure log inside unavailable/untrusted state.
+        # to create a failure log inside unavailable/untrusted state. In an
+        # enrolled checkout the miss is visible to the agent and the person.
         if args.command in {"hook", "provider-hook"}:
             print("multithread: hook observation unavailable; no ledger receipt", file=sys.stderr)
+            if args.command == "provider-hook":
+                _hook_warning(args, "input" if stage == "input" else "enrollment"
+                              if isinstance(exc, EnrollmentError) else "runtime"
+                              if isinstance(exc, ConfinementError) else "ledger", registry=registry)
             return 0
         message = str(exc) if isinstance(exc, (RelayError, EnrollmentError, ConfinementError)) else "installed state is unavailable"
         print(f"multithread: {message}", file=sys.stderr)

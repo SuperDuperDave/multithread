@@ -441,6 +441,41 @@ class CodexProtocolTests(unittest.TestCase):
                 self.assertEqual('modified' in statuses.values(),
                                  'Codex last trusted a different command' in result['message'])
 
+    def test_user_level_hooks_replace_invocation_copies_and_keep_the_gate(self):
+        from relay_runtime import hooks
+        user_file = Path(self.environment["CODEX_HOME"]) / "hooks.json"
+        with (mock.patch.object(hooks, "account_launcher", return_value=self.relay),
+              mock.patch.dict(os.environ, self.environment, clear=True)):
+            plan = hooks.change_files("install", ("codex",))
+            hooks.change_files("install", ("codex",), expected=plan["plan_sha256"])
+        user = {"source": "user", "sourcePath": str(user_file)}
+        with mock.patch.object(hooks, "account_launcher", return_value=self.relay):
+            self.configure(hook_updates=user)
+            code, result, _ = self.invoke()
+            self.assertEqual(0, code, result)
+            self.assertEqual("ready", result["hook_readiness"]["state"])
+            receipt = json.loads(self.receipt.read_text())
+            # No invocation copy beside the user hooks: each event runs once.
+            self.assertEqual([str(self.provider), "app-server", "--listen", "stdio://"], receipt["argv"])
+            self.configure(hook_updates={**user, "trustStatus": "untrusted"})
+            code, result, _ = self.invoke()
+            self.assertNotEqual(0, code)
+            self.assertEqual("not_submitted", result["task_submission"])
+            self.assertIn("/hooks in a Codex terminal", result["message"])
+            self.assertIn(shlex.join([str(self.relay), "hooks", "trust"]), result["message"])
+            self.assertIn("A peer call never changes native hook trust.", result["message"])
+            self.assertNotIn(" launch codex", result["message"])
+            # A session-flag copy while user hooks are installed would run twice.
+            for updates, status in (({}, "mismatched"),
+                                    ({"extra_hooks": [{**user, "eventName": "stop", "handlerType": "command",
+                                                       "enabled": True, "trustStatus": "trusted", "timeoutSec": 3,
+                                                       "matcher": None, "async": False}]}, "duplicate")):
+                self.configure(**updates)
+                code, result, _ = self.invoke()
+                self.assertNotEqual(0, code)
+                self.assertEqual(status, result["hook_readiness"]["events"]["stop"])
+                self.assertIn(shlex.join([str(self.relay), "hooks", "status"]), result["message"])
+
     def list_hooks(self, **options):
         with mock.patch.dict(os.environ, self.environment, clear=True):
             return codex_peer.list_hooks([str(self.provider), *self.native_arguments], str(self.repo), **options)

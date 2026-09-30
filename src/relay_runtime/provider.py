@@ -25,7 +25,7 @@ import tempfile
 import time
 import tomllib
 import uuid
-from . import account_launcher, hook_argv
+from . import account_launcher, hook_argv, hooks as user_hooks
 from .native_io import (USAGE_SCOPES, MODEL_USAGE_SCOPES, COST_SCOPES,
                         claude_measurements, measurement_scope, canonical_provider_version)
 
@@ -166,9 +166,22 @@ def prepare(client, repo, relay, provider):
             or any(not isinstance(arg, str) or "\0" in arg for arg in arguments)):
         raise LaunchError("The configuration plan has invalid native arguments.")
     check_native_arguments(client, hook_command, arguments)
+    # Each event runs once: installed user-level hooks replace the invocation
+    # copies, which then stay off the command line.
+    try:
+        delivery = user_hooks.delivery(client)
+    except user_hooks.HooksError as exc:
+        raise LaunchError(str(exc)) from None
+    if delivery["source"] == "user":
+        if client == "codex" and delivery["command"] != hook_command:
+            raise LaunchError("The user-level Codex hook command differs from this launcher's; run "
+                              + shlex.join([str(account_launcher()), "hooks", "status"]) + " and follow its next step.")
+        arguments = []
+    else:
+        delivery["command"] = hook_command
     return {"schema": 1, "state": "launch_prepared", "provider": client,
             "repo": str(checkout), "argv": [provider_path, *arguments],
-            "relay_plan": plan, "provider_started": False,
+            "relay_plan": plan, "hooks": delivery, "provider_started": False,
             "hook_delivery": "unknown", "provider_tools": "unknown"}
 
 
@@ -193,11 +206,17 @@ def _display_launch(plan):
     print("Provider: " + _display_text(plan["provider"]))
     print("Executable: " + _display_text(plan["argv"][0]))
     print("Checkout: " + _display_text(plan["repo"]))
-    # prepare validated these exact hooks in the native arguments; display
-    # their enforced shape, not optional descriptive fields in the plan.
-    print("Invocation hooks: " + ", ".join(_hook_events(plan["provider"])))
+    # prepare validated these exact hooks in the native arguments or the user
+    # hook file; display their enforced shape, not descriptive plan fields.
+    if plan["hooks"]["source"] == "user":
+        print("Hooks: your user-level hooks in " + _display_text(plan["hooks"]["file"])
+              + ", so this launch adds no copies: " + ", ".join(_hook_events(plan["provider"])))
+        if plan["provider"] == "codex":
+            print("Codex runs them once trusted; if it asks, review them in /hooks.")
+    else:
+        print("Invocation hooks: " + ", ".join(_hook_events(plan["provider"])))
     print("Each hook runs the following command with a 3-second timeout:")
-    hook_command = plan["relay_plan"]["hook_command"]
+    hook_command = plan["hooks"]["command"]
     # Native trust may identify literal hook text. Do not normalize accepted
     # whitespace or quoting when presenting the command to be reviewed.
     if hook_command.isprintable():
@@ -865,7 +884,8 @@ def _run_peer(args, interruption):
                                directory, envelope, args.timeout,
                                control=ObservedControl(control, envelope) if control is not None else None, observer=observer,
                                feedback=feedback,
-                               **({"expected_hook": plan["relay_plan"]["hook_command"]} if args.client == "codex" else {}))
+                               **({"expected_hook": plan["relay_plan"]["hook_command"],
+                                   "hook_file": plan["hooks"]["file"]} if args.client == "codex" else {}))
                     # EOF is the ordinary end of this owned stdio server.
                     # Retain a valid returned turn even if server shutdown
                     # needs cleanup; shutdown is not a second provider turn.

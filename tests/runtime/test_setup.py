@@ -70,7 +70,8 @@ class SetupTests(unittest.TestCase):
     def codex_plan(self, path):
         hook = shlex.join([self.launcher, "provider-hook", "--client", "codex"])
         return {"argv": [str(path), "-c", "hooks.fixture=[]"], "repo": str(self.repo),
-                "relay_plan": {"hook_command": hook}, "provider_started": False}
+                "relay_plan": {"hook_command": hook}, "provider_started": False,
+                "hooks": {"source": "session_flags", "file": None, "command": hook}}
 
     def list_hooks(self, argv, repo, *, on_start=None, timeout=15):
         self.listings.append((argv, repo))
@@ -269,7 +270,8 @@ class SetupTests(unittest.TestCase):
             self.assertEqual(self.repo, repo)
             self.assertEqual(Path(self.launcher), launcher)
             self.assertEqual(selected, path)
-            return {"argv": [str(selected), "--settings", "{}"], "provider_started": False}
+            return {"argv": [str(selected), "--settings", "{}"], "provider_started": False,
+                    "hooks": {"source": "session_flags", "file": None, "command": "fixture"}}
         with mock.patch.object(setup.provider, "prepare", side_effect=prepare) as prepare_call:
             code, result = self.invoke("--claude", str(selected))
         self.assertEqual(0, code)

@@ -39,12 +39,14 @@ def _multithread_hook(command, launcher):
             and (argv[0] == launcher or Path(argv[0]).name in ("multithread", "relay")))
 
 
-def hook_readiness(result, repo, expected_hook):
+def hook_readiness(result, repo, expected_hook, user_file=None):
     """Classify each Multithread hook exactly as Codex lists it for this checkout.
 
-    Every session-flag entry for an event, and any Multithread provider hook
-    from another source (including an older per-checkout command), counts before
-    commands are compared, so a second handler cannot sit unseen beside ours.
+    The one handler per event comes from invocation flags, or from the user hook
+    file when user_file names it. Every session-flag entry for an event, and any
+    Multithread provider hook from another source (including an older
+    per-checkout command), counts before commands are compared, so a second
+    handler cannot sit unseen beside ours.
     """
     groups = result.get("data") if isinstance(result, dict) else None
     if not isinstance(groups, list) or any(not isinstance(group, dict) for group in groups):
@@ -58,6 +60,12 @@ def hook_readiness(result, repo, expected_hook):
         if (isinstance(hook, dict) and hook.get("eventName") in listed
                 and (hook.get("source") == "sessionFlags" or _multithread_hook(hook.get("command"), launcher))):
             listed[hook["eventName"]].append(hook)
+
+    def expected_source(hook):
+        if user_file is None:
+            return hook.get("source") == "sessionFlags"
+        return hook.get("source") == "user" and _same_path(hook.get("sourcePath"), user_file)
+
     events = {}
     for name, hooks in listed.items():
         hook = hooks[0] if len(hooks) == 1 else {}
@@ -65,7 +73,7 @@ def hook_readiness(result, repo, expected_hook):
             events[name] = "missing"
         elif len(hooks) > 1:
             events[name] = "duplicate"
-        elif (hook.get("source") != "sessionFlags"
+        elif (not expected_source(hook)
               or hook.get("command") != expected_hook or hook.get("handlerType") != "command"
               or hook.get("async", False) is not False or hook.get("matcher") is not None
               or type(hook.get("timeoutSec")) is not int or hook["timeoutSec"] != 3):
@@ -83,7 +91,18 @@ def hook_readiness(result, repo, expected_hook):
             "ready_events": sorted(set(events) - set(unready))}
 
 
-def hook_remedy(readiness, repo, expected_hook):
+def _same_path(listed, expected):
+    if not isinstance(listed, str):
+        return False
+    if listed == str(expected):
+        return True
+    try:
+        return os.path.samefile(listed, expected)
+    except OSError:
+        return False
+
+
+def hook_remedy(readiness, repo, expected_hook, user_file=None):
     """Name the unready events by status and give the one next step for them."""
     events = readiness["events"]
     statuses = sorted({events[name] for name in readiness["unready_events"]})
@@ -92,6 +111,17 @@ def hook_remedy(readiness, repo, expected_hook):
     launcher = shlex.split(expected_hook)[0]
     launch = [launcher, "launch", "codex", "--repo", repo]
     check = shlex.join([launcher, "setup", "--repo", repo, "--check", "--json"])
+    if user_file is not None:
+        # User-level hooks: the person chose how trust is recorded at setup.
+        if readiness["state"] == "needs_review":
+            action = ("Codex skips these user-level hooks until they are trusted. Either the person opens /hooks in "
+                      "a Codex terminal and trusts the five Multithread hooks from " + str(user_file) + " running "
+                      + expected_hook + ", or, if the person chose agent-assisted trust, an agent runs "
+                      + shlex.join([launcher, "hooks", "trust"]) + " and shows them its plan before recording it.")
+        else:
+            action = ("Codex did not load the user-level hooks as Multithread installed them: inspect "
+                      + shlex.join([launcher, "hooks", "status"]) + " and follow its next step.")
+        return "Codex hooks are not ready (" + detail + ")", action
     if readiness["state"] == "needs_review":
         action = ("In their own terminal, the person reviews once in Codex: run " + shlex.join(launch) + ", type launch, open /hooks "
                   "and trust the five Multithread hooks running " + expected_hook
@@ -110,58 +140,78 @@ def hook_remedy(readiness, repo, expected_hook):
     return "Codex hooks are not ready (" + detail + ")", action
 
 
-def list_hooks(argv, repo, *, timeout=15, on_start=None):
-    """Ask Codex's app server for one checkout's hooks: initialize and hooks/list only.
+class AppServer:
+    """One owned stdio app server for configuration questions: no thread or turn.
 
-    This starts Codex but creates no thread or turn, submits no task and changes
-    no trust. ProtocolError, OSError or TimeoutExpired mean the listing is
-    unavailable, never that hooks are absent.
+    Requests run one at a time and each response must answer the pending one.
+    ProtocolError, OSError or TimeoutExpired mean the answer is unavailable,
+    never that the asked-for state is absent. Leaving the block ends the server
+    and any descendants in the process group this object created.
     """
-    process = subprocess.Popen([*argv, "app-server", "--listen", "stdio://"], cwd=repo,
-                               stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                               stderr=subprocess.DEVNULL, start_new_session=True)
-    if on_start is not None:
-        on_start()
-    deadline = time.monotonic() + timeout
-    buffer = bytearray()
-    received = 0
 
-    def send(value):
-        process.stdin.write((json.dumps(value, ensure_ascii=True, separators=(",", ":")) + "\n").encode("utf-8"))
-        process.stdin.flush()
+    def __init__(self, argv, cwd, *, timeout=15, on_start=None, limit=_MAX_LISTING):
+        self.argv, self.cwd, self.timeout, self.limit = argv, cwd, timeout, limit
+        self.on_start = on_start
+        self.process = None
+        self.next_id = 0
+        self.buffer = bytearray()
+        self.received = 0
+        self.deadline = None
 
-    listing_requested = False
-    try:
-        send({"id": 1, "method": "initialize", "params": {"clientInfo": _CLIENT_INFO}})
+    def __enter__(self):
+        self.process = subprocess.Popen([*self.argv, "app-server", "--listen", "stdio://"], cwd=self.cwd,
+                                        stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                        stderr=subprocess.DEVNULL, start_new_session=True)
+        try:
+            if self.on_start is not None:
+                self.on_start()
+            self.deadline = time.monotonic() + self.timeout
+            self.initialize = self.call("initialize", {"clientInfo": _CLIENT_INFO})
+            self._send({"method": "initialized", "params": {}})
+        except BaseException:
+            self.__exit__(None, None, None)
+            raise
+        return self
+
+    def _send(self, value):
+        self.process.stdin.write((json.dumps(value, ensure_ascii=True, separators=(",", ":")) + "\n").encode("utf-8"))
+        self.process.stdin.flush()
+
+    def call(self, method, params):
+        """Return the result object, or raise ProtocolError with Codex's refusal."""
+        self.next_id += 1
+        pending = self.next_id
+        self._send({"id": pending, "method": method, "params": params})
         with selectors.DefaultSelector() as selector:
-            selector.register(process.stdout, selectors.EVENT_READ)
+            selector.register(self.process.stdout, selectors.EVENT_READ)
             while True:
-                remaining = deadline - time.monotonic()
+                while b"\n" in self.buffer:
+                    line, _, rest = bytes(self.buffer).partition(b"\n")
+                    self.buffer[:] = rest
+                    message = decode(line)
+                    if "method" in message:
+                        continue
+                    if message.get("id") != pending:
+                        raise _ProtocolError("Codex answered a request that was not pending.")
+                    if "result" in message and isinstance(message["result"], dict):
+                        return message["result"]
+                    error = message.get("error")
+                    detail = error.get("message") if isinstance(error, dict) else None
+                    raise _ProtocolError("Codex rejected " + method + (
+                        ": " + detail[:500] if isinstance(detail, str) and detail.isprintable() else "."))
+                remaining = self.deadline - time.monotonic()
                 if remaining <= 0:
-                    raise subprocess.TimeoutExpired(process.args, timeout)
+                    raise subprocess.TimeoutExpired(self.process.args, self.timeout)
                 if not selector.select(remaining):
                     continue
-                chunk = os.read(process.stdout.fileno(), 65536)
-                received += len(chunk)
-                if not chunk or received > _MAX_LISTING:
-                    raise _ProtocolError("Codex ended or exceeded its bound before listing hooks.")
-                buffer.extend(chunk)
-                while b"\n" in buffer:
-                    line, _, rest = bytes(buffer).partition(b"\n")
-                    buffer[:] = rest
-                    message = decode(line)
-                    if "method" in message or message.get("id") not in (1, 2):
-                        continue
-                    if "result" not in message or not isinstance(message["result"], dict):
-                        raise _ProtocolError("Codex rejected the hook listing.")
-                    if (message["id"] == 2) != listing_requested:
-                        raise _ProtocolError("Codex answered a request that was not pending.")
-                    if listing_requested:
-                        return message["result"]
-                    send({"method": "initialized", "params": {}})
-                    send({"id": 2, "method": "hooks/list", "params": {"cwds": [repo]}})
-                    listing_requested = True
-    finally:
+                chunk = os.read(self.process.stdout.fileno(), 65536)
+                self.received += len(chunk)
+                if not chunk or self.received > self.limit:
+                    raise _ProtocolError("Codex ended or exceeded its bound before answering " + method + ".")
+                self.buffer.extend(chunk)
+
+    def __exit__(self, *_exc):
+        process = self.process
         try:
             process.stdin.close()
         except OSError:
@@ -177,10 +227,23 @@ def list_hooks(argv, repo, *, timeout=15, on_start=None):
             pass
         process.wait()
         process.stdout.close()
+        return False
+
+
+def list_hooks(argv, repo, *, timeout=15, on_start=None):
+    """Ask Codex's app server for one checkout's hooks: initialize and hooks/list only.
+
+    This starts Codex but creates no thread or turn, submits no task and changes
+    no trust. ProtocolError, OSError or TimeoutExpired mean the listing is
+    unavailable, never that hooks are absent.
+    """
+    with AppServer(argv, repo, timeout=timeout, on_start=on_start) as server:
+        return server.call("hooks/list", {"cwds": [repo]})
 
 
 class _Driver:
-    def __init__(self, process, task, repo, resume, envelope, timeout, control, expected_hook=None):
+    def __init__(self, process, task, repo, resume, envelope, timeout, control, expected_hook=None,
+                 hook_file=None):
         self.process = process
         self.task = task.decode("utf-8")
         self.repo = repo
@@ -190,6 +253,7 @@ class _Driver:
         self.timeout = timeout
         self.control = control
         self.expected_hook = expected_hook
+        self.hook_file = hook_file
         self.next_id = 1
         self.pending = {}
         self.outgoing = bytearray()
@@ -219,12 +283,12 @@ class _Driver:
         self.request("thread/resume" if self.resume else "thread/start", params)
 
     def hooks_ready(self, result):
-        readiness = hook_readiness(result, self.repo, self.expected_hook)
+        readiness = hook_readiness(result, self.repo, self.expected_hook, self.hook_file)
         self.envelope["hook_readiness"] = readiness
         if readiness["state"] != "ready":
-            problem, action = hook_remedy(readiness, self.repo, self.expected_hook)
+            problem, action = hook_remedy(readiness, self.repo, self.expected_hook, self.hook_file)
             raise _ProtocolError(problem + "; no task was submitted. " + action
-                                 + " Multithread does not change native hook trust.")
+                                 + " A peer call never changes native hook trust.")
 
     def remaining(self):
         remaining = self.deadline - time.monotonic()
@@ -559,9 +623,10 @@ class _Driver:
 
 
 def run(process, task: bytes, repo: str, resume: str | None, directory: Path,
-        envelope: dict, timeout: float, control=None, observer=None, expected_hook=None, feedback=None) -> None:
+        envelope: dict, timeout: float, control=None, observer=None, expected_hook=None, feedback=None,
+        hook_file=None) -> None:
     """Observe a native terminal turn separately from the caller's cleanup."""
-    driver = _Driver(process, task, repo, resume, envelope, timeout, control, expected_hook)
+    driver = _Driver(process, task, repo, resume, envelope, timeout, control, expected_hook, hook_file)
     owned_observer = observer is None
     observation = observer if observer is not None else Observation(process, directory, envelope)
     observation.driver = driver
