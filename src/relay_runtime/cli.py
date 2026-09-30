@@ -25,7 +25,8 @@ from relay_core.protocol import RelayError, StateError, ValidationError, _identi
 from relay_core.store import RelayStore, _bind_installed_access
 from .admission import Admission
 from .confinement import ConfinementError, abi_version
-from .enrollment import Registry, EnrollmentError, UnsafeDirectory, permission_refusal
+from .enrollment import (Registry, EnrollmentError, NotEnrolled, UnsafeDirectory,
+                         command_text, permission_refusal)
 from . import account_launcher, hook_argv
 
 _MAX_OUTPUT = 16 * 1024 * 1024
@@ -541,8 +542,11 @@ def main(argv=None, *, registry=None, command_alias_check=None):
         if isinstance(exc, UnsafeDirectory):
             exc = _complete_refusal(exc, args, registry)
         message = str(exc) if isinstance(exc, (RelayError, EnrollmentError, ConfinementError)) else "installed state is unavailable"
+        if isinstance(exc, NotEnrolled):
+            message += (". If this is the repository you want Multithread in, enroll it with: "
+                        + command_text([str(account_launcher()), "setup", "--repo", str(exc.root), "--apply"]))
         print(f"multithread: {message}", file=sys.stderr)
-        return exc.exit_code if isinstance(exc, RelayError) else 1
+        return exc.exit_code if isinstance(exc, (RelayError, NotEnrolled)) else 1
     except KeyboardInterrupt:
         print("multithread: interrupted; operation outcome may be uncertain", file=sys.stderr)
         return 130

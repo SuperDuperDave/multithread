@@ -164,6 +164,31 @@ class SetupTests(unittest.TestCase):
         self.assertEqual(1, code)
         self.assertEqual("unavailable", result["repository"]["doctor"]["state"])
 
+    def test_unenrolled_checkout_gets_one_plain_next_step(self):
+        refusal = b"multithread: this checkout is not enrolled: \"/fixture\". If this ...\n"
+        self.responses["doctor"] = (78, b"", refusal)
+        with mock.patch.object(setup.provider, "prepare") as prepare:
+            code, result = self.invoke()
+        self.assertEqual(1, code)
+        self.assertEqual("not_ready", result["state"])
+        self.assertEqual("not_enrolled", result["repository"]["state"])
+        self.assertEqual("not_enrolled", result["repository"]["doctor"]["state"])
+        self.assertEqual(refusal.decode(), result["repository"]["doctor"]["stderr"])
+        self.assertEqual([{"stage": "repository", "action": "This checkout is not enrolled with Multithread yet. "
+                           "If it is the repository you want Multithread in, enroll it; setup then checks it again.",
+                           "command": [self.launcher, "setup", "--repo", str(self.repo), "--apply"]}],
+                         result["next_actions"])
+        prepare.assert_not_called()
+        lines = self.display(result).splitlines()
+        self.assertEqual("Multithread is installed; this checkout is not enrolled yet.", lines[0])
+        self.assertIn("Repository: not_enrolled", lines)
+        self.assertFalse([line for line in lines if line.startswith("Diagnostic: ")])
+        # Only the installed command's own status means not enrolled; the same text alone does not.
+        self.responses["doctor"] = (1, b"", refusal)
+        code, result = self.invoke()
+        self.assertEqual("failed", result["repository"]["state"])
+        self.assertEqual(2, len(result["next_actions"]))
+
     def test_apply_failed_command_retains_verified_runtime_and_independent_healthy_reads(self):
         self.responses["init"] = (1, b"", b"synthetic refused enrollment\n")
         code, result = self.invoke("--apply")

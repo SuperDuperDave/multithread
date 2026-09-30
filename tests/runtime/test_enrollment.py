@@ -68,6 +68,47 @@ class EnrollmentTests(unittest.TestCase):
         self.assertFalse(self.registry.root.exists())
         self.assertFalse((self.repo / ".relay").exists())
 
+    def test_absent_enrollment_is_named_positively_from_any_checkout_directory(self):
+        (self.repo / "src").mkdir()
+        other = self.second_repo()
+        for registry_exists in (False, True):
+            if registry_exists:
+                self.registry.enroll(other)
+            for selected in (self.repo, self.repo / "src"):
+                with self.subTest(registry_exists=registry_exists, selected=selected):
+                    before = snapshot(self.base)
+                    with self.assertRaises(subject.NotEnrolled) as refused:
+                        self.registry.lookup(selected)
+                    self.assertEqual(self.repo, refused.exception.root)
+                    self.assertEqual(78, refused.exception.exit_code)
+                    self.assertEqual("this checkout is not enrolled: " + json.dumps(str(self.repo)),
+                                     str(refused.exception))
+                    self.assertEqual(before, snapshot(self.base))
+
+    def test_state_without_an_enrollment_is_never_called_unenrolled(self):
+        self.registry.enroll(self.second_repo())
+        for leftover in (self.repo / ".relay", self.repo / ".git" / "relay-enrollment.json"):
+            with self.subTest(leftover=leftover.name):
+                leftover.mkdir(mode=0o700) if leftover.name == ".relay" else leftover.write_text("{}")
+                with self.assertRaises(subject.EnrollmentError) as refused:
+                    self.registry.lookup(self.repo)
+                self.assertNotIsInstance(refused.exception, subject.NotEnrolled)
+                self.assertIn("holds Multithread state", str(refused.exception))
+                leftover.rmdir() if leftover.name == ".relay" else leftover.unlink()
+
+    def test_unreadable_or_unsafe_registry_is_not_called_unenrolled(self):
+        self.registry.enroll(self.second_repo())
+        self.registry.root.chmod(0o755)
+        with self.assertRaises(subject.UnsafeDirectory):
+            self.registry.lookup(self.repo)
+        self.registry.root.chmod(0o700)
+        moved = self.base / "account-moved"
+        self.registry.root.parent.rename(moved)
+        self.registry.root.parent.symlink_to(moved, target_is_directory=True)
+        with self.assertRaises(subject.EnrollmentError) as refused:
+            self.registry.lookup(self.repo)
+        self.assertNotIsInstance(refused.exception, subject.NotEnrolled)
+
     def test_explicit_enrollment_reserves_markers_without_database(self):
         entry = self.registry.enroll(self.repo)
         self.assertEqual(entry.generation, 1)

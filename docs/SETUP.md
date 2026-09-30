@@ -168,6 +168,10 @@ To explicitly enroll a new chosen repository, then run the same checks:
 ~/.local/bin/multithread setup --repo "$PWD" --apply
 ```
 
+A checkout that is not enrolled yet reports `not_enrolled`, with this command as
+its one next step. `status`, `doctor`, `peer` and `launch` in that checkout
+name the same command.
+
 Select reviewed provider paths explicitly when necessary:
 
 ```sh

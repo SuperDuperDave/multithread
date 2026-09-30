@@ -105,6 +105,22 @@ registry = Registry(pathlib.Path({str(self.registry)!r}))
         self.assertFalse(self.state.exists())
         self.assertFalse(self.registry.exists())
 
+    def test_unenrolled_checkout_is_named_with_the_command_that_enrolls_it(self):
+        from relay_runtime import account_launcher
+        enroll = shlex.join([str(account_launcher()), "setup", "--repo", str(self.repo), "--apply"])
+        (self.repo / "src").mkdir()
+        for args, cwd in ((("status",), None), (("doctor",), None), (("status",), self.repo / "src")):
+            result = self.command(*args, cwd=cwd)
+            self.assertEqual(78, result.returncode)
+            self.assertEqual("", result.stdout)
+            self.assertEqual("multithread: this checkout is not enrolled: " + json.dumps(str(self.repo))
+                             + ". If this is the repository you want Multithread in, enroll it with: "
+                             + enroll + "\n", result.stderr)
+            self.assertNotIn("installed state is unavailable", result.stderr)
+        self.assertFalse(self.state.exists())
+        self.initialize()
+        self.assertTrue(self.success("doctor")["ok"])
+
     def test_unsafe_directories_refuse_once_with_every_fix(self):
         unsafe = (self.repo, self.repo / ".git")
         for path in unsafe:

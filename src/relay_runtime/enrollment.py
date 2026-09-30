@@ -40,6 +40,17 @@ class UnsafeDirectory(EnrollmentError):
         self.path, self.mode, self.private = path, mode, private
 
 
+class NotEnrolled(EnrollmentError):
+    """Positive absence: no account enrollment for this checkout, and no Multithread state in it."""
+
+    # sysexits EX_CONFIG. Setup reads this status as a checkout not yet enrolled.
+    exit_code = 78
+
+    def __init__(self, root: Path):
+        super().__init__("this checkout is not enrolled: " + json.dumps(str(root), ensure_ascii=True))
+        self.root = root
+
+
 def command_text(argv: list[str]) -> str:
     """A command to paste, or JSON when an argument could disturb the terminal."""
     if all(argument.isprintable() for argument in argv):
@@ -204,6 +215,26 @@ def permission_refusal(repo: str | os.PathLike[str], registry_root: Path,
     if any(not private and mode & 0o020 for _, mode, private in found):
         lines.append("A umask of 002 creates directories with group write, so a fresh clone can start this way.")
     return EnrollmentError("\n".join(lines))
+
+
+def _held_unless_absent(path: Path, custody: _Custody, *, private: bool = False) -> _Directory | None:
+    """Hold path through controlled ancestry, or None where a component is positively absent."""
+    directory = custody.get(Path("/"))
+    for part in path.parts[1:]:
+        if not directory.exists(part):
+            return None
+        directory = custody.get(directory.path / part)
+    return custody.get(path, private=private)
+
+
+def _unenrolled(workspace: Workspace, custody: _Custody) -> None:
+    """Refuse an absent record by what the checkout holds; absence never means empty state."""
+    if (custody.get(workspace.state.parent).exists(workspace.state.name)
+            or custody.get(workspace.common).exists("relay-enrollment.json")):
+        raise EnrollmentError("this checkout holds Multithread state, but this account has no enrollment "
+                              "for its path; preserve that state and inspect it before enrolling (a checkout "
+                              "moved on the same filesystem can use rebind-plan)")
+    raise NotEnrolled(workspace.root)
 
 
 def _fingerprint(info: os.stat_result) -> tuple[int, int]:
@@ -763,8 +794,11 @@ class Registry:
 
     def _lookup(self, repo: str | os.PathLike[str], workspace: Workspace,
                 custody: _Custody) -> Enrollment:
-        registry = custody.get(self.root, private=True)
-        record, _ = self._route(registry, self._record_path(workspace).name)
+        name = self._record_path(workspace).name
+        registry = _held_unless_absent(self.root, custody, private=True)
+        if registry is None or not registry.exists(name):
+            _unenrolled(workspace, custody)
+        record, _ = self._route(registry, name)
         if (record["common"] != str(workspace.common)
                 or record["common_device"] != workspace.common_device
                 or record["common_inode"] != workspace.common_inode

@@ -19,6 +19,7 @@ from . import codex_peer
 from . import hooks
 from . import provider
 from . import account_launcher
+from .enrollment import NotEnrolled
 from .native_io import ProtocolError
 
 
@@ -186,6 +187,9 @@ def setup_report(repo, *, apply=False, codex=None, claude=None):
             "Enrollment did not return a verified initialization receipt; inspect current state before retrying.",
             invalid_state="uncertain")
     doctor = _observe(base + ["doctor"])
+    if doctor["exit_code"] == NotEnrolled.exit_code:
+        # The installed command established the absence itself; nothing else maps to this.
+        doctor["state"] = "not_enrolled"
     diagnostics = doctor.get("data", {})
     if isinstance(diagnostics.get("hook_coverage"), dict):
         result["hook_coverage"] = diagnostics["hook_coverage"]
@@ -207,6 +211,11 @@ def setup_report(repo, *, apply=False, codex=None, claude=None):
     failures = [entry for entry in (repository["enrollment"], doctor, repository["status"])
                 if entry["state"] not in {"verified", "not_requested", "not_checked"}]
     repository["state"] = failures[0]["state"] if failures else "verified"
+    if repository["state"] == "not_enrolled" and not apply:
+        _next(result, "repository", "This checkout is not enrolled with Multithread yet. If it is the repository "
+              "you want Multithread in, enroll it; setup then checks it again.",
+              [launcher, "setup", "--repo", selected, "--apply"])
+        return result
     if repository["state"] != "verified":
         _next(result, "repository", "Inspect the reported failure or unavailable observation; preserve existing state.",
               base + ["doctor"])
@@ -277,7 +286,9 @@ def _display(report):
     text = provider._display_text
     codex = report["providers"]["codex"]["state"]
     user_codex = report["providers"]["codex"].get("hook_source") == "user"
-    print("Multithread setup needs attention." if report["state"] != "ready" else
+    print("Multithread is installed; this checkout is not enrolled yet."
+          if report["repository"]["state"] == "not_enrolled" else
+          "Multithread setup needs attention." if report["state"] != "ready" else
           "Multithread is ready for this repository; Codex skips its hooks until they are trusted."
           if codex == "needs_hook_review" and user_codex else
           "Multithread is ready for this repository; Codex peer calls need one hook review first."
@@ -331,7 +342,8 @@ def _display(report):
     observations = [report["runtime"], *(report["repository"].get(key, {}) for key in ("enrollment", "doctor", "status"))]
     shown = set()
     for entry in observations:
-        if entry.get("state") in {"verified", "not_checked", "not_requested", None}:
+        # The next action already says a checkout is not enrolled, with its command.
+        if entry.get("state") in {"verified", "not_checked", "not_requested", "not_enrolled", None}:
             continue
         if entry.get("message"):
             print(text(entry["message"]))

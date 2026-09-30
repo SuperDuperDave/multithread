@@ -174,6 +174,17 @@ class LaunchProviderTests(unittest.TestCase):
                     json.loads(received.read_text()))
                 provider_call.assert_not_called()
 
+    def test_unenrolled_checkout_is_named_with_the_command_that_enrolls_it(self):
+        self.make_executable(self.relay, "raise SystemExit(78)\n")
+        for client in ("codex", "claude"):
+            with (self.subTest(client=client), mock.patch.object(launch.subprocess, "call") as provider_call):
+                value = self.assert_unavailable(self.invoke(client=client))
+                self.assertEqual("This checkout is not enrolled with Multithread, so no provider was started. "
+                                 "If it is the repository you want Multithread in, enroll it with: "
+                                 + shlex.join([str(self.relay), "setup", "--repo", str(self.repo), "--apply"]),
+                                 value["message"])
+                provider_call.assert_not_called()
+
     def test_relative_repo_components_expand_from_cwd_without_normalization(self):
         alias = self.base / "relative alias"
         alias.symlink_to(self.repo, target_is_directory=True)

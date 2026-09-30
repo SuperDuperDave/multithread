@@ -27,6 +27,7 @@ import time
 import tomllib
 import uuid
 from . import account_launcher, hook_argv, hooks as user_hooks
+from .enrollment import NotEnrolled
 from .native_io import (USAGE_SCOPES, MODEL_USAGE_SCOPES, COST_SCOPES,
                         claude_measurements, measurement_scope, canonical_provider_version,
                         identity as _identity, setting_relation)
@@ -138,6 +139,10 @@ def prepare(client, repo, relay, provider):
         raise LaunchError("Multithread configuration timed out; observation is unavailable. Inspect installed status before retrying.") from None
     except UnicodeError:
         raise LaunchError("Multithread returned unreadable configuration output; observation is unavailable.") from None
+    if result.returncode == NotEnrolled.exit_code:
+        raise LaunchError("This checkout is not enrolled with Multithread, so no provider was started. If it is "
+                          "the repository you want Multithread in, enroll it with: "
+                          + shlex.join([launcher, "setup", "--repo", str(checkout), "--apply"]))
     if result.returncode != 0:
         # Give the exact native command for diagnosis without copying arbitrary
         # diagnostics into the structured launch plan.
