@@ -461,10 +461,13 @@ class PeerTests(unittest.TestCase):
         self.assertNotIn("readiness", result)
         self.assertNotIn("readiness_check", result)
 
-    def test_legacy_launcher_flag_still_prepares_without_provider_or_evidence_writes(self):
+    def test_retired_launcher_flag_still_prepares_without_provider_or_evidence_writes(self):
         evidence = self.base / "legacy-dry-evidence"
-        code, result, _ = self.invoke("--dry-run", output=evidence, launcher_flag="--relay")
+        code, result, errors = self.invoke("--dry-run", output=evidence, launcher_flag="--relay")
         self.assertEqual(0, code)
+        self.assertTrue(errors.startswith("multithread peer: warning: --relay is deprecated; use --multithread. "
+                                          "--relay still works in this release and will be removed in a later "
+                                          "one.\n"), errors)
         self.assertEqual("call_prepared", result["state"])
         self.assertFalse(result["provider_started"])
         self.assertFalse(self.calls.exists())

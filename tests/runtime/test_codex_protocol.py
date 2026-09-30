@@ -259,7 +259,7 @@ class CodexProtocolTests(unittest.TestCase):
         self.requests.unlink(missing_ok=True)
         self.calls.unlink(missing_ok=True)
         directory = self.base / f"evidence-{self.count}"
-        arguments = ["codex", "--repo", str(self.repo), "--relay", str(self.relay),
+        arguments = ["codex", "--repo", str(self.repo), "--multithread", str(self.relay),
                      "--provider", str(self.provider), "--task-file", str(self.task),
                      "--output-dir", str(directory), "--timeout", "2", "--json", *extra]
         stdout, stderr = io.StringIO(), io.StringIO()
@@ -1034,7 +1034,7 @@ class CodexProtocolTests(unittest.TestCase):
                  "runpy.run_path(sys.argv[0], run_name='__main__')\n")
         wrapper = subprocess.Popen(
             [sys.executable, "-I", "-S", "-B", "-c", entry, str(ROOT / "examples/call_peer.py"),
-             "codex", "--repo", str(self.repo), "--relay", str(self.relay), "--provider", str(self.provider),
+             "codex", "--repo", str(self.repo), "--multithread", str(self.relay), "--provider", str(self.provider),
              "--task-file", str(self.task), "--output-dir", str(evidence), "--timeout", "15", "--json"],
             cwd=ROOT, env=self.environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, start_new_session=True)

@@ -134,15 +134,26 @@ class LaunchProviderTests(unittest.TestCase):
                 provider_call.assert_not_called()
                 self.assertFalse(self.receipt.exists())
 
-    def test_legacy_launcher_flag_keeps_the_same_prepared_invocation(self):
+    def test_retired_launcher_flag_still_prepares_the_same_invocation_and_says_so(self):
+        _, current, current_errors, _ = self.invoke()
         code, output, errors, prompt = self.invoke(launcher_flag="--relay")
         self.assertEqual(0, code, errors)
         value = json.loads(output)
         self.assertEqual("launch_prepared", value["state"])
         self.assertEqual([str(self.provider), *self.plan["native_arguments"]], value["argv"])
+        self.assertEqual(json.loads(current), value)
         self.assertFalse(value["provider_started"])
         self.assertFalse(self.receipt.exists())
         prompt.assert_not_called()
+        self.assertEqual("", current_errors)
+        self.assertEqual("multithread launch: warning: --relay is deprecated; use --multithread. --relay still works in this release and will be removed in a later one.\n", errors)
+        # The retired spelling is no longer offered.
+        for main in (launch.launch_main, launch.peer_main):
+            with self.subTest(main=main.__name__), redirect_stdout(io.StringIO()) as shown, \
+                    self.assertRaises(SystemExit):
+                main(["--help"])
+            self.assertIn("--multithread", shown.getvalue())
+            self.assertNotIn("--relay", shown.getvalue())
 
     def test_preparation_uses_exact_multithread_argv_and_inherited_environment(self):
         with (mock.patch.object(launch.subprocess, "run", return_value=self.mocked_result()) as run,
@@ -501,7 +512,9 @@ class LaunchProviderTests(unittest.TestCase):
                       mock.patch.object(launch, "account_launcher", return_value=multithread)):
                     code, output, errors, prompt = self.invoke(launcher_flag=flag)
                     self.assertEqual(0, code, output + errors)
+                    self.assertEqual(flag == "--relay", "--relay is deprecated" in errors)
                     value = json.loads(output)
+                    # Neither flag spelling reaches the hook command Codex trusts.
                     self.assertEqual(expected["hook_command"], value["relay_plan"]["hook_command"])
                     self.assertEqual([str(self.provider), *expected["native_arguments"]], value["argv"])
                     prompt.assert_not_called()
@@ -514,7 +527,7 @@ class LaunchProviderTests(unittest.TestCase):
         output = io.StringIO()
         with (redirect_stdout(output), mock.patch.dict(os.environ, self.environment, clear=True),
               mock.patch.object(launch, "account_launcher", return_value=multithread)):
-            code = launch.peer_main(["codex", "--repo", str(self.repo), "--relay", str(relay),
+            code = launch.peer_main(["codex", "--repo", str(self.repo), "--multithread", str(relay),
                                      "--provider", str(self.provider), "--task-file", str(task),
                                      "--dry-run", "--json"])
         self.assertEqual(0, code, output.getvalue())
@@ -528,7 +541,7 @@ class LaunchProviderTests(unittest.TestCase):
             self.relay = spelling
             with (self.subTest(spelling=str(spelling)),
                   mock.patch.object(launch, "account_launcher", return_value=multithread)):
-                code, output, errors, _ = self.invoke(client="claude", launcher_flag="--relay")
+                code, output, errors, _ = self.invoke(client="claude")
                 self.assertEqual(0, code, output + errors)
                 self.assertEqual(self.configuration("claude", spelling)["hook_command"],
                                  json.loads(output)["relay_plan"]["hook_command"])
@@ -569,9 +582,9 @@ class AgentRuleDocumentationTests(unittest.TestCase):
 
     RULES = {
         "docs/PEER.md": ("never runs `launch`", "`--multithread` unset"),
-        "docs/PEER-REFERENCE.md": ("never runs `launch`", "`--multithread` and `--relay` unset"),
-        "docs/PROVIDERS.md": ("never runs `launch`", "`--multithread` and `--relay` unset"),
-        "skills/multithread/SKILL.md": ("Never run `multithread launch`", "`--multithread` and `--relay` unset"),
+        "docs/PEER-REFERENCE.md": ("never runs `launch`", "`--multithread` unset"),
+        "docs/PROVIDERS.md": ("never runs `launch`", "`--multithread` unset"),
+        "skills/multithread/SKILL.md": ("Never run `multithread launch`", "`--multithread` unset"),
     }
 
     # An agent changes hook settings or trust only through the reviewed commands.

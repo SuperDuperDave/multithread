@@ -43,8 +43,8 @@ terminal. An agent reports them with the remedy Multithread prints and never
 runs `launch`. It changes provider hook settings or Codex trust only through
 `multithread hooks install`, `trust` or `remove`, after the person chose that
 route, showing the exact plan first; it never edits hook files or Codex's
-`config.toml` directly. It also leaves `--multithread` and `--relay` unset:
-Codex trusts one exact hook command, the account launcher setup prints.
+`config.toml` directly. It also leaves `--multithread` unset: Codex trusts one
+exact hook command, the account launcher setup prints.
 
 ## Command and scope
 

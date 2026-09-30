@@ -237,11 +237,32 @@ def _display_launch(plan):
     print("Use launch --json with the same options to inspect the complete invocation plan without starting a provider.")
 
 
+class _RetiredSpelling(argparse.Action):
+    """Accept an old option spelling for one more release, and name its replacement."""
+
+    def __init__(self, *args, replacement, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.replacement = replacement
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        print(f"{parser.prog}: warning: {option_string} is deprecated; use {self.replacement}. "
+              f"{option_string} still works in this release and will be removed in a later one.",
+              file=sys.stderr)
+        setattr(namespace, self.dest, values)
+
+
+def _launcher_option(parser):
+    parser.add_argument("--multithread", dest="relay", type=Path,
+                        help="reviewed absolute installed launcher; default: the account launcher setup prints")
+    parser.add_argument("--relay", dest="relay", type=Path, action=_RetiredSpelling,
+                        replacement="--multithread", help=argparse.SUPPRESS)
+
+
 def launch_main(argv=None):
     parser = argparse.ArgumentParser(prog="multithread launch", description="Review invocation-only Multithread hooks and start an interactive provider.")
     parser.add_argument("client", choices=("codex", "claude"))
     parser.add_argument("--repo", type=Path, default=Path.cwd(), help="enrolled checkout; default: current directory")
-    parser.add_argument("--multithread", "--relay", dest="relay", type=Path, help="reviewed absolute installed launcher; --relay is a compatibility spelling")
+    _launcher_option(parser)
     parser.add_argument("--provider", type=Path, help="reviewed absolute provider entry point; default: PATH lookup")
     parser.add_argument("--json", action="store_true", help="print a plan without starting a provider or asking for input")
     args = parser.parse_args(argv)
@@ -707,7 +728,7 @@ def peer_main(argv=None, *, report_entry=None):
                                      epilog="For an existing call: peer report --call-dir PATH [--json] gives a read-only summary; peer packet --help freezes a scoped review diff; peer control --help covers live input.")
     parser.add_argument("client", choices=("claude", "codex"))
     parser.add_argument("--repo", type=Path, default=Path.cwd(), help="enrolled peer checkout")
-    parser.add_argument("--multithread", "--relay", dest="relay", type=Path, help="reviewed absolute installed launcher; --relay is a compatibility spelling")
+    _launcher_option(parser)
     parser.add_argument("--provider", type=Path, help="reviewed absolute provider entry point; default: PATH")
     parser.add_argument("--task-file", required=True, help="UTF-8 task packet; - reads stdin, at most 64 KiB")
     parser.add_argument("--resume", type=_native_identity, help="exact peer session identity from a previous result; no latest-session lookup")

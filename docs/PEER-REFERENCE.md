@@ -11,8 +11,8 @@ deliberate follow-up. This reference covers:
 - [Coordination and native verification evidence](#coordination-and-verification-scope)
 - [The reviewed source entry](#use-the-source-entry)
 
-An agent starting a peer call leaves `--multithread` and `--relay` unset; the
-account launcher setup prints is the default. A generated follow-up prefix
+An agent starting a peer call leaves `--multithread` unset; the account
+launcher setup prints is the default. A generated follow-up prefix
 already names any other launcher the call used, so use it unchanged. Launch and
 the manual `/hooks` review are the person's steps; `multithread hooks trust` is
 available to the agent when the person chose

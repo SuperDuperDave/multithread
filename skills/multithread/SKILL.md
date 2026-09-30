@@ -24,8 +24,8 @@ hook settings or Codex hook trust only through `multithread hooks install`,
 `trust` or `remove`, only when the person chose that route, and show them the
 `--json` plan before applying it with `--yes --expected-plan`. Never edit hook
 files or Codex's `config.toml` directly, and never run Codex's `/hooks` review
-for them. Leave `--multithread` and `--relay` unset: Codex trusts one exact hook
-command, the account launcher setup prints. When a peer call or setup check says
+for them. Leave `--multithread` unset: Codex trusts one exact hook command, the
+account launcher setup prints. When a peer call or setup check says
 hooks are not ready, stop and report its refusal and the remedy it prints to the
 person; do not relaunch, retry or work around it. If your context begins with a
 `MULTITHREAD WARNING`, tell the person and give them the fix it names.
