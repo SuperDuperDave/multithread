@@ -24,9 +24,11 @@ from .native_io import (USAGE_SCOPES, measurement_error, measurement_number,
 _MAX_PENDING = 128
 _MAX_DETAILS = 8
 _MAX_LISTING = 1024 * 1024
-# The settings check is advisory: bounded, and never the reason a call stops.
+# Reading the model list is bounded; when it fails or runs long, the call proceeds unchecked.
 _MODEL_LIST_PAGES = 32
 _MODEL_LIST_SECONDS = 10
+# Where a setting the call does not request comes from: Codex keeps a thread's settings.
+_KEPT = {"new_thread": "the new thread's configured", "resumed_thread": "this thread's current"}
 _CLIENT_INFO = {"name": "multithread", "title": "Multithread", "version": "0.4.1"}
 _HOOK_EVENTS = ("sessionStart", "userPromptSubmit", "stop", "sessionEnd", "interrupt")
 # Statuses a person resolves in Codex's /hooks review; any other is configuration.
@@ -112,6 +114,22 @@ def hook_remedy(readiness, repo, expected_hook):
     # The reader may be an agent: launch and hook trust stay with the person.
     action += " This is the person's step; an agent reports it and never runs launch or changes hook trust."
     return "Codex hooks are not ready (" + detail + ")", action
+
+
+def _settings_refusal(model, model_source, effort, effort_source, efforts):
+    """Say which pair would have run, why nothing was submitted, and the exact next step."""
+    subject = model if model_source == "requested" else model + ", " + _KEPT[model_source] + " model"
+    setting = "effort " + effort if effort_source == "requested" else effort + ", " + _KEPT[effort_source] + " effort,"
+    message = "Codex's model list does not advertise " + setting + " for " + subject + "."
+    if effort_source != "requested":
+        message += " Codex keeps a thread's effort when only the model changes."
+    message += " No task was submitted, because the provider could reject that pair or run it unverified."
+    if not efforts:
+        return message + " It lists no effort at all for " + model + ", so choose another model with --model."
+    message += " Repeat the call with --effort set to one " + model + " advertises: " + ", ".join(efforts) + "."
+    if model_source != "requested":
+        message += " Or add --model with a model that advertises " + effort + "."
+    return message
 
 
 def list_hooks(argv, repo, *, timeout=15, on_start=None):
@@ -255,8 +273,10 @@ class _Driver:
     def listing_done(self, catalog):
         self.listing = None
         self.catalog = catalog
-        if self.envelope.get("requested_model") is not None:
-            self.check_settings(self.envelope["requested_model"])
+        model, effort = self.envelope.get("requested_model"), self.envelope.get("requested_effort")
+        if model is not None and effort is not None:
+            # The call names the whole pair, so it is checked before any thread opens.
+            self.check_settings(model, "requested", effort, "requested")
         self.start_thread()
 
     def poll_listing(self):
@@ -266,30 +286,34 @@ class _Driver:
             self.abandoned.add(self.listing)
             self.listing_done(None)
 
-    def check_settings(self, model):
-        """Refuse an effort a listed model does not advertise, before any task is submitted.
+    def check_settings(self, model, model_source, effort, effort_source):
+        """Check the model and effort the turn will run with, before any task is submitted.
 
-        Codex accepts an unadvertised effort without error, so only this check
-        catches one. A model Codex does not list may be an alias or another
-        provider's model: it proceeds, recorded as unverified.
+        A source is "requested", or the opened thread's, since Codex keeps a
+        thread's setting that a turn does not override. Codex's advertised
+        efforts are the contract: it accepts any effort, and the provider then
+        rejects an unadvertised pair or runs it unverified. A model Codex does
+        not list may be an alias or another provider's model: it proceeds.
         """
-        effort = self.envelope.get("requested_effort")
         status, efforts = "unavailable", None
-        if self.catalog is not None and model is not None:
+        if self.catalog is not None:
             offered = [entry.get("supportedReasoningEfforts") for entry in self.catalog
-                       if model in (entry.get("model"), entry.get("id"))]
-            if not offered:
+                       if model is not None and model in (entry.get("model"), entry.get("id"))]
+            if model is None:
+                status = "inherited_unknown"
+            elif not offered:
                 status = "model_unlisted"
             elif all(isinstance(options, list) and all(
                     isinstance(option, dict) and _identity(option.get("reasoningEffort")) for option in options)
                     for options in offered):
                 efforts = list(dict.fromkeys(option["reasoningEffort"] for options in offered for option in options))
-                status = "refused" if effort is not None and effort not in efforts else "verified"
-        self.envelope["settings_check"] = {"status": status, "model": model, "advertised_efforts": efforts}
+                status = ("inherited_unknown" if effort is None else
+                          "verified" if effort in efforts else "refused")
+        self.envelope["settings_check"] = {"status": status, "model": model, "model_source": model_source,
+                                           "effort": effort, "effort_source": effort_source,
+                                           "advertised_efforts": efforts}
         if status == "refused":
-            raise _ProtocolError("Codex lists model " + model + " without effort " + effort + "; it advertises "
-                                 + (", ".join(efforts) or "none") + ". No task was submitted. Choose an"
-                                 " advertised effort, or omit --effort to keep the model's default.")
+            raise _ProtocolError(_settings_refusal(model, model_source, effort, effort_source, efforts))
 
     def start_thread(self):
         params = {"cwd": self.repo}
@@ -457,9 +481,14 @@ class _Driver:
             reported = {"model": result.get("model"), "effort": result.get("reasoningEffort")}
             self.observe("codex_" + method.replace("/", "_"),
                          {key: value for key, value in reported.items() if requested[key] is None})
-            if requested["model"] is None and requested["effort"] is not None:
-                # With no model requested, the effort applies to the thread's model.
-                self.check_settings(reported["model"] if _identity(reported["model"]) else None)
+            if (requested["model"] is None) != (requested["effort"] is None):
+                # The call names one setting; the turn keeps this thread's value of the other.
+                kept = "resumed_thread" if self.resume else "new_thread"
+                (model, model_source), (effort, effort_source) = (
+                    (requested[key], "requested") if requested[key] is not None
+                    else (reported[key] if _identity(reported[key]) else None, kept)
+                    for key in ("model", "effort"))
+                self.check_settings(model, model_source, effort, effort_source)
             turn = {"threadId": self.session, "input": [{"type": "text", "text": self.task}]}
             turn.update((key, value) for key, value in requested.items() if value is not None)
             self.turn_requested = True

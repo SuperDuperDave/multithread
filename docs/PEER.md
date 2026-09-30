@@ -180,29 +180,35 @@ to the task so the peer has time to inspect evidence and produce a useful
 answer. Multithread makes one invocation and never automatically retries it.
 
 `--model` and `--effort` request settings for this call without changing the
-account profile; with neither, the provider uses its configured default. Claude
-receives them as its native options, as in `--model opus --effort high`, and
-accepts `low`, `medium`, `high`, `xhigh` or `max`. Codex receives both with the
-turn the call starts, and each Codex model advertises its own efforts.
+account profile. Claude receives them as its native options, as in `--model opus
+--effort high`, and accepts `low`, `medium`, `high`, `xhigh` or `max`. Codex
+receives both with the turn the call starts, and each Codex model advertises its
+own efforts. Without a flag, a new call uses the provider's configured settings.
+A resumed Codex thread instead keeps the settings it last ran with, including an
+earlier call's override, because Codex applies a turn's settings to the thread's
+later turns: omitting a flag never resets it, and changing only the model keeps
+the thread's effort.
 
-Codex runs an effort its model does not advertise without any error, so
-Multithread checks before the turn. It reads Codex's model list, hidden models
-included, and refuses before submitting the task when the listed model (the
-requested one, or else the thread's) does not advertise the requested effort; the
-refusal names the efforts it does advertise. A model Codex does not list, which
-may be an alias or another provider's model, proceeds unverified. If the list is
-unavailable, the call proceeds and Codex decides. `settings_check` records which
-of these happened. The dry run and private receipts preserve the request; a clean
-follow-up preserves both flags.
+Codex accepts any effort; the provider then rejects a pair the model does not
+advertise, or runs it unverified. So when a call names a model or an effort,
+Multithread checks the pair the turn will run with, the requested settings
+completed by the thread's own, before submitting anything. It reads Codex's model
+list, hidden models included, and treats the efforts listed there as the contract.
+When the listed model does not advertise the effort, the call is refused with
+those efforts named and the flag to change. That includes an effort the provider
+would accept but Codex does not list, such as `none` where Codex omits it. A model
+Codex does not list, which may be an alias or another provider's model, proceeds
+unverified, as does a pair whose kept setting the thread does not report. If the
+list is unavailable, the call proceeds and the provider decides. `settings_check`
+records which of these happened. The dry run and private receipts preserve the
+request; a clean follow-up preserves both flags.
 
 Claude's native streaming can report a model name, though an alias may resolve
 to another literal name; its effective effort is not verified. Codex reports a
 thread's settings when it opens the thread, so during the call a requested
 setting stays `unknown`; Codex confirms it when a later call resumes that thread.
 The receipt records what Codex reports, including a model it reroutes the turn
-to, as `model_observation` and `effective_effort`. On a resumed thread the flags
-apply to this turn and, by Codex's definition, to the thread's later turns; a
-resumed call without them keeps whatever settings the thread reports.
+to, as `model_observation` and `effective_effort`.
 [Observation details](PEER-REFERENCE.md#receipt-fields-and-capture-limits).
 
 For a review of working-tree changes, `multithread peer packet --repo

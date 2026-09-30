@@ -39,6 +39,11 @@ def listed_model(model, efforts, *, hidden=False):
                                           for effort in efforts]}
 
 
+def checked(status, model, model_source, effort, effort_source, efforts):
+    return {"status": status, "model": model, "model_source": model_source, "effort": effort,
+            "effort_source": effort_source, "advertised_efforts": efforts}
+
+
 # The requested model is hidden from the picker: the check must still find it.
 MODEL_PAGES = [[listed_model("fixture-native-selection", ["fixture-default-effort", EFFORT]),
                 listed_model(MODEL, [EFFORT, "fixture-other-effort"], hidden=True)]]
@@ -387,8 +392,8 @@ class CodexProtocolTests(unittest.TestCase):
                                   "thread/resume" if resume else "thread/start", "turn/start"],
                                  [row["method"] for row in requests])
                 self.assertEqual({"includeHidden": True}, requests[3]["params"])
-                self.assertEqual({"status": "verified", "model": MODEL,
-                                  "advertised_efforts": [EFFORT, "fixture-other-effort"]}, result["settings_check"])
+                self.assertEqual(checked("verified", MODEL, "requested", EFFORT, "requested",
+                                         [EFFORT, "fixture-other-effort"]), result["settings_check"])
                 opened = next(row for row in requests if row["method"] in ("thread/start", "thread/resume"))
                 self.assertEqual({"cwd": str(self.repo), **({"threadId": resume} if resume else {})},
                                  opened["params"])
@@ -413,6 +418,9 @@ class CodexProtocolTests(unittest.TestCase):
         self.assertNotIn("effort", turn["params"])
         self.assertEqual(UNOBSERVED, result["model_observation"])
         self.assertEqual(EFFORT, result["effective_effort"])
+        # A model change alone keeps the thread's effort, so the pair that runs is checked.
+        self.assertEqual(checked("verified", MODEL, "requested", EFFORT, "new_thread",
+                                 [EFFORT, "fixture-other-effort"]), result["settings_check"])
         code, result, _ = self.invoke("--effort", EFFORT)
         self.assertEqual(0, code, result)
         turn = next(row for row in self.recorded_requests() if row["method"] == "turn/start")
@@ -422,26 +430,87 @@ class CodexProtocolTests(unittest.TestCase):
                           "relation": "not_requested"}, result["model_observation"])
         self.assertEqual("unknown", result["effective_effort"])
         # With no model requested, the effort is checked against the model the thread reports.
-        self.assertEqual({"status": "verified", "model": "fixture-native-selection",
-                          "advertised_efforts": ["fixture-default-effort", EFFORT]}, result["settings_check"])
+        self.assertEqual(checked("verified", "fixture-native-selection", "new_thread", EFFORT, "requested",
+                                 ["fixture-default-effort", EFFORT]), result["settings_check"])
 
     def test_an_effort_the_listed_model_does_not_advertise_is_refused_before_submission(self):
-        cases = ((("--model", MODEL), MODEL, [EFFORT, "fixture-other-effort"],
-                  ["initialize", "initialized", "hooks/list", "model/list"]),
-                 ((), "fixture-native-selection", ["fixture-default-effort", EFFORT],
-                  ["initialize", "initialized", "hooks/list", "model/list", "thread/start"]),
-                 (("--resume", THREAD), "fixture-native-selection", ["fixture-default-effort", EFFORT],
-                  ["initialize", "initialized", "hooks/list", "model/list", "thread/resume"]))
-        for arguments, model, efforts, methods in cases:
+        why = " No task was submitted, because the provider could reject that pair or run it unverified."
+        cases = (
+            (("--model", MODEL, "--effort", "fixture-unadvertised"),
+             checked("refused", MODEL, "requested", "fixture-unadvertised", "requested",
+                     [EFFORT, "fixture-other-effort"]),
+             ["initialize", "initialized", "hooks/list", "model/list"],
+             "Codex's model list does not advertise effort fixture-unadvertised for " + MODEL + "." + why
+             + " Repeat the call with --effort set to one " + MODEL + " advertises: fixture-effort,"
+             " fixture-other-effort."),
+            (("--effort", "fixture-unadvertised"),
+             checked("refused", "fixture-native-selection", "new_thread", "fixture-unadvertised", "requested",
+                     ["fixture-default-effort", EFFORT]),
+             ["initialize", "initialized", "hooks/list", "model/list", "thread/start"],
+             "Codex's model list does not advertise effort fixture-unadvertised for fixture-native-selection,"
+             " the new thread's configured model." + why + " Repeat the call with --effort set to one"
+             " fixture-native-selection advertises: fixture-default-effort, fixture-effort. Or add --model"
+             " with a model that advertises fixture-unadvertised."),
+            (("--resume", THREAD, "--effort", "fixture-unadvertised"),
+             checked("refused", "fixture-native-selection", "resumed_thread", "fixture-unadvertised", "requested",
+                     ["fixture-default-effort", EFFORT]),
+             ["initialize", "initialized", "hooks/list", "model/list", "thread/resume"],
+             "Codex's model list does not advertise effort fixture-unadvertised for fixture-native-selection,"
+             " this thread's current model." + why + " Repeat the call with --effort set to one"
+             " fixture-native-selection advertises: fixture-default-effort, fixture-effort. Or add --model"
+             " with a model that advertises fixture-unadvertised."),
+            # A model change alone keeps the thread's effort: that inherited pair is refused too.
+            (("--model", MODEL),
+             checked("refused", MODEL, "requested", "fixture-default-effort", "new_thread",
+                     [EFFORT, "fixture-other-effort"]),
+             ["initialize", "initialized", "hooks/list", "model/list", "thread/start"],
+             "Codex's model list does not advertise fixture-default-effort, the new thread's configured effort,"
+             " for " + MODEL + ". Codex keeps a thread's effort when only the model changes." + why
+             + " Repeat the call with --effort set to one " + MODEL + " advertises: fixture-effort,"
+             " fixture-other-effort."),
+            (("--resume", THREAD, "--model", MODEL),
+             checked("refused", MODEL, "requested", "fixture-default-effort", "resumed_thread",
+                     [EFFORT, "fixture-other-effort"]),
+             ["initialize", "initialized", "hooks/list", "model/list", "thread/resume"],
+             "Codex's model list does not advertise fixture-default-effort, this thread's current effort,"
+             " for " + MODEL + ". Codex keeps a thread's effort when only the model changes." + why
+             + " Repeat the call with --effort set to one " + MODEL + " advertises: fixture-effort,"
+             " fixture-other-effort."),
+        )
+        for arguments, record, methods, message in cases:
             with self.subTest(arguments=arguments):
-                result = self.assert_attention(self.invoke(*arguments, "--effort", "fixture-unadvertised"))
+                self.configure(thread_result_updates={"reasoningEffort": "fixture-default-effort"})
+                result = self.assert_attention(self.invoke(*arguments))
                 self.assertEqual(methods, [row["method"] for row in self.recorded_requests()])
                 self.assertEqual("not_submitted", result["task_submission"])
                 self.assertIsNone(result["result"])
-                self.assertEqual({"status": "refused", "model": model, "advertised_efforts": efforts},
-                                 result["settings_check"])
-                self.assertIn("Codex lists model " + model + " without effort fixture-unadvertised; it advertises "
-                              + ", ".join(efforts) + ". No task was submitted.", result["message"])
+                self.assertEqual(record, result["settings_check"])
+                # The whole refusal: what would have run, why nothing was sent, the exact next step.
+                self.assertEqual(message, result["message"])
+                self.assertNotIn("default", result["message"].replace("fixture-default-effort", ""))
+
+    def test_a_model_listed_without_efforts_points_to_another_model(self):
+        self.assertEqual(
+            "Codex's model list does not advertise effort fixture-effort for fixture-plain. No task was submitted,"
+            " because the provider could reject that pair or run it unverified. It lists no effort at all for"
+            " fixture-plain, so choose another model with --model.",
+            codex_peer._settings_refusal("fixture-plain", "requested", EFFORT, "requested", []))
+
+    def test_a_setting_the_thread_does_not_report_leaves_the_pair_unverified(self):
+        cases = ((("--model", MODEL), {},
+                  checked("inherited_unknown", MODEL, "requested", None, "new_thread", [EFFORT, "fixture-other-effort"])),
+                 (("--resume", THREAD, "--effort", EFFORT), {"model": None},
+                  checked("inherited_unknown", None, "resumed_thread", EFFORT, "requested", None)),
+                 (("--effort", EFFORT), {"model": "x\ny"},
+                  checked("inherited_unknown", None, "new_thread", EFFORT, "requested", None)))
+        for arguments, updates, record in cases:
+            with self.subTest(arguments=arguments):
+                self.configure(thread_result_updates=updates)
+                code, result, _ = self.invoke(*arguments)
+                self.assertEqual(0, code, result)
+                self.assertEqual("returned", result["state"])
+                self.assertFalse(result["needs_attention"])
+                self.assertEqual(record, result["settings_check"])
 
     def test_the_check_follows_every_page_of_the_model_list(self):
         pages = [[listed_model("fixture-native-selection", ["fixture-default-effort"])], [],
@@ -452,8 +521,8 @@ class CodexProtocolTests(unittest.TestCase):
         listings = [row["params"] for row in self.recorded_requests() if row["method"] == "model/list"]
         self.assertEqual([{"includeHidden": True}, {"includeHidden": True, "cursor": "1"},
                           {"includeHidden": True, "cursor": "2"}], listings)
-        self.assertEqual({"status": "verified", "model": MODEL, "advertised_efforts": ["fixture-other-effort"]},
-                         result["settings_check"])
+        self.assertEqual(checked("verified", MODEL, "requested", "fixture-other-effort", "requested",
+                                 ["fixture-other-effort"]), result["settings_check"])
         # The same effort is not advertised by the model on the first page.
         code, result, _ = self.invoke("--model", "fixture-native-selection", "--effort", "fixture-other-effort")
         self.assertNotEqual(0, code, result)
@@ -464,11 +533,17 @@ class CodexProtocolTests(unittest.TestCase):
         self.assertEqual(0, code, result)
         self.assertEqual("returned", result["state"])
         self.assertFalse(result["needs_attention"])
-        self.assertEqual({"status": "model_unlisted", "model": "fixture-unlisted-model", "advertised_efforts": None},
-                         result["settings_check"])
+        self.assertEqual(checked("model_unlisted", "fixture-unlisted-model", "requested", "fixture-unadvertised",
+                                 "requested", None), result["settings_check"])
         turn = next(row for row in self.recorded_requests() if row["method"] == "turn/start")
         self.assertEqual(("fixture-unlisted-model", "fixture-unadvertised"),
                          (turn["params"]["model"], turn["params"]["effort"]))
+        # The same holds for a thread's own model that Codex does not list.
+        self.configure(thread_result_updates={"model": "fixture-unlisted-model"})
+        code, result, _ = self.invoke("--resume", THREAD, "--effort", "fixture-unadvertised")
+        self.assertEqual(0, code, result)
+        self.assertEqual(checked("model_unlisted", "fixture-unlisted-model", "resumed_thread", "fixture-unadvertised",
+                                 "requested", None), result["settings_check"])
 
     def test_an_unavailable_model_list_never_stops_the_call(self):
         unusable_efforts = listed_model(MODEL, [EFFORT])
@@ -488,8 +563,8 @@ class CodexProtocolTests(unittest.TestCase):
                 self.assertEqual(ANSWER, result["result"])
                 self.assertFalse(result["needs_attention"])
                 self.assertEqual([], result["provider_errors"])
-                self.assertEqual({"status": "unavailable", "model": MODEL, "advertised_efforts": None},
-                                 result["settings_check"])
+                self.assertEqual(checked("unavailable", MODEL, "requested", "fixture-unadvertised", "requested",
+                                         None), result["settings_check"])
                 turn = next(row for row in self.recorded_requests() if row["method"] == "turn/start")
                 self.assertEqual((MODEL, "fixture-unadvertised"), (turn["params"]["model"], turn["params"]["effort"]))
 
