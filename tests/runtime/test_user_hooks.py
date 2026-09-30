@@ -246,6 +246,89 @@ class FileTests(HomeCase):
         self.assertEqual({"hooks": {}, "edited": True}, json.loads(self.file("codex").read_text()))
         self.assertEqual([], list(self.codex_home.glob("*.bak")))
 
+    def test_a_failure_after_the_first_replacement_names_what_was_applied(self):
+        self.write("codex", FOREIGN)
+        original_claude = self.write("claude", {"model": "fixture"})
+        plan = hooks.change_files("install", ("codex", "claude"))
+        real_write = hooks._write
+
+        def edited_after_codex(item):
+            outcome = real_write(item)
+            if item["client"] == "codex":
+                self.file("claude").write_text(json.dumps({"edited": True}))
+            return outcome
+        with mock.patch.object(hooks, "_write", side_effect=edited_after_codex):
+            result = hooks.change_files("install", ("codex", "claude"), expected=plan["plan_sha256"])
+        codex, claude = result["plans"]
+        self.assertEqual(("partly_applied", True), (result["state"], result["changes_provider_settings"]))
+        self.assertEqual(("applied", "not_written"), (codex["outcome"], claude["outcome"]))
+        self.assertEqual("installed", hooks.inspect("codex")["state"])
+        self.assertEqual({"edited": True}, json.loads(self.file("claude").read_text()), "the concurrent edit survives")
+        self.assertEqual(
+            f"Codex: {self.file('codex')} now has Multithread's hooks (previous file kept at {codex['backup']}). "
+            f"Claude Code: {self.file('claude')} was not changed ({self.file('claude')} changed after the plan was "
+            f"made). Check with {LAUNCHER} hooks status. To finish, fix the cause and review a new plan with "
+            f"{LAUNCHER} hooks install --json, which plans only what is still needed. To undo the part that was "
+            f"applied, review {LAUNCHER} hooks remove --client codex --json, or restore the kept copy.",
+            result["message"])
+        self.assertTrue(Path(codex["backup"]).exists())
+        # An OS failure on the second replacement leaves that file and its folder exactly as they were.
+        self.write("claude", {"model": "fixture"})
+        self.apply("remove", ("codex",))
+        plan = hooks.change_files("install", ("codex", "claude"))
+        real_replace = os.replace
+
+        def refuse_claude(source, destination):
+            if Path(destination) == self.file("claude"):
+                raise PermissionError("fixture")
+            return real_replace(source, destination)
+        before = sorted(path.name for path in self.claude_home.iterdir())
+        with mock.patch.object(hooks.os, "replace", side_effect=refuse_claude):
+            code, output, _ = CommandLineTests.run_hooks(self, "install", "--yes", "--expected-plan", plan["plan_sha256"])
+        self.assertEqual(1, code)
+        self.assertIn("Claude Code: " + str(self.file("claude")) + " was not changed (it could not be written: "
+                      "PermissionError).", output)
+        self.assertIn("  Not changed: it could not be written: PermissionError.", output)
+        self.assertEqual(before, sorted(path.name for path in self.claude_home.iterdir()), "no stray copy or temp file")
+        self.assertEqual(original_claude, self.file("claude").read_bytes())
+
+    def test_a_first_failure_changes_nothing_and_says_so(self):
+        self.write("codex", FOREIGN)
+        claude = self.write("claude", {"model": "fixture"})
+        plan = hooks.change_files("install", ("codex", "claude"))
+        before = sorted(path.name for path in self.codex_home.iterdir())
+        with mock.patch.object(hooks.os, "replace", side_effect=PermissionError("fixture")) as replace:
+            with self.assertRaises(hooks.HooksError) as refused:
+                hooks.change_files("install", ("codex", "claude"), expected=plan["plan_sha256"])
+        self.assertEqual(1, replace.call_count, "nothing further is attempted after a failure")
+        self.assertEqual(f"Codex: {self.file('codex')} was not changed (it could not be written: PermissionError). "
+                         f"Claude Code: {self.file('claude')} was not changed (not attempted after that failure). "
+                         f"Nothing was changed. Fix the cause, then review a new plan: {LAUNCHER} hooks install --json",
+                         str(refused.exception))
+        self.assertEqual(before, sorted(path.name for path in self.codex_home.iterdir()))
+        self.assertEqual(claude, self.file("claude").read_bytes())
+
+    def test_unreadable_settings_need_attention_not_ready(self):
+        self.file("codex").write_text("{not json")
+        result = hooks.status(("codex",))
+        self.assertEqual("needs_attention", result["state"])
+        self.assertEqual(("unreadable", str(self.file("codex"))),
+                         (result["providers"]["codex"]["state"], result["providers"]["codex"]["file"]))
+        action = result["next_actions"][0]
+        self.assertEqual([str(LAUNCHER), "hooks", "status", "--client", "codex"], action["command"])
+        self.assertEqual(f"Multithread could not read {self.file('codex')}, so it cannot tell whether Codex sessions "
+                         f"reach their ledger, and it changed nothing. {self.file('codex')} is not valid JSON, or "
+                         "repeats a key. Fix it with the provider's own settings, then run this again.", action["action"])
+        code, output, _ = CommandLineTests.run_hooks(self, "status", "--client", "codex")
+        self.assertEqual(1, code)
+        self.assertIn("Codex: unreadable (" + str(self.file("codex")) + ")", output)
+        self.file("codex").write_text("{}")
+        self.file("codex").chmod(0)
+        if os.geteuid() != 0:
+            state = hooks.status(("codex",))
+            self.assertIn("could not be read (PermissionError). Nothing was changed.",
+                          state["providers"]["codex"]["message"])
+
     def test_missing_provider_directory_is_skipped_not_created(self):
         self.claude_home.rmdir()
         result = self.apply("install")
@@ -350,13 +433,18 @@ for line in sys.stdin:
             {"name": {"type": "user", "file": spec["config_file"], "profile": None},
              "version": spec["version"], "config": {}, "disabledReason": None}]}})
     elif method == "hooks/list":
+        if spec.get("written") and spec.get("fail_after_write"):
+            raise SystemExit(0)  # The check after an acknowledged write never answers.
+        if spec.get("fail_list"):
+            emit({"id": identifier, "error": {"code": -32603, "message": "fixture listing failure"}})
+            continue
         emit({"id": identifier, "result": {"data": [
             {"cwd": params["cwds"][0], "hooks": spec["hooks"], "warnings": [], "errors": []}]}})
     elif method == "config/batchWrite":
-        if params.get("expectedVersion") != spec["version"]:
+        if params.get("expectedVersion") != spec["version"] or spec.get("reject_write"):
             emit({"id": identifier, "error": {"code": -32600, "message": "Configuration was modified since last read."}})
             continue
-        for edit in params["edits"]:
+        for edit in ([] if spec.get("ignore_write") else params["edits"]):
             if edit["keyPath"] == "hooks.state" and edit["mergeStrategy"] == "upsert":
                 for key, record in edit["value"].items():
                     for hook in spec["hooks"]:
@@ -369,7 +457,10 @@ for line in sys.stdin:
                     if hook["key"] == key:
                         hook["trustStatus"] = "untrusted"
         spec["version"] = "sha256:" + "1" * 64
+        spec["written"] = True
         spec_path.write_text(json.dumps(spec))
+        if spec.get("drop_write_answer"):
+            raise SystemExit(0)  # Written, but the answer is lost.
         emit({"id": identifier, "result": {"status": "ok", "version": spec["version"],
                                            "filePath": spec["config_file"], "overriddenMetadata": None}})
     else:
@@ -399,10 +490,61 @@ class TrustTests(HomeCase):
         return [listed(event, self.keys[event], path=self.path, **updates.get(event, {}))
                 for event in hooks.EVENTS["codex"]]
 
-    def config(self, hooks_listed):
+    def config(self, hooks_listed, **faults):
         self.spec.write_text(json.dumps({"config_file": str(self.codex_home / "config.toml"),
-                                         "version": "sha256:" + "0" * 64, "hooks": hooks_listed + self.foreign}))
+                                         "version": "sha256:" + "0" * 64, "hooks": hooks_listed + self.foreign,
+                                         **faults}))
         self.log.write_text("")
+
+    def cli(self, *argv):
+        output = io.StringIO()
+        with redirect_stdout(output), redirect_stderr(io.StringIO()):
+            code = hooks.hooks_main(list(argv))
+        return code, json.loads(output.getvalue())
+
+    def test_each_write_phase_says_what_may_have_changed_and_what_to_check(self):
+        check = shlex.join([str(LAUNCHER), "hooks", "trust", "--json"])
+        status = shlex.join([str(LAUNCHER), "hooks", "status"])
+        revoke = shlex.join([str(LAUNCHER), "hooks", "trust", "--revoke"])
+        # Before the write: nothing reached Codex's configuration.
+        self.config(self.ours(), fail_list=True)
+        code, result = self.cli("trust", "--codex", str(self.codex), "--json")
+        self.assertEqual((1, "refused"), (code, result["state"]))
+        self.assertIn("before anything was written, so nothing was changed", result["message"])
+        cases = {
+            "drop_write_answer": ("uncertain", "sent", None,
+                                  "The trust write was sent to Codex, but its answer was lost (Codex ended or exceeded "
+                                  "its bound before answering config/batchWrite.), so it may or may not be recorded. "
+                                  "Before any retry, check with " + check + ": already_trusted means it was recorded, "
+                                  "planned means it was not. Undo a recorded write with " + revoke + "."),
+            "fail_after_write": ("applied_unverified", "acknowledged", True,
+                                 "Codex acknowledged the trust write (configuration version sha256:" + "1" * 64 + "), "
+                                 "but the check that followed failed (Codex ended or exceeded its bound before "
+                                 "answering hooks/list.). It is recorded unless something else changed it since; "
+                                 "confirm with " + status + " before any retry. Undo a recorded write with " + revoke + "."),
+            "reject_write": ("refused", "refused_by_codex", False,
+                             "Codex refused the trust write (Codex rejected config/batchWrite: Configuration was "
+                             "modified since last read.), so by its own report nothing was recorded. Check with "
+                             + check + " before trying again; it shows a fresh plan."),
+            "ignore_write": ("uncertain", "acknowledged", True,
+                             "Codex acknowledged the trust write, but its listing right after shows SessionStart: "
+                             "untrusted, UserPromptSubmit: untrusted, Stop: untrusted, SessionEnd: untrusted, "
+                             "Interrupt: untrusted. Something else may have changed these hooks meanwhile. Inspect "
+                             + status + " before any retry."),
+        }
+        for fault, (state, write, changed, message) in cases.items():
+            with self.subTest(fault):
+                self.config(self.ours())
+                plan = hooks.trust(self.codex)
+                self.config(self.ours(), **{fault: True})
+                code, result = self.cli("trust", "--codex", str(self.codex), "--yes",
+                                        "--expected-plan", plan["plan_sha256"], "--json")
+                self.assertEqual(1, code)
+                self.assertEqual((state, write, changed),
+                                 (result["state"], result["write"], result["changes_provider_settings"]))
+                self.assertEqual(message, result["message"])
+                self.assertNotIn("nothing was changed", result["message"])
+                self.assertEqual(1, self.requests().count("config/batchWrite"), "never retried automatically")
 
     def requests(self):
         return [json.loads(line)["method"] for line in self.log.read_text().splitlines()]
@@ -656,6 +798,11 @@ class CoverageTests(HomeCase):
                     "evidence": "codex_thread_index", "sessions": session, **extra}}}, {"codex": set()})
                 self.assertIn(": " + cause, report["messages"][0])
                 self.assertTrue(report["messages"][0].endswith("Fix: " + fix + "."), report["messages"][0])
+        unreadable = hooks.coverage_report({**base, "providers": {"codex": {
+            "evidence": "codex_thread_index", "sessions": session, "hooks": "unreadable"}}}, {"codex": set()})
+        self.assertTrue(unreadable["messages"][0].endswith(
+            ": Multithread could not read the Codex hook settings. Fix: " + str(LAUNCHER)
+            + " hooks status --client codex, which names the file and what to fix."), unreadable["messages"][0])
         covered = hooks.coverage_report({**base, "providers": {"codex": {
             "evidence": "codex_thread_index", "sessions": session, "hooks": "absent"}}}, {"codex": {"s1"}})
         self.assertEqual(("covered", []), (covered["state"], covered["messages"]))

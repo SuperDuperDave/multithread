@@ -117,14 +117,18 @@ def _read(path):
     """The file's bytes and strict JSON object, or (None, None) when absent."""
     try:
         info = os.lstat(path)
+        if stat.S_ISREG(info.st_mode) and info.st_size <= _MAX_FILE:
+            body = Path(path).read_bytes()
     except FileNotFoundError:
         return None, None
+    except OSError as exc:
+        raise HooksError(f"{path} could not be read ({exc.__class__.__name__}). Nothing was changed. Check that "
+                         "your account can read it, then run this again.") from None
     if stat.S_ISLNK(info.st_mode):
         raise HooksError(f"{path} is a symbolic link, and Multithread edits only a regular file. Add the "
                          "entries from `multithread hooks install --json` to the link's target yourself.")
     if not stat.S_ISREG(info.st_mode) or info.st_size > _MAX_FILE:
         raise HooksError(f"{path} is not a regular settings file within 1 MiB; inspect it before changing hooks.")
-    body = Path(path).read_bytes()
     try:
         value = json.loads(body.decode("utf-8"), object_pairs_hook=_unique)
     except (UnicodeError, ValueError, RecursionError):
@@ -311,50 +315,78 @@ def _plan(client, action, environ=None):
 
 
 def _write(plan):
-    """Replace the file with the planned bytes, keeping a private copy of the old ones."""
+    """Replace the file with the planned bytes, keeping a private copy of the old ones.
+
+    Returns (backup, durable). A failure before the atomic replacement leaves
+    the file as it was, removes any copy made on the way, and raises.
+    """
     path = Path(plan["file"])
     try:
         current = path.read_bytes() if os.path.lexists(path) else None
     except OSError:
         current = b""
     if _sha(current) != plan["before_sha256"]:
-        raise HooksError(f"{path} changed after the plan was made; nothing was written. Review the new plan.")
-    backup = None
-    mode = 0o600
-    if current is not None:
-        mode = stat.S_IMODE(os.stat(path).st_mode)
-        backup = path.with_name(path.name + ".multithread-" + time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
-                                + "-" + uuid.uuid4().hex[:8] + ".bak")
-        fd = os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-        with os.fdopen(fd, "wb") as stream:
-            stream.write(current)
-            stream.flush()
-            os.fsync(stream.fileno())
-    fd, temporary = tempfile.mkstemp(prefix="." + path.name + ".multithread-", dir=path.parent)
+        raise HooksError(f"{path} changed after the plan was made")
+    backup = temporary = None
     try:
+        mode = 0o600
+        if current is not None:
+            mode = stat.S_IMODE(os.stat(path).st_mode)
+            backup = path.with_name(path.name + ".multithread-" + time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+                                    + "-" + uuid.uuid4().hex[:8] + ".bak")
+            fd = os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(current)
+                stream.flush()
+                os.fsync(stream.fileno())
+        fd, temporary = tempfile.mkstemp(prefix="." + path.name + ".multithread-", dir=path.parent)
         with os.fdopen(fd, "wb") as stream:
             os.fchmod(stream.fileno(), mode)
             stream.write(plan["_body"])
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, path)
-    finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
-    directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        temporary = None
+    except BaseException:
+        for leftover in (temporary, backup):
+            if leftover is not None and os.path.lexists(leftover):
+                os.unlink(leftover)
+        raise
+    kept = None if backup is None else str(backup)
     try:
-        os.fsync(directory)
-    finally:
-        os.close(directory)
-    return None if backup is None else str(backup)
+        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    except OSError:
+        return kept, False
+    return kept, True
 
 
 def _public(plan):
     return {key: value for key, value in plan.items() if not key.startswith("_")}
 
 
+def _outcome_line(plan, action):
+    """One provider's outcome in a sentence."""
+    name = _NAMES[plan["client"]]
+    if plan["outcome"] == "applied":
+        done = "now has Multithread's hooks" if action == "install" else "no longer has Multithread's hooks"
+        return (f"{name}: {plan['file']} {done}"
+                + (f" (previous file kept at {plan['backup']})" if plan.get("backup") else "") + ".")
+    if plan["outcome"] == "not_written":
+        return f"{name}: {plan['file']} was not changed ({plan['reason']})."
+    return f"{name}: {plan['file']} was not changed (not attempted after that failure)."
+
+
 def change_files(action, clients, environ=None, *, expected=None):
-    """Plan, or with the reviewed plan's digest apply, install or remove."""
+    """Plan, or with the reviewed plan's digest apply, install or remove.
+
+    Files are replaced one at a time. When a later file fails after an earlier
+    one was replaced, the result is partly_applied and names each outcome and
+    kept copy; it never implies that nothing changed.
+    """
     plans = [_plan(client, action, environ) for client in clients]
     digest = _digest([[p["client"], p["file"], p["before_sha256"], p["after_sha256"]] for p in plans])
     result = {"schema": 1, "action": action, "plans": [_public(p) for p in plans], "plan_sha256": digest,
@@ -365,10 +397,38 @@ def change_files(action, clients, environ=None, *, expected=None):
     if expected != digest:
         raise HooksError("The hook files or the plan changed since it was shown; nothing was written. Review the "
                          "new plan: " + shlex.join(_launcher_command("hooks", action, "--json")))
+    failed = False
     for plan, public in zip(plans, result["plans"]):
-        if plan["changes"]:
-            public["backup"] = _write(plan)
-    result["state"] = "applied" if result["changes_provider_settings"] else "unchanged"
+        if not plan["changes"]:
+            public["outcome"] = "unchanged"
+        elif failed:
+            public["outcome"] = "not_attempted"
+        else:
+            try:
+                public["backup"], durable = _write(plan)
+                public["outcome"] = "applied"
+                if not durable:
+                    public["durability"] = "unconfirmed"
+            except (HooksError, OSError) as exc:
+                failed = True
+                public.update(outcome="not_written", reason=str(exc) if isinstance(exc, HooksError)
+                              else "it could not be written: " + exc.__class__.__name__)
+    applied = [public for public in result["plans"] if public["outcome"] == "applied"]
+    if not failed:
+        result["state"] = "applied" if applied else "unchanged"
+        return result
+    lines = " ".join(_outcome_line(public, action) for public in result["plans"] if public["outcome"] != "unchanged")
+    if not applied:
+        raise HooksError(lines + " Nothing was changed. Fix the cause, then review a new plan: "
+                         + shlex.join(_launcher_command("hooks", action, "--json")))
+    undo = "remove" if action == "install" else "install"
+    result.update(state="partly_applied", changes_provider_settings=True, message=(
+        lines + " Check with " + shlex.join(_launcher_command("hooks", "status")) + ". To finish, fix the cause "
+        "and review a new plan with " + shlex.join(_launcher_command("hooks", action, "--json"))
+        + ", which plans only what is still needed. To undo the part that was applied, review "
+        + " and ".join(shlex.join(_launcher_command("hooks", undo, "--client", public["client"], "--json"))
+                       for public in applied)
+        + ", or restore the kept copy."))
     return result
 
 
@@ -486,7 +546,17 @@ def trust(codex=None, environ=None, *, revoke=False, expected=None, timeout=20):
                          "install them first: " + shlex.join(_launcher_command("hooks", "install", "--client", "codex")))
     action = "revoke" if revoke else "trust"
     result = {"schema": 1, "client": "codex", "action": action, "hook_file": installed["file"],
-              "command": command("codex"), "changes_provider_settings": False}
+              "command": command("codex"), "changes_provider_settings": False, "write": "not_sent"}
+    try:
+        return _trust_session(executable, installed, result, revoke, expected, timeout)
+    except (ProtocolError, OSError, subprocess.SubprocessError) as exc:
+        if result["write"] == "not_sent":
+            raise  # Nothing reached Codex's configuration; the caller reports that.
+        return _after_write(result, exc)
+
+
+def _trust_session(executable, installed, result, revoke, expected, timeout):
+    action = result["action"]
     with tempfile.TemporaryDirectory(prefix="multithread-hooks-") as neutral:
         # A neutral directory has no project layer; user hooks list for any cwd.
         with codex_peer.AppServer([executable], neutral, timeout=timeout) as server:
@@ -533,9 +603,17 @@ def trust(codex=None, environ=None, *, revoke=False, expected=None, timeout=20):
                 raise HooksError("Codex's hooks or configuration changed since the plan was shown; nothing was "
                                  "written. Review the new plan: " + shlex.join(_launcher_command(
                                      "hooks", "trust", *(["--revoke"] if revoke else []), "--json")))
-            written = server.call("config/batchWrite", {"edits": edits, "expectedVersion": version,
-                                                        "reloadUserConfig": True})
-            result.update(changes_provider_settings=True, written_version=written.get("version"))
+            result["write"] = "sent"
+            try:
+                written = server.call("config/batchWrite", {"edits": edits, "expectedVersion": version,
+                                                            "reloadUserConfig": True})
+            except codex_peer.CodexRejected as exc:
+                check = shlex.join(_launcher_command("hooks", "trust", *(["--revoke"] if revoke else []), "--json"))
+                result.update(state="refused", write="refused_by_codex", message=(
+                    f"Codex refused the {action} write ({exc}), so by its own report nothing was recorded. "
+                    f"Check with {check} before trying again; it shows a fresh plan."))
+                return result
+            result.update(write="acknowledged", changes_provider_settings=True, written_version=written.get("version"))
             after = server.call("hooks/list", {"cwds": [neutral]})
     statuses = {hook.get("key"): hook.get("trustStatus")
                 for group in after.get("data", ()) if isinstance(group, dict)
@@ -549,10 +627,35 @@ def trust(codex=None, environ=None, *, revoke=False, expected=None, timeout=20):
         verified = all(item["status_after"] == "trusted" for item in result["hooks"])
     result["state"] = ("revoked" if revoke else "trusted") if verified else "uncertain"
     if not verified:
-        result["message"] = ("Codex accepted the write but its listing does not show the expected result; inspect "
-                             + shlex.join(_launcher_command("hooks", "status")) + " before retrying.")
+        unexpected = ", ".join(f"{item.get('event', item['key'])}: {item['status_after']}" for item in result["hooks"]
+                               if (item["status_after"] == "trusted") == revoke)
+        result["message"] = (f"Codex acknowledged the {result['action']} write, but its listing right after shows "
+                             f"{unexpected}. Something else may have changed these hooks meanwhile. Inspect "
+                             + shlex.join(_launcher_command("hooks", "status")) + " before any retry.")
     elif not revoke:
         result["revoke_command"] = shlex.join(_launcher_command("hooks", "trust", "--revoke"))
+    return result
+
+
+def _after_write(result, exc):
+    """Name what may have changed once a write reached Codex, and the read-back to run first."""
+    reason = (str(exc)[:300] or exc.__class__.__name__) if isinstance(exc, ProtocolError) else exc.__class__.__name__
+    status = shlex.join(_launcher_command("hooks", "status"))
+    revoke = result["action"] == "revoke"
+    check = shlex.join(_launcher_command("hooks", "trust", *(["--revoke"] if revoke else []), "--json"))
+    undo = ("" if revoke else " Undo a recorded write with "
+            + shlex.join(_launcher_command("hooks", "trust", "--revoke")) + ".")
+    if result["write"] == "sent":
+        result.update(state="uncertain", changes_provider_settings=None, message=(
+            f"The {result['action']} write was sent to Codex, but its answer was lost ({reason}), so it may or may "
+            f"not be recorded. Before any retry, check with {check}: "
+            + ("nothing_to_revoke means it was applied, planned means it was not." if revoke else
+               "already_trusted means it was recorded, planned means it was not.") + undo))
+    else:
+        result.update(state="applied_unverified", message=(
+            f"Codex acknowledged the {result['action']} write (configuration version "
+            f"{result.get('written_version') or 'not reported'}), but the check that followed failed ({reason}). "
+            f"It is recorded unless something else changed it since; confirm with {status} before any retry." + undo))
     return result
 
 
@@ -577,7 +680,13 @@ def status(clients=("codex", "claude"), environ=None, *, codex=None, listing=Tru
         try:
             entry = inspect(client, environ)
         except HooksError as exc:
-            entry = {"client": client, "state": "unreadable", "message": str(exc)}
+            # A readiness check cannot vouch for a file it could not read.
+            entry = {"client": client, "state": "unreadable", "file": str(hook_file(client, environ)),
+                     "message": str(exc)}
+            result["next_actions"].append({
+                "client": client, "action": "Multithread could not read " + entry["file"] + ", so it cannot tell "
+                "whether " + _NAMES[client] + " sessions reach their ledger, and it changed nothing. " + str(exc),
+                "command": _launcher_command("hooks", "status", "--client", client)})
         result["providers"][client] = entry
         if entry["state"] in ("absent", "incomplete", "needs_repair"):
             result["next_actions"].append({
@@ -736,6 +845,9 @@ def coverage_report(evidence, observed):
             install = shlex.join([launcher, "hooks", "install", "--client", client])
             if entry.get("hooks") in ("absent", "provider_not_found"):
                 cause, fix = f"Multithread's user-level {_NAMES[client]} hooks aren't installed", install
+            elif entry.get("hooks") == "unreadable":
+                cause = f"Multithread could not read the {_NAMES[client]} hook settings"
+                fix = shlex.join([launcher, "hooks", "status", "--client", client]) + ", which names the file and what to fix"
             elif entry.get("hooks") != "installed":
                 cause, fix = f"Multithread's user-level {_NAMES[client]} hooks are {_condition(str(entry.get('hooks')))}", install
             elif client == "codex" and entry.get("trust") != "trusted":
@@ -782,6 +894,8 @@ def _display_plan(result):
         for moved in plan["moved_hooks"]:
             print(f"  Another hook for {moved['event']} moves from {moved['from']} to {moved['to']}"
                   + ("; Codex will ask you to review it again." if plan["client"] == "codex" else "."))
+        if plan.get("outcome") in ("not_written", "not_attempted"):
+            print("  Not changed: " + plan.get("reason", "not attempted after the failure above") + ".")
         if plan["reformatted"]:
             print("  The file's layout is normalized; everything else in it stays the same.")
         if plan.get("backup"):
@@ -900,15 +1014,17 @@ def hooks_main(argv=None):
                                         "already_trusted", "nothing_to_revoke") else 1
     except (HooksError, ProtocolError, OSError, subprocess.SubprocessError) as exc:
         message = str(exc) if isinstance(exc, HooksError) else (
-            "Codex could not answer (" + (str(exc)[:300] or exc.__class__.__name__) + "); nothing was changed. "
-            "Check that Codex starts in a terminal, then run this again." if isinstance(exc, (ProtocolError, subprocess.SubprocessError))
-            else "A settings file or Codex could not be reached (" + exc.__class__.__name__ + "); check the named "
-            "paths, then run this again.")
+            "Codex could not answer (" + (str(exc)[:300] or exc.__class__.__name__) + ") before anything was "
+            "written, so nothing was changed. Check that codex starts in a terminal, then run this again."
+            if isinstance(exc, (ProtocolError, subprocess.SubprocessError)) else
+            "A settings file or Codex could not be reached (" + exc.__class__.__name__ + ") before anything was "
+            "written, so nothing was changed. Check the paths named above, then run this again.")
         if args.json:
             print(json.dumps({"schema": 1, "state": "refused", "message": message}, ensure_ascii=False))
         else:
             print("multithread hooks: " + message, file=sys.stderr)
         return 1
     except (KeyboardInterrupt, EOFError):
-        print("multithread hooks: interrupted; run the same command with --json to see the current state.", file=sys.stderr)
+        print("multithread hooks: interrupted. A change that was being written may have happened; check with "
+              + shlex.join(_launcher_command("hooks", "status")) + " before running this again.", file=sys.stderr)
         return 130

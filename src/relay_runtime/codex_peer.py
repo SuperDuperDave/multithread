@@ -140,6 +140,10 @@ def hook_remedy(readiness, repo, expected_hook, user_file=None):
     return "Codex hooks are not ready (" + detail + ")", action
 
 
+class CodexRejected(_ProtocolError):
+    """Codex answered the request with an error: it refused, rather than went silent."""
+
+
 class AppServer:
     """One owned stdio app server for configuration questions: no thread or turn.
 
@@ -197,7 +201,7 @@ class AppServer:
                         return message["result"]
                     error = message.get("error")
                     detail = error.get("message") if isinstance(error, dict) else None
-                    raise _ProtocolError("Codex rejected " + method + (
+                    raise CodexRejected("Codex rejected " + method + (
                         ": " + detail[:500] if isinstance(detail, str) and detail.isprintable() else "."))
                 remaining = self.deadline - time.monotonic()
                 if remaining <= 0:
