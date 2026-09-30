@@ -139,15 +139,17 @@ mutating SQL.
 Every failure returns exit zero, so the provider session continues, with a
 generic diagnostic on stderr. In a checkout that was never enrolled, that is
 all: no context, no notice. In an enrolled checkout, a SessionStart or
-UserPromptSubmit hook that could not reach its ledger (malformed input,
-unverifiable enrollment, an unavailable runtime, or a ledger that refused or
-failed) returns one visible warning instead of context:
+UserPromptSubmit hook that could not deliver verified ledger context
+(malformed input, unverifiable enrollment, an unavailable runtime, or a ledger
+that refused or failed) returns one visible warning instead of context:
 
 ```text
-MULTITHREAD WARNING: this checkout is enrolled, but Multithread's SessionStart hook could not reach its ledger (REASON), so this session is not being recorded and no brief was read. Tell the person; the fix starts with: /ABSOLUTE/ACCOUNT/HOME/.local/bin/multithread setup --repo /ABSOLUTE/CHECKOUT --check
+MULTITHREAD WARNING: this checkout is enrolled, but Multithread's SessionStart hook could not deliver verified ledger context this time (REASON). This session's Multithread record may be incomplete, and this step shows no brief. Tell the person; the fix starts with: /ABSOLUTE/ACCOUNT/HOME/.local/bin/multithread setup --repo /ABSOLUTE/CHECKOUT --check
 ```
 
-It also carries a `systemMessage` for the person. REASON is one of: the
+One failed invocation shows only that this step's context is missing: the
+startup event may already be saved, and later steps may succeed. The warning
+also carries a `systemMessage` for the person. REASON is one of: the
 provider's hook input could not be used; its enrollment could not be verified;
 the installed runtime could not run its ledger worker; the ledger refused or
 could not complete this step. "Enrolled" means positive evidence: the Git
@@ -457,7 +459,14 @@ app server: `config/batchWrite` with one `hooks.state` edit, merge strategy
 each hook's `key`, `currentHash`, `source`, `sourcePath` and `trustStatus`;
 `config/read` with `includeLayers` reports the user layer's version, which
 `config/batchWrite` accepts as `expectedVersion` and refuses when stale; a
-`null` value on `hooks.state."KEY".trusted_hash` removes the record.
+`null` value on `hooks.state."KEY".trusted_hash` removes the record. Codex
+raises `configVersionConflict`, `configValidationError`, `configLayerReadonly`
+and `configRequirementReadonly` (in the error's `data.config_write_error_code`)
+before it persists anything; any other error, such as `userLayerNotFound`,
+which it raises while building the response after persisting, or an internal
+error without a code, can follow a completed write. `hooks trust` reports only
+the first group as refused with nothing recorded, and everything else as
+`uncertain`.
 
 Against Codex 0.159.2 in a disposable `CODEX_HOME`, with no model request or
 thread: the hash derived independently matched `currentHash` for all five

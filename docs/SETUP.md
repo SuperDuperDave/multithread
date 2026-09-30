@@ -210,7 +210,7 @@ set), then asks you to type `install`. It appends one handler for each
 lifecycle event after any existing hooks, so every other hook keeps its place
 and Codex keeps trusting it. It never edits, reorders or removes another hook,
 reports the ones it leaves in place, and keeps a private copy of each file it
-changes beside it. An agent first runs `hooks install --json` to show you the
+changes beside it for recovery. An agent first runs `hooks install --json` to show you the
 plan, then applies exactly that plan with `--yes --expected-plan
 <plan_sha256>`; a file that changed in between refuses. Files change one at a
 time: if the second fails after the first changed, the result is
@@ -249,13 +249,31 @@ trusting. Claude Code normally picks up hook changes in a running session.
 With user-level hooks installed, `launch` and peer calls add no invocation copy,
 so each event runs once; a partial or altered installation makes them refuse
 and name the fix. To take the hooks out, run `hooks trust --revoke` (Codex),
-then `hooks remove`.
+then `hooks remove`. Prefer these fresh, guarded plans to restoring a kept copy:
+a copy also erases anything written to the file since.
+
+To retire another tool's hooks that you no longer want, for example an older
+lifecycle dispatcher, name each exact command with `--command`, first for its
+Codex trust records and then for the hooks themselves:
+
+```sh
+~/.local/bin/multithread hooks trust --revoke --command 'EXACT COMMAND' --json
+~/.local/bin/multithread hooks remove --client codex --command 'EXACT COMMAND' --json
+```
+
+Each shows its plan: the trust records Codex lists for exactly that command
+(the whole record is removed only when trust is all it holds), and the handlers
+it takes out with every other hook left in place and any that move named.
+Apply each with `--yes --expected-plan`. Do this before `hooks install`, so the
+positions Codex keys trust to are settled first.
 
 ### When a session cannot reach its ledger
 
-In an enrolled checkout, a hook that cannot reach its ledger says so. The agent
-receives one `MULTITHREAD WARNING` line with the reason and the fix, to tell
-you, and you see a short notice. A repository nobody enrolled stays silent.
+In an enrolled checkout, a hook that cannot deliver verified ledger context
+says so. The agent receives one `MULTITHREAD WARNING` line with the reason and
+the fix, to tell you, and you see a short notice: this step has no brief, and
+the session's record may be incomplete. A repository nobody enrolled stays
+silent.
 
 `doctor` also looks for silence. It compares the Codex and Claude sessions that
 worked in this repository and its worktrees in the last 24 hours with the
