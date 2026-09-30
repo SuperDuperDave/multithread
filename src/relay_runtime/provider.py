@@ -269,6 +269,7 @@ def _native_identity(value):
 _CLAUDE_EFFORTS = ("low", "medium", "high", "xhigh", "max")
 # Report only a short lowercase effort word; Codex models advertise their own.
 _REPORTED_EFFORT = re.compile(r"[a-z]{1,16}")
+_SETTINGS_CHECKS = ("verified", "refused", "model_unlisted", "inherited_unknown", "unavailable")
 
 
 def _setting(value, kind):
@@ -1070,6 +1071,10 @@ def _report_projection(record):
                               and model_observation.get("relation") in
                               ("same_literal", "different_name_unverified", "prior_init_only",
                                "not_requested", "unknown") else "unknown")
+    # The pre-turn Codex check's outcome only; its model and effort names stay private.
+    check = record.get("settings_check")
+    call["settings_check"] = ("not_recorded" if "settings_check" not in record else check["status"]
+                              if isinstance(check, dict) and check.get("status") in _SETTINGS_CHECKS else "invalid")
     call["caller_stop_reason"] = _caller_stop_reason(record)
     call["elapsed_seconds"] = _report_number(record, "elapsed_seconds")
     call["process_exit_code"] = _report_number(record, "process_exit_code", integer=True, minimum=-(2**31))
@@ -1327,6 +1332,8 @@ def report_main(argv=None):
             if call["model_relation"] != "unknown":
                 print("Model observation: " + call["model_relation"]
                       + " (name comparison only; aliases may resolve to another name).")
+            if call["settings_check"] != "not_recorded":
+                print("Settings check before the turn: " + call["settings_check"] + " (names omitted).")
             print("Recorded task submission: " + call["task_submission"])
             print("Recorded producer runtime identity: " + call["producer_runtime_identity"] + " (digest omitted)")
             print("Needs attention: " + ("yes" if call["needs_attention"] else "no"))

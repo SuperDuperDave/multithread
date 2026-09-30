@@ -22,7 +22,7 @@ from relay_runtime import peer_control, provider
 CANARY = "ARTIFICIAL-PRIVATE-REPORT-CANARY"
 CALL_FIELDS = {
     "provider", "provider_version", "requested_effort", "effort_relation", "model_relation",
-    "state", "provider_started", "needs_attention", "process_exit_code",
+    "settings_check", "state", "provider_started", "needs_attention", "process_exit_code",
     "elapsed_seconds", "provider_turns", "provider_duration_ms", "estimated_cost_usd",
     "actual_billed_cost", "permission_denial_count", "provider_error_count",
     "session_identity", "stdout_observation", "faults", "unavailable_stage",
@@ -36,6 +36,25 @@ UNCHECKED = ("hook_delivery", "provider_tools", "relay_acknowledgement", "workfl
 
 
 class PeerReportTests(unittest.TestCase):
+    def test_settings_check_reports_only_its_status(self):
+        names = {"model": CANARY, "model_source": CANARY, "effort": CANARY, "effort_source": CANARY,
+                 "advertised_efforts": [CANARY]}
+        cases = [({}, "not_recorded")]
+        cases += [({"settings_check": {**names, "status": status}}, status)
+                  for status in ("verified", "refused", "model_unlisted", "inherited_unknown", "unavailable")]
+        cases += [({"settings_check": value}, "invalid")
+                  for value in (None, [], CANARY, names, {**names, "status": CANARY}, {"status": ["verified"]})]
+        for client in ("codex", "claude"):
+            for changes, status in cases:
+                with self.subTest(client=client, status=status, changes=changes):
+                    call = self.reported(provider=client, **changes)
+                    self.assertEqual(status, call["settings_check"])
+                    _, output = self.invoke(structured=False)
+                    if status == "not_recorded":
+                        self.assertNotIn("Settings check", output)
+                    else:
+                        self.assertIn("Settings check before the turn: " + status + " (names omitted).", output)
+
     def test_provider_version_is_attributed_and_selected_in_both_formats(self):
         for client, source in (("codex", "codex_initialize_user_agent"), ("claude", "claude_system_init")):
             with self.subTest(client=client):
