@@ -448,7 +448,7 @@ a subscription-preserving isolation shortcut.
 Codex 0.159.2 records hook trust in the user `config.toml` as
 `[hooks.state."KEY"] trusted_hash = "HASH"`. KEY is the declaring file, event
 label, matcher-group index and handler index, for example
-`/ABSOLUTE/HOME/.codex/hooks.json:session_start:1:0`. HASH is `sha256:` over
+`/ABSOLUTE/ACCOUNT/HOME/.codex/hooks.json:session_start:1:0`. HASH is `sha256:` over
 compact, key-sorted JSON of the event label and a matcher group holding only
 that handler as Codex normalized it (type, command, timeout, async, and any
 matcher, status message or context limit); the declaring file and position are

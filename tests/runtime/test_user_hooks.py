@@ -23,17 +23,17 @@ sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from relay_runtime import codex_peer, hooks, provider
 
-LAUNCHER = Path("/home/fixture/.local/bin/multithread")
-CODEX_COMMAND = "/home/fixture/.local/bin/multithread provider-hook --client codex"
-CLAUDE_COMMAND = '/home/fixture/.local/bin/multithread --repo "$CLAUDE_PROJECT_DIR" provider-hook --client claude'
+LAUNCHER = Path("/synthetic/account/.local/bin/multithread")
+CODEX_COMMAND = "/synthetic/account/.local/bin/multithread provider-hook --client codex"
+CLAUDE_COMMAND = '/synthetic/account/.local/bin/multithread --repo "$CLAUDE_PROJECT_DIR" provider-hook --client claude'
 # currentHash that Codex 0.159.2's own hooks/list reported for CODEX_COMMAND,
 # observed in a disposable CODEX_HOME. The derivation here must reproduce it.
 NATIVE_HASHES = {
-    "SessionStart": "sha256:3aef92f5b034e63a1aff9d3d7e51ddcc50146684680d03f412330e2cc2dfced2",
-    "SessionEnd": "sha256:b36882c47399aafe66cd1848067f986fe2fa12cb4420cf06185d6fcde23f4b47",
-    "UserPromptSubmit": "sha256:4b24b9f9e605f79133f4345bfa540d540952a5cf166a57719d4871dd5b96b9b6",
-    "Stop": "sha256:bd68ef73b3e588c6ae2733720d156774dfcad9260eca9e141cf92ce58501002d",
-    "Interrupt": "sha256:76c2ccc10a289e9917897d14ddd848e8dc8fc8acfcd8ac8e4e77cf9d046fd12d",
+    "SessionStart": "sha256:5379e65f63592aeaca88bd027f6d246d6a56aaffe2d37c1f9a541239fd2f1cc1",
+    "SessionEnd": "sha256:ee88381341fa8dc5bd1538625189d80205f2ac3283404fe7e78090b69fa7f642",
+    "UserPromptSubmit": "sha256:807c0a2aa9754e4d85e9c03593030dd5b3c25b805154fb0bddffce640b8a449f",
+    "Stop": "sha256:3764dbec9a925010b1b2b4ef5f9e7697669a2c7496261c9ea3464c84c9b77cc4",
+    "Interrupt": "sha256:6d8979f070262055db3797a69be3f167350dba50e5b609a74f16e1452a223666",
 }
 FOREIGN = {  # Someone else's hooks, shaped like an existing dispatcher: never ours to edit.
     "description": "Another tool's user-level hooks.",
@@ -211,7 +211,7 @@ class FileTests(HomeCase):
 
     def test_older_multithread_hook_is_replaced_in_place(self):
         older = {"hooks": {**FOREIGN["hooks"], "Stop": FOREIGN["hooks"]["Stop"] + [{"hooks": [
-            {"type": "command", "command": "/home/fixture/.local/bin/relay --repo /alpha provider-hook --client codex",
+            {"type": "command", "command": "/synthetic/account/.local/bin/relay --repo /alpha provider-hook --client codex",
              "timeout": 3}]}]}}
         self.write("codex", older)
         state = hooks.inspect("codex")
@@ -640,7 +640,7 @@ class TrustTests(HomeCase):
     def test_any_difference_from_what_multithread_installed_refuses_everything(self):
         stop = self.keys["Stop"]
         cases = {
-            "command": ({"Stop": {"command": "/home/fixture/.local/bin/multithread provider-hook --client  codex"}},
+            "command": ({"Stop": {"command": "/synthetic/account/.local/bin/multithread provider-hook --client  codex"}},
                         "differs from the one Multithread installed"),
             "hash": ({"Stop": {"currentHash": "sha256:" + "a" * 64}}, "Codex's hash differs"),
             "source": ({"Stop": {"source": "project"}}, "does not come from"),

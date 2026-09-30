@@ -155,6 +155,24 @@
       "reason": "public-example"
     },
     {
+      "path": "docs/PROVIDERS.md",
+      "rule": "personal-home-path",
+      "line_sha256": "35b629dc1a63da80212dca2f25c980184bc14b30a2ec17a32b761c6f39d4688b",
+      "reason": "public-example"
+    },
+    {
+      "path": "docs/PROVIDERS.md",
+      "rule": "personal-home-path",
+      "line_sha256": "b304ccfe54b8be1522ef4da77c828f5a6f9f88a4dcd47b574e0c216005e699d6",
+      "reason": "public-example"
+    },
+    {
+      "path": "docs/PROVIDERS.md",
+      "rule": "personal-home-path",
+      "line_sha256": "45ad12a5ecade9b8690e1284fa941cb75bb3e8e7a8a23696c97b364ddc986042",
+      "reason": "public-example"
+    },
+    {
       "path": "examples/demo_scenario.py",
       "rule": "email-address",
       "line_sha256": "f15e2e5822da5fb32f6edf40046c1d33c07bcf6e69b62aaceba7cddcdec92d13",
@@ -290,6 +308,12 @@
       "path": "tests/runtime/test_public_peer.py",
       "rule": "email-address",
       "line_sha256": "5f2dacbb7f784f0cb2a5cc51aae1e6fbbc97e5be7f49cb36ccaac41011a08bf0",
+      "reason": "synthetic-test-fixture"
+    },
+    {
+      "path": "tests/runtime/test_user_hooks.py",
+      "rule": "email-address",
+      "line_sha256": "0457bbb85667d58642421bfff0d63fb261b8f49658eaf61732fc68b2aa96e254",
       "reason": "synthetic-test-fixture"
     }
   ]
