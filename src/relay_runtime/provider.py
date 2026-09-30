@@ -14,6 +14,7 @@ import math
 import os
 from pathlib import Path
 import platform
+import re
 import selectors
 import shlex
 import shutil
@@ -27,7 +28,8 @@ import tomllib
 import uuid
 from . import account_launcher, hook_argv, hooks as user_hooks
 from .native_io import (USAGE_SCOPES, MODEL_USAGE_SCOPES, COST_SCOPES,
-                        claude_measurements, measurement_scope, canonical_provider_version)
+                        claude_measurements, measurement_scope, canonical_provider_version,
+                        identity as _identity, setting_relation)
 
 
 class LaunchError(Exception):
@@ -285,11 +287,25 @@ def _native_identity(value):
     return value
 
 
-def _model_selection(value):
+_CLAUDE_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+# Report only a short lowercase effort word; Codex models advertise their own.
+_REPORTED_EFFORT = re.compile(r"[a-z]{1,16}")
+_SETTINGS_CHECKS = ("verified", "refused", "model_unlisted", "inherited_unknown", "unavailable")
+
+
+def _setting(value, kind):
     if (not isinstance(value, str) or not 0 < len(value) <= 128 or value.startswith("-") or any(
             ord(character) < 33 or ord(character) > 126 for character in value)):
-        raise argparse.ArgumentTypeError("use a nonempty printable model name without spaces (at most 128 characters)")
+        raise argparse.ArgumentTypeError(f"use a nonempty printable {kind} without spaces (at most 128 characters)")
     return value
+
+
+def _model_selection(value):
+    return _setting(value, "model name")
+
+
+def _effort_selection(value):
+    return _setting(value, "effort name")
 
 
 def _positive(value):
@@ -692,9 +708,10 @@ def peer_main(argv=None, *, report_entry=None):
     parser.add_argument("--output-dir", type=Path, help="new private evidence directory; default: retained temporary directory")
     parser.add_argument("--timeout", type=_positive, default=600, help="call wall-time limit in seconds, 1 through 3600 (default: 600)")
     parser.add_argument("--max-turns", type=_positive, help="optional Claude agentic-turn cap, 1 through 3600; tool/source work can consume it before the final answer; no cap by default")
-    parser.add_argument("--model", type=_model_selection, help="request this Claude model for this call; the provider decides what it actually uses")
-    parser.add_argument("--effort", choices=("low", "medium", "high", "xhigh", "max"),
-                        help="request this Claude effort level for this call; effective effort is not verified")
+    parser.add_argument("--model", type=_model_selection, help="request this model for this call; the provider decides what it actually uses")
+    parser.add_argument("--effort", type=_effort_selection,
+                        help="request this effort for this call: Claude accepts " + ", ".join(_CLAUDE_EFFORTS)
+                        + "; Codex accepts an effort its model advertises. The provider decides what it actually uses")
     parser.add_argument("--live-input", action="store_true", help="enable Claude session input while this call runs; queued input may start later turns within the call timeout. Codex always exposes exact-turn input")
     parser.add_argument("--stream-progress", action="store_true", help="use Claude's native event stream for content-free progress observations, without enabling live input; the default remains final JSON")
     parser.add_argument("--dry-run", action="store_true", help="validate task/configuration and print a plan; no provider or evidence writes")
@@ -703,8 +720,8 @@ def peer_main(argv=None, *, report_entry=None):
     args.report_entry = report_entry
     if args.client == "codex" and args.max_turns is not None:
         parser.error("--max-turns is a Claude option; Codex returns one native turn with its normal tool loop")
-    if args.client == "codex" and (args.model is not None or args.effort is not None):
-        parser.error("--model and --effort are Claude options in this peer release")
+    if args.client == "claude" and args.effort is not None and args.effort not in _CLAUDE_EFFORTS:
+        parser.error("argument --effort: Claude accepts " + ", ".join(_CLAUDE_EFFORTS))
     if args.client == "codex" and args.stream_progress:
         parser.error("Codex already uses native streaming; --stream-progress is a Claude option")
     if args.client == "claude" and args.resume is not None:
@@ -1064,14 +1081,22 @@ def _report_projection(record):
         raise ValueError()
     call = {key: record[key] for key in ("provider", "state", "provider_started", "needs_attention")}
     call["provider_version"] = _report_provider_version(record)
-    requested_effort = record.get("requested_effort")
-    call["requested_effort"] = (requested_effort if requested_effort in
-                                ("low", "medium", "high", "xhigh", "max") else None)
+    requested_effort, effective_effort = record.get("requested_effort"), record.get("effective_effort")
+    call["requested_effort"] = (requested_effort if isinstance(requested_effort, str)
+                                and _REPORTED_EFFORT.fullmatch(requested_effort) else None)
+    # Compare the provider-reported effort with the request without disclosing it.
+    call["effort_relation"] = (setting_relation(requested_effort, effective_effort)
+                               if _identity(effective_effort) and effective_effort != "unknown"
+                               and (requested_effort is None or _identity(requested_effort)) else "unknown")
     model_observation = record.get("model_observation")
     call["model_relation"] = (model_observation.get("relation") if isinstance(model_observation, dict)
                               and model_observation.get("relation") in
                               ("same_literal", "different_name_unverified", "prior_init_only",
                                "not_requested", "unknown") else "unknown")
+    # The pre-turn Codex check's outcome only; its model and effort names stay private.
+    check = record.get("settings_check")
+    call["settings_check"] = ("not_recorded" if "settings_check" not in record else check["status"]
+                              if isinstance(check, dict) and check.get("status") in _SETTINGS_CHECKS else "invalid")
     call["caller_stop_reason"] = _caller_stop_reason(record)
     call["elapsed_seconds"] = _report_number(record, "elapsed_seconds")
     call["process_exit_code"] = _report_number(record, "process_exit_code", integer=True, minimum=-(2**31))
@@ -1320,12 +1345,17 @@ def report_main(argv=None):
             print("Recorded provider version: " + (
                 version["version"] + " (provider-reported; " + version["source"] + ")"
                 if version["status"] == "reported" else "unknown (" + version["status"] + ")"))
-            if call["provider"] == "claude" and call["requested_effort"] is not None:
+            if call["requested_effort"] is not None:
                 print("Requested effort: " + call["requested_effort"]
-                      + "; effective effort unknown.")
-            if call["provider"] == "claude" and call["model_relation"] != "unknown":
+                      + ("; effective effort unknown." if call["effort_relation"] == "unknown" else ""))
+            if call["effort_relation"] != "unknown":
+                print("Effort observation: " + call["effort_relation"]
+                      + " (provider-reported; name comparison only).")
+            if call["model_relation"] != "unknown":
                 print("Model observation: " + call["model_relation"]
                       + " (name comparison only; aliases may resolve to another name).")
+            if call["settings_check"] != "not_recorded":
+                print("Settings check before the turn: " + call["settings_check"] + " (names omitted).")
             print("Recorded task submission: " + call["task_submission"])
             print("Recorded producer runtime identity: " + call["producer_runtime_identity"] + " (digest omitted)")
             print("Needs attention: " + ("yes" if call["needs_attention"] else "no"))
