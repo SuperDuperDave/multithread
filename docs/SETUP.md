@@ -192,6 +192,28 @@ repository setup unresolved. After a timeout or uncertain enrollment result,
 run the printed read-only check before deciding whether to retry. Keep local
 diagnostics private and sanitize anything shared.
 
+### Folder permissions
+
+Enrollment refuses a checkout when another user could change a directory it
+relies on: the checkout and each folder above it, its Git directory (for a
+linked worktree, also the shared `.git/worktrees` entries) and Multithread's own
+state. None of them may allow group or other write, and Multithread's private
+state and account folders allow no group or other access at all. A umask of
+002, which Ubuntu gives login sessions of accounts with their own group, creates
+directories with group write, so a fresh clone can be refused. The refusal lists
+every such directory at once, each with a `chmod` that changes only that
+directory:
+
+```text
+multithread: enrollment directory permissions are unsafe: other users could change 2 directories this checkout's enrollment relies on, so Multithread refuses it. Run each command below (it changes only the directory it names), then check again:
+  chmod g-w,o-w /work/app   (observed mode 0775; group/other write access is not allowed)
+  chmod g-w,o-w /work/app/.git   (observed mode 0775; group/other write access is not allowed)
+A umask of 002 creates directories with group write, so a fresh clone can start this way.
+```
+
+Run the listed commands, then check or enroll again. Nothing was written before
+the refusal. A clone made under `umask 022` starts without group write.
+
 ## Connect every session
 
 Hooks connect a Codex or Claude session to its checkout's ledger: the session

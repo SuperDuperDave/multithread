@@ -25,7 +25,7 @@ from relay_core.protocol import RelayError, StateError, ValidationError, _identi
 from relay_core.store import RelayStore, _bind_installed_access
 from .admission import Admission
 from .confinement import ConfinementError, abi_version
-from .enrollment import Registry, EnrollmentError
+from .enrollment import Registry, EnrollmentError, UnsafeDirectory, permission_refusal
 from . import account_launcher, hook_argv
 
 _MAX_OUTPUT = 16 * 1024 * 1024
@@ -431,6 +431,14 @@ def _run_worker(access, args, argv):
         return code if code >= 0 else 1
 
 
+def _complete_refusal(refused, args, registry):
+    """Name every unsafe directory and its fix at once; the first refusal stands if that fails."""
+    try:
+        return permission_refusal(args.repo or os.getcwd(), (registry or Registry.for_account()).root, refused)
+    except (OSError, EnrollmentError):
+        return refused
+
+
 def main(argv=None, *, registry=None, command_alias_check=None):
     raw = list(argv if argv is not None else sys.argv[1:])
     if "--json" in raw:
@@ -530,6 +538,8 @@ def main(argv=None, *, registry=None, command_alias_check=None):
                               if isinstance(exc, EnrollmentError) else "runtime"
                               if isinstance(exc, ConfinementError) else "ledger", registry=registry)
             return 0
+        if isinstance(exc, UnsafeDirectory):
+            exc = _complete_refusal(exc, args, registry)
         message = str(exc) if isinstance(exc, (RelayError, EnrollmentError, ConfinementError)) else "installed state is unavailable"
         print(f"multithread: {message}", file=sys.stderr)
         return exc.exit_code if isinstance(exc, RelayError) else 1

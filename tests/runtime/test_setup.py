@@ -175,6 +175,17 @@ class SetupTests(unittest.TestCase):
         self.assertEqual(1, sum(command[-1] == "init" for command in self.commands))
         self.assertIn("--check", result["next_actions"][-1]["command"])
 
+    def test_identical_refusals_from_enrollment_and_its_check_are_shown_once(self):
+        refusal = b"multithread: enrollment directory permissions are unsafe: ...\n  chmod g-w,o-w /fixture\n"
+        self.responses["init"] = self.responses["doctor"] = (1, b"", refusal)
+        code, result = self.invoke("--apply")
+        self.assertEqual(1, code)
+        self.assertEqual(refusal.decode(), result["repository"]["enrollment"]["stderr"])
+        self.assertEqual(refusal.decode(), result["repository"]["doctor"]["stderr"])
+        diagnostics = [line for line in self.display(result).splitlines() if line.startswith("Diagnostic: ")]
+        self.assertEqual(["Diagnostic: multithread: enrollment directory permissions are unsafe: ...",
+                          "Diagnostic:   chmod g-w,o-w /fixture"], diagnostics)
+
     def test_nonzero_exit_does_not_claim_a_specific_refusal_cause(self):
         for exit_code, diagnostic in ((1, b"synthetic partial initialization\n"),
                                       (2, b"synthetic malformed request\n"),

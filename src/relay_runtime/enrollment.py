@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 import pwd
 import re
+import shlex
 import stat
 import subprocess
 from typing import Any
@@ -23,6 +24,27 @@ import uuid
 
 class EnrollmentError(RuntimeError):
     """Enrollment is unavailable or ambiguous; do not access a ledger."""
+
+
+_REQUIREMENTS = {False: "group/other write access is not allowed",
+                 True: "group/other access is not allowed for a private directory"}
+
+
+class UnsafeDirectory(EnrollmentError):
+    """A directory enrollment relies on, whose mode would let other users change it."""
+
+    def __init__(self, path: Path, mode: int, private: bool):
+        super().__init__("enrollment directory permissions are unsafe at "
+                         f"{json.dumps(str(path), ensure_ascii=True)} "
+                         f"(observed mode {mode:04o}); {_REQUIREMENTS[private]}")
+        self.path, self.mode, self.private = path, mode, private
+
+
+def command_text(argv: list[str]) -> str:
+    """A command to paste, or JSON when an argument could disturb the terminal."""
+    if all(argument.isprintable() for argument in argv):
+        return shlex.join(argv)
+    return json.dumps(argv, ensure_ascii=True) + " (JSON argument list)"
 
 
 _GIT = "/usr/bin/git"
@@ -96,6 +118,94 @@ def _absolute(path: str | os.PathLike[str]) -> Path:
     return Path(os.path.abspath(result))
 
 
+def _unsafe_mode(path: Path, info: os.stat_result, private: bool) -> bool:
+    """The one mode rule: no group/other write, and no group/other access when private.
+
+    Root's sticky /tmp and /var/tmp are allowed as ancestors of a shared directory.
+    """
+    system_temporary = (path in (Path("/tmp"), Path("/var/tmp"))
+                        and info.st_uid == 0 and info.st_mode & stat.S_ISVTX)
+    return (bool(stat.S_IMODE(info.st_mode) & (0o077 if private else 0o022))
+            and not (system_temporary and not private))
+
+
+def _linked_git_directory(checkout: Path) -> Path | None:
+    """A linked worktree's Git directory as its .git file names it, or None."""
+    try:
+        fd = os.open(checkout / ".git", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError:
+        return None
+    try:
+        body = os.read(fd, _MAX_JSON + 1) if stat.S_ISREG(os.fstat(fd).st_mode) else b""
+    finally:
+        os.close(fd)
+    line = os.fsdecode(body).rstrip("\n")
+    if len(body) > _MAX_JSON or not line.startswith("gitdir: "):
+        return None
+    target = Path(line[len("gitdir: "):])
+    return Path(os.path.normpath(target if target.is_absolute() else checkout / target))
+
+
+def unsafe_directories(repo: str | os.PathLike[str], registry_root: Path) -> list[tuple[Path, int, bool]]:
+    """Every existing directory enrollment would refuse for its mode, in checking order.
+
+    A diagnostic, so one refusal can name every fix. It follows no symlink,
+    writes, runs and decides nothing: enrollment still validates each directory
+    it holds. The one file it reads is a linked worktree's .git pointer, which
+    names the Git directories enrollment checks next.
+    """
+    requested = Path(os.path.normpath(Path.cwd() / repo))
+    root = next((path for path in (requested, *requested.parents) if os.path.lexists(path / ".git")), None)
+    targets, private = [requested], {registry_root}
+    if root is not None:
+        main = stat.S_ISDIR(os.lstat(root / ".git").st_mode)
+        git_dir = root / ".git" if main else _linked_git_directory(root)
+        common = (git_dir if main else git_dir.parent.parent
+                  if git_dir is not None and git_dir.parent.name == "worktrees" else None)
+        targets += [path for path in (root, git_dir, common) if path is not None]
+        if common is not None:
+            targets.append(common.parent / ".relay")
+            private.add(common.parent / ".relay")
+    targets.append(registry_root)
+    found, reachable = [], {}
+    for target in targets:
+        for path in (*reversed(target.parents), target):
+            if path not in reachable:
+                try:
+                    info = os.lstat(path)
+                except OSError:
+                    info = None
+                # Enrollment refuses a missing path, a symlink or a file for its own reasons.
+                reachable[path] = info is not None and stat.S_ISDIR(info.st_mode)
+                if (reachable[path] and info.st_uid in (0, os.getuid())
+                        and _unsafe_mode(path, info, path in private)):
+                    found.append((path, stat.S_IMODE(info.st_mode), path in private))
+            if not reachable[path]:
+                break
+    return found
+
+
+def permission_refusal(repo: str | os.PathLike[str], registry_root: Path,
+                       refused: UnsafeDirectory) -> EnrollmentError:
+    """One refusal naming every unsafe directory with its exact fix; the rule itself is unchanged."""
+    try:
+        found = unsafe_directories(repo, registry_root)
+    except (OSError, ValueError):
+        found = []
+    if all(path != refused.path for path, _, _ in found):
+        found.insert(0, (refused.path, refused.mode, refused.private))
+    lines = ["enrollment directory permissions are unsafe: other users could change "
+             + ("1 directory" if len(found) == 1 else f"{len(found)} directories")
+             + " this checkout's enrollment relies on, so Multithread refuses it. Run each command "
+             "below (it changes only the directory it names), then check again:"]
+    for path, mode, private in found:
+        fix = command_text(["chmod", "g-rwx,o-rwx" if private else "g-w,o-w", str(path)])
+        lines.append(f"  {fix}   (observed mode {mode:04o}; {_REQUIREMENTS[private]})")
+    if any(not private and mode & 0o020 for _, mode, private in found):
+        lines.append("A umask of 002 creates directories with group write, so a fresh clone can start this way.")
+    return EnrollmentError("\n".join(lines))
+
+
 def _fingerprint(info: os.stat_result) -> tuple[int, int]:
     return info.st_dev, info.st_ino
 
@@ -137,16 +247,8 @@ class _Directory:
                 or info.st_uid not in (0, os.getuid())
                 or (self.account and info.st_uid != os.getuid())):
             raise EnrollmentError("directory ancestry is not controlled by this account or root")
-        system_temporary = (self.path in (Path("/tmp"), Path("/var/tmp"))
-                            and info.st_uid == 0 and info.st_mode & stat.S_ISVTX)
-        if (stat.S_IMODE(info.st_mode) & (0o077 if self.private else 0o022)
-                and not (system_temporary and not self.private)):
-            requirement = ("group/other access is not allowed for a private directory"
-                           if self.private else "group/other write access is not allowed")
-            raise EnrollmentError(
-                "enrollment directory permissions are unsafe at "
-                f"{json.dumps(str(self.path), ensure_ascii=True)} "
-                f"(observed mode {stat.S_IMODE(info.st_mode):04o}); {requirement}")
+        if _unsafe_mode(self.path, info, self.private):
+            raise UnsafeDirectory(self.path, stat.S_IMODE(info.st_mode), self.private)
 
     def exists(self, name: str) -> bool:
         self.custody.verify()

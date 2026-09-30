@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -212,6 +213,85 @@ class EnrollmentTests(unittest.TestCase):
                 self.assertNotIn("\x1b", message)
                 self.assertNotIn("\n", message)
                 self.assertEqual(before, snapshot(self.base))
+
+    def complete_refusal(self, operation, repo=None):
+        """One unsafe-directory refusal, which wrote nothing, completed with every fix."""
+        before = snapshot(self.base)
+        with self.assertRaises(subject.UnsafeDirectory) as refused:
+            operation()
+        self.assertEqual(before, snapshot(self.base))
+        return str(subject.permission_refusal(repo or self.repo, self.registry.root, refused.exception))
+
+    @staticmethod
+    def apply_fixes(message):
+        """Run exactly the commands the refusal lists, and return the directories they name."""
+        fixes = [shlex.split(line.strip().split("   (")[0]) for line in message.splitlines()
+                 if line.startswith("  chmod ")]
+        for fix in fixes:
+            subprocess.run(["/usr/bin/chmod", *fix[1:]], check=True)
+        return [Path(fix[-1]) for fix in fixes]
+
+    def test_one_refusal_lists_every_unsafe_directory_and_its_fixes_suffice(self):
+        # A clone made under umask 002: every directory it created is group-writable.
+        account = self.registry.root.parent
+        account.mkdir()
+        (self.repo / "src").mkdir()
+        for path in (self.repo, self.repo / ".git", self.repo / ".git" / "objects", self.repo / "src", account):
+            path.chmod(0o775)
+        message = self.complete_refusal(lambda: self.registry.enroll(self.repo))
+        self.assertTrue(message.startswith("enrollment directory permissions are unsafe: other users could "
+                                           "change 3 directories this checkout's enrollment relies on"), message)
+        self.assertIn("\n  " + shlex.join(["chmod", "g-w,o-w", str(self.repo)])
+                      + "   (observed mode 0775; group/other write access is not allowed)\n", message)
+        self.assertTrue(message.endswith("\nA umask of 002 creates directories with group write, "
+                                         "so a fresh clone can start this way."))
+        # Only the directories enrollment checks, in its order; each fix is non-recursive.
+        self.assertEqual([self.repo, self.repo / ".git", account], self.apply_fixes(message))
+        self.assertEqual(1, self.registry.enroll(self.repo).generation)
+        self.assertEqual(0o775, (self.repo / "src").stat().st_mode & 0o777)
+
+    def test_linked_worktree_refusal_names_the_shared_git_directories(self):
+        self.git(self.repo, "commit", "--allow-empty", "-q", "-F", "-")
+        linked = self.base / "linked"
+        self.git(self.repo, "worktree", "add", "--detach", "-q", str(linked))
+        shared = self.repo / ".git" / "worktrees"
+        for path in (linked, self.repo, shared, shared / "linked"):
+            path.chmod(0o775)
+        message = self.complete_refusal(lambda: self.registry.enroll(linked), linked)
+        self.assertEqual([linked, self.repo, shared, shared / "linked"], self.apply_fixes(message))
+        self.assertEqual(self.repo / ".relay", self.registry.enroll(linked).workspace.state)
+
+    def test_private_directories_get_the_stricter_fix(self):
+        self.registry.enroll(self.repo)
+        for path in (self.repo / ".relay", self.registry.root):
+            path.chmod(0o750)
+        message = self.complete_refusal(lambda: self.registry.lookup(self.repo))
+        self.assertIn("\n  " + shlex.join(["chmod", "g-rwx,o-rwx", str(self.repo / ".relay")])
+                      + "   (observed mode 0750; group/other access is not allowed for a private directory)", message)
+        self.assertNotIn("umask", message)
+        self.assertEqual([self.repo / ".relay", self.registry.root], self.apply_fixes(message))
+        self.registry.lookup(self.repo)
+
+    def test_scan_follows_no_symlink_and_escapes_unprintable_paths(self):
+        target = self.base / "elsewhere"
+        (target / "inner").mkdir(parents=True)
+        (target / "inner").chmod(0o777)
+        (self.base / "alias").symlink_to(target, target_is_directory=True)
+        self.assertEqual([], subject.unsafe_directories(self.base / "alias" / "inner", self.registry.root))
+        odd = self.base / "odd\n\x1b[2J"
+        odd.mkdir()
+        odd.chmod(0o775)
+        message = str(subject.permission_refusal(odd, self.registry.root, subject.UnsafeDirectory(odd, 0o775, False)))
+        self.assertIn(json.dumps(["chmod", "g-w,o-w", str(odd)], ensure_ascii=True) + " (JSON argument list)", message)
+        self.assertNotIn("\x1b", message)
+        self.assertEqual(3, len(message.splitlines()))
+
+    def test_unavailable_scan_keeps_the_directory_actually_refused(self):
+        refused = subject.UnsafeDirectory(self.repo, 0o770, False)
+        with mock.patch.object(subject, "unsafe_directories", side_effect=OSError("artificial")):
+            message = str(subject.permission_refusal(self.repo, self.registry.root, refused))
+        self.assertIn("change 1 directory", message)
+        self.assertIn(shlex.join(["chmod", "g-w,o-w", str(self.repo)]) + "   (observed mode 0770;", message)
 
     def test_private_registry_leaf_below_writable_parent_refuses(self):
         self.registry.enroll(self.repo)

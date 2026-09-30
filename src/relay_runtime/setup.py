@@ -329,12 +329,15 @@ def _display(report):
         print("First collaboration, when you authorize provider use: "
               + text(report["first_collaboration_url"]))
     observations = [report["runtime"], *(report["repository"].get(key, {}) for key in ("enrollment", "doctor", "status"))]
+    shown = set()
     for entry in observations:
         if entry.get("state") in {"verified", "not_checked", "not_requested", None}:
             continue
         if entry.get("message"):
             print(text(entry["message"]))
-        if entry.get("stderr"):
+        # Enrollment and the check after it can refuse identically; say it once.
+        if entry.get("stderr") and entry["stderr"] not in shown:
+            shown.add(entry["stderr"])
             for line in entry["stderr"].splitlines():
                 print("Diagnostic: " + text(line))
         if entry.get("stderr_truncated") or entry.get("stdout_truncated"):

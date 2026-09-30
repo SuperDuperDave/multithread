@@ -3,6 +3,7 @@
 import json
 import os
 from pathlib import Path
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -103,6 +104,23 @@ registry = Registry(pathlib.Path({str(self.registry)!r}))
             self.assertEqual("", result.stdout)
         self.assertFalse(self.state.exists())
         self.assertFalse(self.registry.exists())
+
+    def test_unsafe_directories_refuse_once_with_every_fix(self):
+        unsafe = (self.repo, self.repo / ".git")
+        for path in unsafe:
+            path.chmod(0o775)
+        for args in (("init",), ("status",)):
+            result = self.command(*args)
+            self.assertEqual(1, result.returncode)
+            self.assertEqual("", result.stdout)
+            for path in unsafe:
+                self.assertIn("\n  " + shlex.join(["chmod", "g-w,o-w", str(path)]) + "   (observed mode 0775;",
+                              result.stderr)
+        self.assertFalse(self.state.exists())
+        self.assertFalse(self.registry.exists())
+        for path in unsafe:
+            path.chmod(0o755)
+        self.initialize()
 
     def test_state_overrides_refuse_before_enrollment(self):
         for args, env in ((("--home", str(self.base / "elsewhere"), "init"), {}),
