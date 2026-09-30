@@ -187,6 +187,10 @@ class FileTests(HomeCase):
         self.write("codex", FOREIGN)
         self.apply("install", ("codex",))
         lifecycle = "/usr/bin/env -i /bin/bash /opt/dispatch.sh lifecycle"
+        for part in ("/opt/dispatch.sh", lifecycle[:-1], lifecycle + " "):
+            with self.subTest(part=part):
+                self.assertEqual("unchanged", hooks.change_files("remove", ("codex",), commands=[part])["state"],
+                                 "only the exact command text names a hook")
         plan = hooks.change_files("remove", ("codex",), commands=[lifecycle])
         self.assertEqual([{"event": "SessionStart", "change": "remove", "slot": [0, 0], "command": lifecycle},
                           {"event": "Stop", "change": "remove", "slot": [0, 0], "command": lifecycle}],
@@ -372,6 +376,10 @@ class FileTests(HomeCase):
         self.assertIn("Next: " + note, output)
         self.assertEqual("unchanged", hooks.change_files("install", ("claude",))["state"])
         self.assertEqual(before, self.file("claude").read_bytes(), "the setting is never changed")
+        for action in ("remove", "install"):
+            self.assertEqual("applied", self.apply(action, ("claude",))["state"])
+            self.assertIs(True, json.loads(self.file("claude").read_text())["disableAllHooks"],
+                          f"{action} leaves the setting to the person")
 
     def test_missing_provider_directory_is_skipped_not_created(self):
         self.claude_home.rmdir()
@@ -670,6 +678,10 @@ class TrustTests(HomeCase):
         cases = {
             "null result": ({"result": None}, "unusable"),
             "error without code": ({"error": {"message": "no code"}}, "unusable"),
+            "text code": ({"error": {"code": "-32600", "message": "refused",
+                                     "data": {"config_write_error_code": "configVersionConflict"}}}, "unusable"),
+            "boolean code": ({"error": {"code": True, "message": "refused"}}, "unusable"),
+            "message not text": ({"error": {"code": -32600, "message": 5}}, "unusable"),
             "result and error": ({"result": {}, "error": {"code": 1, "message": "both"}}, "unusable"),
             "empty answer": ({}, "unusable"),
             "well-formed error": ({"error": {"code": -32600, "message": "refused"}}, "refused"),
@@ -699,12 +711,15 @@ class TrustTests(HomeCase):
         for data, recorded in (({"config_write_error_code": "configValidationError"}, False),
                                ({"config_write_error_code": "configRequirementReadonly"}, False),
                                ({"config_write_error_code": "userLayerNotFound"}, None),
+                               ("malformed", None),
                                (None, None)):
             with self.subTest(data=data):
                 self.config(self.ours())
                 plan = hooks.trust(self.codex)
                 error = {"code": -32603 if data is None else -32600, "message": "failed to persist config.toml"}
-                if data is not None:
+                if data == "malformed":  # A pre-persistence code inside an answer that is not a JSON-RPC error.
+                    error.update(code="-32600", data={"config_write_error_code": "configVersionConflict"})
+                elif data is not None:
                     error["data"] = data
                 self.config(self.ours(), write_answer={"error": error})
                 code, result = self.cli("trust", "--codex", str(self.codex), "--yes", "--expected-plan",
@@ -771,11 +786,23 @@ class TrustTests(HomeCase):
                    listed("SessionStart", self.path + ":session_start:0:1",
                           command="/usr/bin/env -i /bin/bash /opt/dispatch.sh brief", path=self.path, status="trusted"),
                    listed("Stop", self.path + ":stop:0:0", command=legacy, path=self.path, status="trusted")]
-        self.foreign = foreign
+        # Decoys a loose match would take: the same command from a project file or from config.toml, and a longer one.
+        project = str(self.base / "repo" / ".codex" / "hooks.json")
+        config = str(self.codex_home / "config.toml")
+        decoys = [listed("SessionStart", project + ":session_start:0:0", command=legacy, path=project,
+                         source="project", status="trusted"),
+                  listed("Stop", config + ":stop:0:0", command=legacy, path=config, status="trusted"),
+                  listed("Stop", self.path + ":stop:9:0", command=legacy + " --verbose", path=self.path,
+                         status="trusted"),
+                  # Codex never lists another layer at the user file's path; the layer check holds regardless.
+                  listed("SessionStart", self.path + ":session_start:7:0", command=legacy, path=self.path,
+                         source="system", status="trusted")]
+        self.foreign = foreign + decoys
         (self.codex_home / "config.toml").write_text(
             f'[hooks.state.{json.dumps(self.path + ":session_start:0:0")}]\ntrusted_hash = "sha256:{"a" * 64}"\n'
             f'[hooks.state.{json.dumps(self.path + ":session_start:0:1")}]\ntrusted_hash = "sha256:{"b" * 64}"\n'
             f'[hooks.state.{json.dumps(self.path + ":stop:0:0")}]\ntrusted_hash = "sha256:{"c" * 64}"\nenabled = true\n'
+            + "".join(f'[hooks.state.{json.dumps(decoy["key"])}]\ntrusted_hash = "sha256:{"d" * 64}"\n' for decoy in decoys)
             + "".join(f'[hooks.state.{json.dumps(key)}]\ntrusted_hash = "{NATIVE_HASHES[event]}"\n'
                       for event, key in self.keys.items()))
         self.config(self.ours())
