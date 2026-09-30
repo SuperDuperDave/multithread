@@ -77,7 +77,7 @@ def send_result(message, result):
     if spec.get('wrong_response_id') == message['method']:
         identifier = 'unrelated-response-id'
     if spec.get('error_response') == message['method']:
-        emit({'id': identifier, 'error': {'code': -32000, 'message': 'fixture RPC failure'}})
+        emit({'id': identifier, 'error': {'code': -32000, 'message': spec.get('error_message', 'fixture RPC failure')}})
         raise SystemExit(0)
     emit({'id': identifier, 'result': result})
 
@@ -1010,6 +1010,21 @@ class CodexProtocolTests(unittest.TestCase):
                 self.assertIn(result["state"], ("uncertain", "provider_error"))
                 self.assertTrue(result["needs_attention"])
                 self.assertEqual("call\n", self.calls.read_text())
+
+    def test_a_thread_held_by_another_codex_app_points_at_wake(self):
+        native = f"thread-store conflict: thread {THREAD} already has an active writer"
+        self.configure(error_response="thread/resume", error_message=native)
+        code, result, _ = self.invoke("--resume", THREAD)
+        self.assertNotEqual(0, code)
+        self.assertTrue(result["needs_attention"])
+        self.assertEqual(f"Conversation {THREAD} is open in another Codex app, which holds it, so this call cannot "
+                         "resume it. Reach it there with `multithread bind` and `multithread wake`, or start a fresh "
+                         "peer session with a summary of what it needs.", result["message"])
+        self.assertEqual([native], result["provider_errors"])
+        self.assertNotIn("turn/start", [row.get("method") for row in self.recorded_requests()])
+        self.configure(error_response="thread/resume")
+        self.assertEqual("Native provider rejected thread/resume; inspect retained output before continuing.",
+                         self.invoke("--resume", THREAD)[1]["message"])
 
     def test_zero_exit_without_turn_completion_remains_uncertain(self):
         self.configure(events=[item("unfinished answer")])

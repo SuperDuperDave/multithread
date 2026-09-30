@@ -138,6 +138,21 @@ registry = Registry(pathlib.Path({str(self.registry)!r}))
             path.chmod(0o755)
         self.initialize()
 
+    def test_a_folder_outside_git_names_itself_and_the_fix(self):
+        folder = self.base / "relay-notes"
+        folder.mkdir()
+        expected = (f"multithread: {folder} is not a Git checkout: run from an enrolled checkout or pass "
+                    "--repo <checkout>")
+        for args in (("status",), ("signal", "work.intent", "--agent", "codex", "--session", "s", "--work-id", "w",
+                                   "--summary", "note"), ("claim", "code:x", "--agent", "codex", "--session", "s",
+                                                           "--purpose", "p")):
+            for placement in ({"repo": folder}, {"cwd": folder}):
+                with self.subTest(command=args[0], **{key: True for key in placement}):
+                    result = self.command(*args, **placement)
+                    self.assertNotEqual(0, result.returncode)
+                    self.assertEqual(expected, result.stderr.strip().splitlines()[-1])
+        self.assertFalse(self.registry.exists())
+
     def test_state_overrides_refuse_before_enrollment(self):
         for args, env in ((("--home", str(self.base / "elsewhere"), "init"), {}),
                           (("init",), {"RELAY_HOME": ""})):
@@ -281,6 +296,44 @@ admission._GuardedConnection.execute = crash
         kinds = [row["kind"] for row in self.success("events")]
         self.assertEqual(1, kinds.count("decision.responded"))
         self.assertEqual(1, kinds.count("delivery.acknowledged"))
+
+    def test_installed_wake_ledger_steps_cross_the_worker_boundary(self):
+        self.initialize()
+        thread = "a0000000-0000-7000-8000-000000000001"
+        actor = ("--agent", "claude", "--session", "binder")
+        bound = self.success("wake-ledger", "bind", "operator", *actor, "--thread", thread, "--endpoint",
+                             "unix:///srv/codex/app-server-control/app-server-control.sock", "--cwd", str(self.repo))
+        generation = bound["binding"]["generation"]
+        plan = ("wake-ledger", "plan", "operator", "--ref", "/srv/task.md", "--requested", "steer",
+                "--ref-sha256", "a" * 64, "--ref-size", "15")
+        before = len(self.success("events"))
+        self.assertEqual(generation, self.success("wake-ledger", "show", "operator")["bindings"][0]["generation"])
+        self.assertEqual("ready", self.success(*plan)["status"])
+        self.assertFalse(self.success("wake-ledger", "observed", thread)["observed"])
+        self.assertEqual(before, len(self.success("events")), "reads run in the read-only worker")
+        begun = self.success("wake-ledger", "begin", *plan[2:], *actor)
+        self.assertEqual("begun", begun["status"])
+        self.success("wake-ledger", "conclude", str(begun["attempt_seq"]), *actor, "--outcome", "uncertain",
+                     "--reason", "no_answer", "--transport", "steer")
+        self.assertEqual("already_sent", self.success(*plan)["status"])
+        self.success("pause", "operator", *actor)
+        self.assertEqual("paused", self.success("wake-ledger", "show")["bindings"][0]["state"])
+        forged = self.command("emit", stdin=json.dumps({
+            "kind": "wake.resumed", "agent": "claude", "session": "forger", "target": "operator",
+            "summary": "Resumed", "meta": {"role": "operator", "generation": generation}}))
+        self.assertNotEqual(0, forged.returncode)
+        self.assertIn("emitted only by a dedicated Multithread transaction", forged.stderr)
+        self.assertEqual("paused", self.success("wake-ledger", "show")["bindings"][0]["state"])
+        self.success("wake-ledger", "bind", "reviewer", *actor, "--provider", "claude", "--endpoint",
+                     "unix:///run/user/1000/cc-socks/7739.sock")
+        inbox = self.success("wake-ledger", "begin", "reviewer", "--ref", str(generation), "--requested",
+                             "queue", *actor)
+        concluded = self.success("wake-ledger", "conclude", str(inbox["attempt_seq"]), *actor, "--outcome",
+                                 "delivered", "--reason", "inbox_accepted", "--transport", "inbox")
+        self.assertEqual("delivered", concluded["event"]["meta"]["outcome"])
+        roles = {item["role"]: item for item in self.success("wake-ledger", "show")["bindings"]}
+        self.assertEqual(("claude", "delivered"), (roles["reviewer"]["provider"],
+                                                   roles["reviewer"]["last_attempt"]["outcome"]))
 
 
     def test_existing_partial_zero_files_are_never_fresh_init(self):

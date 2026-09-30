@@ -65,11 +65,13 @@ def _parser():
             config.add_argument("--launcher-name", choices=("multithread", "relay"), default="relay",
                                 help="exact installed hook entry for Claude; native helpers select multithread. Default relay preserves the existing configuration API. Codex always uses multithread")
             for name, description in (("agent", "use an optional account-registered agent adapter"),
+                                      ("bind", "bind a role to an existing Codex conversation, or show bindings"),
                                       ("hooks", "install, trust and check user-level provider hooks for every session"),
                                       ("launch", "review hooks and start an interactive native provider"),
                                       ("peer", "call Codex or Claude and return its result to this task"),
                                       ("setup", "check readiness or explicitly enroll this repository"),
-                                      ("update", "review and explicitly install a public release update")):
+                                      ("update", "review and explicitly install a public release update"),
+                                      ("wake", "send a short attributed wake to a bound Codex conversation")):
                 native = action.add_parser(name, help=description, add_help=False)
                 native.add_argument("--help", action="store_true", dest="native_help")
                 native.add_argument("provider_args", nargs=argparse.REMAINDER)
@@ -80,7 +82,8 @@ def _readonly(args):
     if args.command == "provider-hook":
         return args.provider_payload["hook_event_name"] == "UserPromptSubmit"
     return args.command in {"status", "brief", "events", "doctor", "channel-pending", "provider-config"} or (
-        args.command == "ratchet" and args.ratchet_command == "review")
+        args.command == "ratchet" and args.ratchet_command == "review") or (
+        args.command == "wake-ledger" and args.wake_action in {"show", "observed", "plan"})
 
 
 def _provider_input(client, *, from_cwd=False, seen=None):
@@ -456,7 +459,7 @@ def main(argv=None, *, registry=None, command_alias_check=None):
             boundary += 1
         else:
             break
-    helper = boundary < len(raw) and raw[boundary] in {"agent", "hooks", "setup", "update"}
+    helper = boundary < len(raw) and raw[boundary] in {"agent", "bind", "hooks", "setup", "update", "wake"}
     args = _parser().parse_args(raw[:boundary + 1] if helper else raw)
     if helper:
         args.provider_args = raw[boundary + 1:]
@@ -468,7 +471,7 @@ def main(argv=None, *, registry=None, command_alias_check=None):
     try:
         if args.state_home is not None or "RELAY_HOME" in os.environ:
             raise StateError("installed Multithread refuses state-directory overrides")
-        if args.command in {"agent", "hooks", "launch", "peer", "setup", "update"}:
+        if args.command in {"agent", "bind", "hooks", "launch", "peer", "setup", "update", "wake"}:
             # A compatibility invocation must verify the preferred alias before
             # any helper executes it. Keep hooks and read-only runtime diagnosis
             # outside this check; an unavailable observation stays nonblocking.
@@ -485,6 +488,7 @@ def main(argv=None, *, registry=None, command_alias_check=None):
             from .hooks import hooks_main
             from .setup import setup_main
             from .update import update_main
+            from .wake import bind_main, wake_main
             forwarded = list(args.provider_args)
             if args.native_help:
                 forwarded += ["--help"]
@@ -494,8 +498,9 @@ def main(argv=None, *, registry=None, command_alias_check=None):
                 forwarded += ["--repo", args.repo]
             if args.json and args.command != "agent":
                 forwarded += ["--json"]
-            return {"agent": agent_main, "hooks": hooks_main, "launch": launch_main, "peer": peer_main,
-                    "setup": setup_main, "update": update_main}[args.command](forwarded)
+            return {"agent": agent_main, "bind": bind_main, "hooks": hooks_main, "launch": launch_main,
+                    "peer": peer_main, "setup": setup_main, "update": update_main,
+                    "wake": wake_main}[args.command](forwarded)
         if args.command == "provider-hook":
             seen = {}
             try:

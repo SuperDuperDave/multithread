@@ -22,6 +22,10 @@ from .protocol import (
     RATCHET_OUTCOMES,
     RelayError,
     ValidationError,
+    WAKE_CONCLUSIONS,
+    WAKE_PROVIDERS,
+    WAKE_REQUESTS,
+    WAKE_TRANSPORTS,
 )
 from .store import (
     BRIEF_DEFAULT_LIMIT,
@@ -249,6 +253,63 @@ def build_parser() -> argparse.ArgumentParser:
     verify.add_argument("--after-cost-seconds", type=int)
     verify.add_argument("--evidence")
 
+    for name, text in (
+        ("unbind", "remove a role's wake binding; its wake records stay"),
+        ("pause", "stop wakes to a bound role until it is resumed"),
+        ("resume", "let wakes reach a paused role again"),
+    ):
+        control = commands.add_parser(name, help=text)
+        control.add_argument("role")
+        _add_actor(control)
+
+    wake_ledger = commands.add_parser(
+        "wake-ledger",
+        help="the ledger half of bind and wake; those commands run it",
+    )
+    wake_actions = wake_ledger.add_subparsers(dest="wake_action", required=True)
+    show = wake_actions.add_parser("show", help="current bindings and last attempts")
+    show.add_argument("role", nargs="?")
+    observed = wake_actions.add_parser(
+        "observed", help="whether a provider session has left events in this ledger"
+    )
+    observed.add_argument("session")
+    observed.add_argument("--client", choices=("codex",), default="codex")
+    bind = wake_actions.add_parser("bind", help="record a daemon-verified binding")
+    bind.add_argument("role")
+    _add_actor(bind)
+    bind.add_argument("--provider", choices=sorted(WAKE_PROVIDERS), default="codex")
+    bind.add_argument("--thread")
+    bind.add_argument("--endpoint", required=True)
+    bind.add_argument("--cwd")
+    bind.add_argument("--replace", action="store_true")
+    for name, text in (
+        ("plan", "decide an attempt without recording it"),
+        ("begin", "check and record an attempt before its transport runs"),
+    ):
+        attempt = wake_actions.add_parser(name, help=text)
+        attempt.add_argument("role")
+        if name == "begin":
+            _add_actor(attempt)
+        attempt.add_argument("--ref", required=True)
+        attempt.add_argument("--requested", required=True, choices=sorted(WAKE_REQUESTS))
+        attempt.add_argument("--id", dest="message_id")
+        attempt.add_argument("--ref-sha256", help="a file reference's sha256")
+        attempt.add_argument("--ref-size", type=int, help="a file reference's size in bytes")
+    conclude = wake_actions.add_parser("conclude", help="record an attempt's one outcome")
+    conclude.add_argument("attempt_seq", type=int)
+    _add_actor(conclude)
+    conclude.add_argument(
+        "--outcome", required=True,
+        choices=sorted({item[0] for allowed in WAKE_CONCLUSIONS.values() for item in allowed}),
+    )
+    conclude.add_argument(
+        "--reason", required=True,
+        choices=sorted({item[1] for allowed in WAKE_CONCLUSIONS.values() for item in allowed}),
+    )
+    conclude.add_argument("--transport", choices=sorted(WAKE_TRANSPORTS))
+    conclude.add_argument("--native-id")
+    conclude.add_argument("--detail", help="the native reason, one line")
+
     hook = commands.add_parser(
         "hook", help="sanitize one Claude/Codex lifecycle hook from stdin"
     )
@@ -413,6 +474,11 @@ def _dispatch(store: RelayStore, args: argparse.Namespace) -> Any:
     if args.command == "acknowledge":
         agent, session = _actor(args)
         return store.acknowledge(args.seq, agent=agent, session=session)
+    if args.command in {"unbind", "pause", "resume"}:
+        agent, session = _actor(args)
+        return store.wake_control(args.command, args.role, agent=agent, session=session)
+    if args.command == "wake-ledger":
+        return _dispatch_wake(store, args)
     if args.command == "events":
         return store.events(after=args.after, limit=args.limit)
     if args.command == "doctor":
@@ -482,6 +548,77 @@ def _dispatch(store: RelayStore, args: argparse.Namespace) -> Any:
             work_id=args.work_id,
         )
     raise AssertionError(f"unhandled command: {args.command}")
+
+
+def _dispatch_wake(store: RelayStore, args: argparse.Namespace) -> Any:
+    action = args.wake_action
+    if action == "show":
+        return store.wake_bindings(args.role)
+    if action == "observed":
+        return {
+            "ledger": str(store.paths.repo_root),
+            "client": args.client,
+            "session": args.session,
+            "observed": bool(store.observed_sessions(args.client, [args.session])),
+        }
+    if action == "plan":
+        return store.wake_plan(
+            args.role, ref=args.ref, requested=args.requested, message_id=args.message_id,
+            ref_sha256=args.ref_sha256, ref_size=args.ref_size,
+        )
+    agent, session = _actor(args)
+    if action == "bind":
+        return store.wake_bind(
+            args.role, provider=args.provider, thread=args.thread, endpoint=args.endpoint,
+            cwd=args.cwd, replace=args.replace, agent=agent, session=session,
+        )
+    if action == "begin":
+        return store.wake_begin(
+            args.role, ref=args.ref, requested=args.requested,
+            message_id=args.message_id, agent=agent, session=session,
+            ref_sha256=args.ref_sha256, ref_size=args.ref_size,
+        )
+    return store.wake_conclude(
+        args.attempt_seq, outcome=args.outcome, reason=args.reason,
+        transport=args.transport, native_id=args.native_id,
+        agent=agent, session=session, detail=args.detail,
+    )
+
+
+def _render_wake_control(command: str, result: Mapping[str, Any]) -> str:
+    binding = result["binding"]
+    role = binding["role"]
+    if command == "unbind":
+        if result["duplicate"]:
+            return (f"ALREADY UNBOUND: {role} isn't bound in this ledger; nothing changed.\n"
+                    f"Next: Nothing. To bind it: {_wake_bind_hint(role, None)}")
+        ended = result["ended"]
+        return (f"UNBOUND: {role} no longer names {_wake_target(ended)} "
+                f"(binding {ended['generation']} ended). Its wake records stay in the ledger.\n"
+                f"Next: Nothing. To bind it again: {_wake_bind_hint(role, ended['provider'])}")
+    generation = binding["generation"]
+    if command == "pause":
+        word = "ALREADY PAUSED" if result["duplicate"] else "PAUSED"
+        return (f"{word}: Wakes to {role} are paused (binding {generation}); "
+                "nothing is sent until they are resumed.\n"
+                f"Next: Resume with: multithread resume {role}")
+    word = "ALREADY ACTIVE" if result["duplicate"] else "RESUMED"
+    return (f"{word}: Wakes to {role} reach {_wake_target(binding)} "
+            f"(binding {generation}).\n"
+            "Next: Nothing.")
+
+
+def _wake_bind_hint(role: str, provider: str | None) -> str:
+    codex = f"multithread bind {role} --thread <codex conversation id>"
+    claude = (f"multithread bind {role} --claude-socket \"$CLAUDE_CODE_MESSAGING_SOCKET\" "
+              "from the Claude Code session")
+    return codex if provider == "codex" else claude if provider == "claude" else f"{codex}, or {claude}"
+
+
+def _wake_target(binding: Mapping[str, Any]) -> str:
+    if binding["provider"] == "codex":
+        return f"Codex conversation {binding['thread']}"
+    return f"the Claude Code inbox {binding['endpoint'].removeprefix('unix://')}"
 
 
 def _run_hook(args: argparse.Namespace) -> int:
@@ -782,6 +919,9 @@ def _print_result(args: argparse.Namespace, result: Any) -> None:
         return
     if args.json:
         print(json.dumps(result, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+        return
+    if args.command in {"unbind", "pause", "resume"}:
+        print(_render_wake_control(args.command, result))
         return
     if args.command in {
         "emit",

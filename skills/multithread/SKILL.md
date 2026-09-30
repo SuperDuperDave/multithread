@@ -45,6 +45,15 @@ Choose the interaction that fits the task:
   Hooks provide this session's coordination identity and bounded pending state.
   Respect exact claim ownership, immutable commit handoffs, explicit ACKs,
   documented manual wakes, and the operator's Git responsibilities.
+- To point an already-open Codex conversation or Claude Code session at new
+  work, bind it to a role once and send it a pointer with `multithread wake`, as
+  the [peer guide](https://github.com/SuperDuperDave/multithread/blob/main/docs/PEER.md#wake-an-existing-conversation)
+  describes. A wake names a task file or ledger sequence, never its content, and
+  its result says whether it was sent and what to do next. Inside Codex's
+  sandbox the installed launcher refuses by design ("unsafe launcher ancestry"),
+  and the sandbox may also block a Claude Code inbox socket: run `multithread
+  wake` through Codex's approved escalation outside the sandbox, and never work
+  around the launcher check.
 - If the user has a configured Muse agent, identify it by nickname and use the
   optional [Muse agent skill](../muse-agent/SKILL.md). Its bridge has an
   asynchronous custody and reply lifecycle; it is separate from native

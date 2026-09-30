@@ -28,10 +28,18 @@ from .protocol import (
     RelayError,
     StateError,
     ValidationError,
+    WAKE_BINDING_KINDS,
+    WAKE_CONCLUSIONS,
+    WAKE_REQUESTS,
     canonical_agent,
     canonical_decision_id,
     canonical_decision_option,
     canonical_resource,
+    canonical_wake_content,
+    canonical_wake_message_id,
+    canonical_wake_ref,
+    canonical_wake_role,
+    canonical_wake_thread,
     canonical_work_id,
     new_event_id,
     normalize_event,
@@ -1176,6 +1184,458 @@ class RelayStore:
 
         seq, duplicate = self._insert_event(event)
         return self._event_receipt(seq, duplicate)
+
+    # --- Wake: role bindings and delivery attempts ---------------------------
+    #
+    # A binding names where a wake goes; it is not a queue. Its generation is
+    # the sequence of its wake.bound event. An attempt is recorded before the
+    # transport runs and concluded once afterwards, so a send whose outcome was
+    # never recorded stays visible and is never repeated under the same id.
+
+    def wake_bindings(self, role: str | None = None) -> dict[str, Any]:
+        """The current binding of one role, or of every role bound here."""
+
+        if role is not None:
+            roles = [canonical_wake_role(role)]
+        else:
+            roles = [
+                str(row[0])
+                for row in self._execute(
+                    "SELECT DISTINCT target FROM events "
+                    "WHERE kind = 'wake.bound' ORDER BY target"
+                ).fetchall()
+            ]
+        return {
+            "ledger": str(self.paths.repo_root),
+            "bindings": [self._wake_state(item) for item in roles],
+        }
+
+    def wake_bind(
+        self,
+        role: str,
+        *,
+        endpoint: str,
+        replace: bool,
+        agent: str,
+        session: str,
+        provider: str = "codex",
+        thread: str | None = None,
+        cwd: str | None = None,
+    ) -> dict[str, Any]:
+        """Bind a role to a Codex conversation, or to a Claude Code session's inbox."""
+
+        role = canonical_wake_role(role)
+        if provider == "codex":
+            thread = canonical_wake_thread(thread)
+        with self._transaction():
+            current = self._wake_binding(role)
+            if current is not None:
+                if current["thread"] == thread and current["endpoint"] == endpoint:
+                    return {"duplicate": True, "binding": self._wake_state(role)}
+                if not replace:
+                    where = (
+                        f"through {current['endpoint']}" if current["thread"] == thread
+                        else f"to conversation {current['thread']}"
+                    )
+                    raise ConflictError(
+                        f"{role} is already bound {where} (binding "
+                        f"{current['generation']}); pass --replace to move it"
+                    )
+            summary = (
+                f"Bound {role} to Codex conversation {thread}" if provider == "codex"
+                else f"Bound {role} to the Claude Code inbox {endpoint.removeprefix('unix://')}"
+            )
+            meta: dict[str, Any] = {
+                "role": role,
+                "provider": provider,
+                "endpoint": endpoint,
+                **({"thread": thread} if thread is not None else {}),
+                **({"cwd": cwd} if cwd is not None else {}),
+            }
+            if current is not None:
+                meta["replaces"] = current["generation"]
+                summary += f", replacing binding {current['generation']}"
+            event = normalize_event(
+                {
+                    "v": 1,
+                    "kind": "wake.bound",
+                    "agent": agent,
+                    "session": session,
+                    "target": role,
+                    "summary": summary,
+                    "meta": meta,
+                },
+                internal=True,
+            )
+            self._insert_event(event)
+            return {
+                "duplicate": False,
+                "binding": self._wake_state(role),
+                "replaced": current,
+            }
+
+    def wake_control(
+        self, action: str, role: str, *, agent: str, session: str
+    ) -> dict[str, Any]:
+        """Unbind, pause or resume the current binding; a no-op is a duplicate."""
+
+        kinds = {"unbind": "wake.unbound", "pause": "wake.paused", "resume": "wake.resumed"}
+        if action not in kinds:
+            raise ValidationError("wake control is unbind, pause or resume")
+        role = canonical_wake_role(role)
+        with self._transaction():
+            current = self._wake_binding(role)
+            if current is None:
+                if action == "unbind":
+                    return {"duplicate": True, "binding": self._wake_state(role)}
+                raise ConflictError(
+                    f"{role} isn't bound in this ledger, so there is nothing to "
+                    f"{action}; bind it first: multithread bind {role} "
+                    "--thread <codex conversation id>, or --claude-socket "
+                    "\"$CLAUDE_CODE_MESSAGING_SOCKET\" from a Claude Code session"
+                )
+            paused = current["paused_seq"] is not None
+            if (action == "pause" and paused) or (action == "resume" and not paused):
+                return {"duplicate": True, "binding": self._wake_state(role)}
+            generation = current["generation"]
+            summary = {
+                "unbind": f"Unbound {role} (binding {generation})",
+                "pause": f"Paused wakes to {role} (binding {generation})",
+                "resume": f"Resumed wakes to {role} (binding {generation})",
+            }[action]
+            event = normalize_event(
+                {
+                    "v": 1,
+                    "kind": kinds[action],
+                    "agent": agent,
+                    "session": session,
+                    "target": role,
+                    "summary": summary,
+                    "meta": {"role": role, "generation": generation},
+                },
+                internal=True,
+            )
+            self._insert_event(event)
+            return {
+                "duplicate": False,
+                "binding": self._wake_state(role),
+                "ended": current if action == "unbind" else None,
+            }
+
+    def wake_plan(
+        self,
+        role: str,
+        *,
+        ref: str,
+        requested: str,
+        message_id: str | None = None,
+        ref_sha256: str | None = None,
+        ref_size: int | None = None,
+    ) -> dict[str, Any]:
+        """What wake_begin would decide, without recording anything."""
+
+        return self._wake_decide(
+            role, ref=ref, requested=requested, message_id=message_id,
+            ref_sha256=ref_sha256, ref_size=ref_size,
+        )
+
+    def wake_begin(
+        self,
+        role: str,
+        *,
+        ref: str,
+        requested: str,
+        agent: str,
+        session: str,
+        message_id: str | None = None,
+        ref_sha256: str | None = None,
+        ref_size: int | None = None,
+    ) -> dict[str, Any]:
+        """Atomically check the binding and the id, then record the attempt."""
+
+        with self._transaction():
+            decision = self._wake_decide(
+                role, ref=ref, requested=requested, message_id=message_id,
+                ref_sha256=ref_sha256, ref_size=ref_size,
+            )
+            if decision["status"] != "ready":
+                return decision
+            binding = decision["binding"]
+            event = normalize_event(
+                {
+                    "v": 1,
+                    "kind": "wake.attempted",
+                    "agent": agent,
+                    "session": session,
+                    "target": decision["role"],
+                    "summary": (
+                        f"Wake {decision['role']} ({requested} requested): "
+                        f"{decision['ref']}"
+                    ),
+                    "meta": {
+                        "role": decision["role"],
+                        "generation": binding["generation"],
+                        "provider": binding["provider"],
+                        **({"thread": binding["thread"]} if binding["thread"] else {}),
+                        "message_id": decision["message_id"],
+                        "ref": decision["ref"],
+                        **(
+                            {"ref_sha256": ref_sha256, "ref_size": ref_size}
+                            if ref_sha256 is not None else {}
+                        ),
+                        "requested": requested,
+                    },
+                },
+                internal=True,
+            )
+            seq, _ = self._insert_event(event)
+            return {**decision, "status": "begun", "attempt_seq": seq}
+
+    def wake_conclude(
+        self,
+        attempt_seq: int,
+        *,
+        outcome: str,
+        reason: str,
+        transport: str | None,
+        native_id: str | None,
+        agent: str,
+        session: str,
+        detail: str | None = None,
+    ) -> dict[str, Any]:
+        """Record the one outcome of an attempt; an identical retry is a duplicate."""
+
+        if (
+            not isinstance(attempt_seq, int)
+            or isinstance(attempt_seq, bool)
+            or attempt_seq < 1
+        ):
+            raise ValidationError("attempt sequence must be a positive integer")
+        with self._transaction():
+            attempt = self._execute(
+                "SELECT * FROM events WHERE seq = ?", (attempt_seq,)
+            ).fetchone()
+            if attempt is None or attempt["kind"] != "wake.attempted":
+                raise ConflictError(f"event {attempt_seq} is not a wake attempt")
+            self._assert_canonical_event_row(attempt)
+            meta = json.loads(attempt["meta_json"])
+            requested = meta["requested"]
+            if (outcome, reason, transport) not in WAKE_CONCLUSIONS[meta["provider"]]:
+                raise ValidationError(
+                    f"attempt {attempt_seq} went to {meta['provider']}, which cannot "
+                    f"conclude {outcome} ({reason})"
+                )
+            if (
+                transport == "steer"
+                or reason in {"no_live_turn", "turn_ended", "turn_changed", "turn_not_steerable"}
+            ) and requested != "steer":
+                raise ValidationError(
+                    f"attempt {attempt_seq} asked to queue, so it cannot conclude "
+                    f"{outcome} ({reason})"
+                )
+            if reason == "requested" and requested != "queue":
+                raise ValidationError(
+                    f"attempt {attempt_seq} asked to steer; a queued fallback "
+                    "names why it queued"
+                )
+            conclusion: dict[str, Any] = {
+                "role": meta["role"],
+                "generation": meta["generation"],
+                "attempt_seq": attempt_seq,
+                "message_id": meta["message_id"],
+                "outcome": outcome,
+                "reason": reason,
+            }
+            if transport is not None:
+                conclusion["transport"] = transport
+            if native_id is not None:
+                conclusion["native_id"] = native_id
+            if detail is not None:
+                conclusion["detail"] = detail
+            event = normalize_event(
+                {
+                    "v": 1,
+                    "id": f"wake-concluded:{attempt_seq}",
+                    "kind": "wake.concluded",
+                    "agent": agent,
+                    "session": session,
+                    "target": meta["role"],
+                    "summary": (
+                        f"Wake {meta['message_id']} to {meta['role']}: "
+                        f"{outcome} ({reason.replace('_', ' ')})"
+                    ),
+                    "meta": conclusion,
+                },
+                internal=True,
+            )
+            seq, duplicate = self._insert_session_neutral_event(
+                event,
+                conflict_message=(
+                    f"wake attempt {attempt_seq} already has a different outcome"
+                ),
+            )
+            return self._event_receipt(seq, duplicate)
+
+    def _wake_decide(
+        self,
+        role: str,
+        *,
+        ref: str,
+        requested: str,
+        message_id: str | None,
+        ref_sha256: str | None,
+        ref_size: int | None,
+    ) -> dict[str, Any]:
+        role = canonical_wake_role(role)
+        ref = canonical_wake_ref(ref)
+        canonical_wake_content(ref, ref_sha256, ref_size)
+        if requested not in WAKE_REQUESTS:
+            raise ValidationError("requested transport must be queue or steer")
+        if message_id is not None:
+            message_id = canonical_wake_message_id(message_id)
+        if ref.isdigit() and self._execute(
+            "SELECT 1 FROM events WHERE seq = ?", (int(ref),)
+        ).fetchone() is None:
+            latest = self._execute("SELECT COALESCE(MAX(seq), 0) FROM events").fetchone()[0]
+            raise ValidationError(
+                f"ledger sequence {ref} doesn't exist here (the latest is {latest})"
+            )
+        binding = self._wake_binding(role)
+        decision: dict[str, Any] = {
+            "ledger": str(self.paths.repo_root),
+            "role": role,
+            "ref": ref,
+            "requested": requested,
+            "binding": binding,
+        }
+        if binding is None:
+            return {**decision, "status": "unbound", "message_id": message_id}
+        if message_id is None:
+            # A file is named by its bytes too: the same path with new content
+            # is a new message; a sequence is already immutable. The binding
+            # generation is part of the name, so after a rebind the same file
+            # is a new message that a person may send deliberately. Automatic
+            # delivery (a later phase) must not rely on this: it must never
+            # replay a signal already accepted under an old binding merely
+            # because the binding changed.
+            content = [ref_sha256] if ref_sha256 is not None else []
+            identity = json.dumps(
+                [str(self.paths.git_common_dir), role, binding["generation"], ref, *content],
+                ensure_ascii=True,
+                separators=(",", ":"),
+            )
+            digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:12]
+            message_id = f"wake-{role}-{binding['generation']}-{digest}"
+        decision["message_id"] = message_id
+        if binding["paused_seq"] is not None:
+            return {**decision, "status": "paused"}
+        rows = self._execute(
+            "SELECT * FROM events WHERE kind = 'wake.attempted' "
+            "AND json_extract(meta_json, '$.message_id') = ? ORDER BY seq",
+            (message_id,),
+        ).fetchall()
+        for row in rows:
+            prior = self._wake_attempt(row)
+            if prior["outcome"] != "not_sent":
+                return {**decision, "status": "already_sent", "prior": prior}
+        return {**decision, "status": "ready"}
+
+    def _wake_binding(self, role: str) -> dict[str, Any] | None:
+        rows = self._execute(
+            "SELECT * FROM events WHERE target = ? AND kind IN (?, ?, ?, ?) ORDER BY seq",
+            (role, *WAKE_BINDING_KINDS),
+        ).fetchall()
+        binding: dict[str, Any] | None = None
+        for row in rows:
+            self._assert_canonical_event_row(row)
+            meta = json.loads(row["meta_json"])
+            if row["kind"] == "wake.bound":
+                binding = {
+                    "generation": int(row["seq"]),
+                    "provider": meta["provider"],
+                    "thread": meta.get("thread"),
+                    "endpoint": meta["endpoint"],
+                    "cwd": meta.get("cwd"),
+                    "bound_at": row["recorded_at"],
+                    "bound_by": f"{row['agent']}:{row['session']}",
+                    "paused_seq": None,
+                }
+                continue
+            if binding is None or meta["generation"] != binding["generation"]:
+                raise StateError(
+                    f"Multithread event {int(row['seq'])} changes a binding "
+                    "that is not current"
+                )
+            if row["kind"] == "wake.unbound":
+                binding = None
+            else:
+                binding["paused_seq"] = (
+                    int(row["seq"]) if row["kind"] == "wake.paused" else None
+                )
+        return binding
+
+    def _wake_state(self, role: str) -> dict[str, Any]:
+        binding = self._wake_binding(role)
+        last = self._execute(
+            "SELECT * FROM events WHERE target = ? AND kind = 'wake.attempted' "
+            "ORDER BY seq DESC LIMIT 1",
+            (role,),
+        ).fetchone()
+        state = (
+            "unbound" if binding is None
+            else "paused" if binding["paused_seq"] is not None
+            else "active"
+        )
+        return {
+            "role": role,
+            "state": state,
+            **(binding or {}),
+            "last_attempt": self._wake_attempt(last) if last is not None else None,
+        }
+
+    def _wake_attempt(self, row: sqlite3.Row) -> dict[str, Any]:
+        self._assert_canonical_event_row(row)
+        meta = json.loads(row["meta_json"])
+        attempt: dict[str, Any] = {
+            "seq": int(row["seq"]),
+            "at": row["recorded_at"],
+            "by": f"{row['agent']}:{row['session']}",
+            "generation": meta["generation"],
+            "provider": meta["provider"],
+            "thread": meta.get("thread"),
+            "message_id": meta["message_id"],
+            "ref": meta["ref"],
+            "ref_sha256": meta.get("ref_sha256"),
+            "ref_size": meta.get("ref_size"),
+            "requested": meta["requested"],
+            "outcome": "open",
+        }
+        conclusion = self._execute(
+            "SELECT * FROM events WHERE event_id = ?",
+            (f"wake-concluded:{int(row['seq'])}",),
+        ).fetchone()
+        if conclusion is not None:
+            self._assert_canonical_event_row(conclusion)
+            result = json.loads(conclusion["meta_json"])
+            if (
+                conclusion["kind"] != "wake.concluded"
+                or result["attempt_seq"] != attempt["seq"]
+                or result["message_id"] != attempt["message_id"]
+            ):
+                raise StateError(
+                    f"Multithread event {int(conclusion['seq'])} does not "
+                    f"conclude wake attempt {attempt['seq']}"
+                )
+            attempt.update(
+                outcome=result["outcome"],
+                reason=result["reason"],
+                transport=result.get("transport"),
+                native_id=result.get("native_id"),
+                detail=result.get("detail"),
+                concluded_seq=int(conclusion["seq"]),
+                concluded_at=conclusion["recorded_at"],
+            )
+        return attempt
 
     def ratchet_decide(
         self,
@@ -2350,6 +2810,13 @@ def _git_path(cwd: Path, flag: str) -> Path:
             timeout=10,
             env=env,
         )
+    except subprocess.CalledProcessError as exc:
+        if "not a git repository" in (exc.stderr or "").lower():
+            raise StateError(
+                f"{cwd} is not a Git checkout: run from an enrolled checkout or pass "
+                "--repo <checkout>"
+            ) from exc
+        raise StateError(f"cannot resolve Multithread repository identity: {exc}") from exc
     except (OSError, subprocess.SubprocessError) as exc:
         raise StateError(f"cannot resolve Multithread repository identity: {exc}") from exc
     value = result.stdout.strip()

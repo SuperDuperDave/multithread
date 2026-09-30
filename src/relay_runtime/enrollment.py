@@ -489,8 +489,15 @@ def _git_identity(directory: _Directory) -> tuple[Path, Path, Path]:
             env=_GIT_ENV, input="", capture_output=True,
             pass_fds=(directory.fd,), text=True, timeout=10, check=True,
         )
+    except subprocess.CalledProcessError as exc:
+        if "not a git repository" in (exc.stderr or "").lower():
+            raise EnrollmentError(f"{directory.path} is not a Git checkout: run from an enrolled checkout "
+                                  "or pass --repo <checkout>") from exc
+        raise EnrollmentError(f"Git could not inspect {directory.path} as a checkout: run from an enrolled "
+                              "checkout or pass --repo <checkout>") from exc
     except (OSError, subprocess.SubprocessError) as exc:
-        raise EnrollmentError("cannot resolve a supported Git workspace") from exc
+        raise EnrollmentError(f"cannot resolve a supported Git workspace at {directory.path} "
+                              f"({exc.__class__.__name__})") from exc
     directory.custody.verify()
     lines = result.stdout.splitlines()
     if len(lines) != 4 or lines[3] != "false":

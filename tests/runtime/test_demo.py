@@ -22,7 +22,7 @@ PAYLOAD = (
     "relay_runtime/codex_peer.py", "relay_runtime/claude_peer.py",
     "relay_runtime/native_io.py", "relay_runtime/peer_control.py", "relay_runtime/agent.py",
     "relay_runtime/review_packet.py", "relay_runtime/hooks.py",
-    "relay_runtime/setup.py", "relay_runtime/update.py",
+    "relay_runtime/setup.py", "relay_runtime/update.py", "relay_runtime/wake.py",
 )
 CLOSED_FILES = (
     "src/relay.py", "src/relay_bootstrap.py", *("src/" + name for name in PAYLOAD),

@@ -44,6 +44,7 @@ PAYLOAD_MODULES = {
     "relay_runtime.review_packet": "relay_runtime/review_packet.py",
     "relay_runtime.setup": "relay_runtime/setup.py",
     "relay_runtime.update": "relay_runtime/update.py",
+    "relay_runtime.wake": "relay_runtime/wake.py",
 }
 PAYLOAD_FILES = frozenset(PAYLOAD_MODULES.values())
 # Release management can inspect the published nine-module profile without

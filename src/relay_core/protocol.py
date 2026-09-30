@@ -34,6 +34,11 @@ PUBLIC_EVENT_KINDS = frozenset(
         "ratchet.verified",
     }
 )
+#: A role's binding to one native conversation. The bound event's sequence is
+#: the binding's generation; the other three name the generation they change.
+WAKE_BINDING_KINDS = ("wake.bound", "wake.unbound", "wake.paused", "wake.resumed")
+#: One delivery attempt: recorded before the transport runs, concluded once after.
+WAKE_ATTEMPT_KINDS = ("wake.attempted", "wake.concluded")
 INTERNAL_EVENT_KINDS = frozenset(
     {
         "claim.acquired",
@@ -42,6 +47,8 @@ INTERNAL_EVENT_KINDS = frozenset(
         "decision.requested",
         "decision.responded",
         "delivery.acknowledged",
+        *WAKE_BINDING_KINDS,
+        *WAKE_ATTEMPT_KINDS,
     }
 )
 EVENT_KINDS = PUBLIC_EVENT_KINDS | INTERNAL_EVENT_KINDS
@@ -72,6 +79,46 @@ DECISION_AUTHORITY_CLASSES = frozenset(
     }
 )
 DECISION_ROLLOUT_FENCE = "active-clients-refreshed"
+#: What a sender may ask for; a Claude Code inbox has no separate steer.
+WAKE_REQUESTS = frozenset({"queue", "steer"})
+WAKE_TRANSPORTS = frozenset({"queue", "steer", "inbox"})
+#: Every admissible conclusion per provider, as (outcome, reason, transport
+#: that produced it). A transport of None means none ran: nothing was sent.
+WAKE_CONCLUSIONS = {
+    "codex": frozenset(
+        {
+            ("steered", "live_turn", "steer"),
+            ("queued", "requested", "queue"),
+            ("queued", "no_live_turn", "queue"),
+            # Codex declined the steer before accepting its input:
+            ("queued", "turn_ended", "queue"),
+            ("queued", "turn_changed", "queue"),
+            ("queued", "turn_not_steerable", "queue"),
+            ("not_sent", "daemon_unreachable", None),
+            ("not_sent", "daemon_refused", None),
+            ("not_sent", "daemon_unreadable", None),
+            ("not_sent", "conversation_unknown", None),
+            ("not_sent", "codex_unavailable", "queue"),
+            ("not_sent", "queue_refused", "queue"),
+            ("uncertain", "no_answer", "steer"),
+            ("uncertain", "unusable_reply", "steer"),
+            ("uncertain", "unrecognized_error", "steer"),
+            ("uncertain", "no_answer", "queue"),
+            ("uncertain", "no_receipt", "queue"),
+            ("uncertain", "queue_failed", "queue"),
+        }
+    ),
+    "claude": frozenset(
+        {
+            ("delivered", "inbox_accepted", "inbox"),
+            ("not_sent", "inbox_missing", None),
+            ("not_sent", "inbox_unsafe", None),
+            ("not_sent", "inbox_refused", "inbox"),
+            ("uncertain", "dropped", "inbox"),
+        }
+    ),
+}
+WAKE_PROVIDERS = frozenset(WAKE_CONCLUSIONS)
 
 _EVENT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,199}$")
 _RESOURCE_ALIASES = {
@@ -82,6 +129,9 @@ _FINGERPRINT_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{2,79}$")
 _DECISION_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{2,79}$")
 _DECISION_OPTION_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 _DECISION_ARTIFACT_RE = re.compile(r"^git:[0-9a-f]{40}$")
+_WAKE_ROLE_RE = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
+_WAKE_MESSAGE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+_WAKE_SEQUENCE_REF_RE = re.compile(r"^[1-9][0-9]{0,11}$")
 _RESOURCE_RE = re.compile(
     r"^[a-z][a-z0-9-]{0,31}:[a-z0-9][a-z0-9._/+\-]{0,159}$"
 )
@@ -181,6 +231,38 @@ _META_KEYS: dict[str, frozenset[str]] = {
             "resolution",
             "authority_class",
             "choice",
+        }
+    ),
+    "wake.bound": frozenset(
+        {"role", "provider", "thread", "endpoint", "cwd", "replaces"}
+    ),
+    "wake.unbound": frozenset({"role", "generation"}),
+    "wake.paused": frozenset({"role", "generation"}),
+    "wake.resumed": frozenset({"role", "generation"}),
+    "wake.attempted": frozenset(
+        {
+            "role",
+            "generation",
+            "provider",
+            "thread",
+            "message_id",
+            "ref",
+            "ref_sha256",
+            "ref_size",
+            "requested",
+        }
+    ),
+    "wake.concluded": frozenset(
+        {
+            "role",
+            "generation",
+            "attempt_seq",
+            "message_id",
+            "outcome",
+            "reason",
+            "transport",
+            "native_id",
+            "detail",
         }
     ),
 }
@@ -298,6 +380,131 @@ def canonical_decision_option(value: Any) -> str:
     return option
 
 
+def canonical_wake_role(value: Any) -> str:
+    role = _one_line("role", value, 32)
+    if role != value or not _WAKE_ROLE_RE.fullmatch(role):
+        raise ValidationError(
+            "role must be a lowercase name of letters, digits and dashes "
+            "(for example operator)"
+        )
+    return role
+
+
+def canonical_wake_thread(value: Any) -> str:
+    """One exact native conversation: Codex names it by lowercase UUID."""
+
+    thread = _one_line("thread", value, 36)
+    try:
+        exact = str(uuid.UUID(thread)) == value
+    except ValueError:
+        exact = False
+    if not exact:
+        raise ValidationError(
+            "thread must be the conversation's exact lowercase UUID, not a title"
+        )
+    return thread
+
+
+def canonical_wake_message_id(value: Any) -> str:
+    message_id = _one_line("message id", value, 128)
+    if message_id != value or not _WAKE_MESSAGE_ID_RE.fullmatch(message_id):
+        raise ValidationError(
+            "message id must be 1 to 128 letters, digits, dots, colons, "
+            "underscores or dashes"
+        )
+    return message_id
+
+
+def canonical_wake_ref(value: Any) -> str:
+    """A pointer the recipient can follow: an absolute file path or a ledger sequence."""
+
+    ref = _one_line("ref", value, 400)
+    if ref != value or not (
+        _WAKE_SEQUENCE_REF_RE.fullmatch(ref) or ref.startswith("/")
+    ):
+        raise ValidationError(
+            "ref must be an absolute task-file path or a ledger sequence number"
+        )
+    return ref
+
+
+def canonical_wake_content(ref: str, sha256: Any, size: Any) -> None:
+    """A file reference names its bytes by sha256 and size; a sequence names neither."""
+
+    if ref.isdigit():
+        if sha256 is not None or size is not None:
+            raise ValidationError("a ledger sequence reference carries no file sha256 or size")
+        return
+    if not isinstance(sha256, str) or re.fullmatch(r"[0-9a-f]{64}", sha256) is None:
+        raise ValidationError("a file reference needs its lowercase sha256")
+    if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+        raise ValidationError("a file reference needs its size in bytes")
+
+
+def _absolute_path(name: str, value: Any) -> str:
+    path = _one_line(name, value, 400)
+    if path != value or not path.startswith("/"):
+        raise ValidationError(f"{name} must be an absolute path")
+    return path
+
+
+def _positive_integer(name: str, value: Any) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+        raise ValidationError(f"{name} must be a positive integer")
+    return value
+
+
+def _wake_target(meta: Mapping[str, Any]) -> None:
+    """A Codex target is a conversation; a Claude Code target is only its inbox."""
+
+    provider = meta.get("provider")
+    if provider not in WAKE_PROVIDERS:
+        raise ValidationError("a wake provider must be codex or claude")
+    if provider == "codex":
+        canonical_wake_thread(meta.get("thread"))
+    elif "thread" in meta or "cwd" in meta:
+        raise ValidationError("a Claude Code wake target is its inbox, with no thread or cwd")
+
+
+def _validate_wake(kind: str, meta: Mapping[str, Any]) -> None:
+    canonical_wake_role(meta.get("role"))
+    if kind == "wake.bound":
+        _wake_target(meta)
+        endpoint = _one_line("endpoint", meta.get("endpoint"), 408)
+        if not endpoint.startswith("unix://"):
+            raise ValidationError("endpoint must be unix:// and an absolute socket path")
+        _absolute_path("endpoint", endpoint.removeprefix("unix://"))
+        if meta["provider"] == "codex":
+            _absolute_path("cwd", meta.get("cwd"))
+        if "replaces" in meta:
+            _positive_integer("replaces", meta["replaces"])
+        return
+    _positive_integer("generation", meta.get("generation"))
+    if kind == "wake.attempted":
+        _wake_target(meta)
+        canonical_wake_message_id(meta.get("message_id"))
+        canonical_wake_content(
+            canonical_wake_ref(meta.get("ref")), meta.get("ref_sha256"), meta.get("ref_size")
+        )
+        if meta.get("requested") not in WAKE_REQUESTS:
+            raise ValidationError("requested transport must be queue or steer")
+    elif kind == "wake.concluded":
+        _positive_integer("attempt_seq", meta.get("attempt_seq"))
+        canonical_wake_message_id(meta.get("message_id"))
+        conclusion = (meta.get("outcome"), meta.get("reason"), meta.get("transport"))
+        if not any(conclusion in allowed for allowed in WAKE_CONCLUSIONS.values()):
+            raise ValidationError(
+                "wake outcome, reason and transport are not an admissible conclusion"
+            )
+        if "detail" in meta:
+            _one_line("detail", meta["detail"], 300)
+        native_id = meta.get("native_id")
+        if native_id is not None:
+            canonical_wake_message_id(native_id)
+        elif meta.get("outcome") == "steered":
+            raise ValidationError("a steered wake records the native turn id")
+
+
 def normalize_event(raw: Mapping[str, Any], *, internal: bool = False) -> Event:
     if not isinstance(raw, Mapping):
         raise ValidationError("event must be a JSON object")
@@ -384,6 +591,8 @@ def normalize_event(raw: Mapping[str, Any], *, internal: bool = False) -> Event:
         raise ValidationError("meta must be a JSON object")
     meta = _normalize_meta(kind, meta_raw)
     _validate_semantics(kind, meta, internal=internal)
+    if kind.startswith("wake.") and target != meta["role"]:
+        raise ValidationError(f"{kind} must target its role")
     commit_oid = meta.get("commit_oid")
     if (
         artifact is not None
@@ -515,6 +724,8 @@ def _validate_semantics(
     elif kind.startswith("claim."):
         _identifier("claim_id", meta.get("claim_id"))
         canonical_resource(_required_string("resource", meta.get("resource")))
+    elif kind.startswith("wake."):
+        _validate_wake(kind, meta)
     elif kind == "delivery.acknowledged":
         signal_seq = meta.get("signal_seq")
         if (

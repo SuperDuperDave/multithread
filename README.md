@@ -133,6 +133,8 @@ it through native `peer`. Projects without a Muse agent need no bridge setup.
 
 The [manual two-worktree walkthrough](docs/PROVIDERS.md#try-a-review-across-two-worktrees)
 remains available for separate sessions with manual wakes and explicit Git work.
+To point an already-open Codex conversation or Claude Code session at new work
+without pasting, [bind it and send a wake](docs/PEER.md#wake-an-existing-conversation).
 
 ## Update
 

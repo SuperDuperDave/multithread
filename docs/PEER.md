@@ -18,7 +18,8 @@ See the
 Use it when a second perspective is worth the extra provider usage. Either
 agent can call Claude or Codex. The initiating agent keeps the continuing goal.
 This command does not control an already-open desktop window or wake an
-independently idle session.
+independently idle session; to point an open Codex conversation or Claude Code
+session at new work, [wake it](#wake-an-existing-conversation).
 
 ## Choose the contribution you need
 
@@ -364,6 +365,101 @@ without `--resume` creates a fresh session.
 The peer process can end while the provider keeps the native conversation.
 History retention, compaction and prompt caching remain provider behavior;
 resume does not guarantee a cache hit or unchanged context.
+
+## Wake an existing conversation
+
+`peer` starts its own native session. To reach a Codex conversation that is
+already open, such as one a person is working in, bind it to a role once, then
+send it short wakes through the shared Codex daemon's control socket in your
+Codex home. A wake carries a pointer to the work, never the work itself:
+
+```sh
+multithread bind operator --thread <conversation uuid> --agent claude --session <session>
+multithread wake operator --ref /absolute/path/task.md --agent claude --session <session>
+```
+
+The conversation receives `Multithread wake from claude: /absolute/path/task.md`.
+A ledger sequence also works as `--ref`; the message then names this checkout's
+ledger. The binding and every attempt live in the ledger of the checkout you
+run them in, or of `--repo`.
+
+- **Bind** asks the daemon whether the conversation exists, shows its directory
+  and status, and records the binding; its sequence is the binding's
+  generation. It refuses an unknown conversation, an unreachable daemon, or a
+  role already bound elsewhere (`--replace` moves it). When the conversation has
+  left no events in the ledger of its own checkout, bind warns: that
+  conversation gets no Multithread brief, so each wake must carry a task-file
+  path. `multithread bind` alone lists bindings and their last wake;
+  `multithread unbind`, `pause` and `resume` change one.
+- **Wake queues by default.** The message starts a new turn when the
+  conversation is idle, or right after its current turn. Use `--steer` only for
+  news about the recipient's current work: it joins the running turn at its next
+  input boundary, and queues when no turn is running. If Codex refuses the steer
+  before accepting it, the wake queues once with the same message id. Any other
+  error, or a reply without the expected turn's receipt, is `UNCERTAIN` and
+  nothing is queued.
+- Each attempt is recorded before it is sent and concluded after. The default
+  message id comes from the ledger, role, binding generation and reference, and
+  for a task file from its bytes too: the attempt records the file's sha256 and
+  size, the content-addressed reference `signal --artifact sha256:<digest>`
+  records by hand. A file that changed is a new message; the same unchanged file
+  sent twice reports `ALREADY SENT` and names the `--id` that sends it again on
+  purpose. A rebind starts a new generation, so message ids start over: a file
+  already sent under the old binding can be sent again. `--dry-run` decides and
+  sends nothing.
+
+| Status | Exit | Meaning |
+|---|---|---|
+| `STEERED` | 0 | Joined the running turn |
+| `QUEUED` | 0 | Queued as asked, because no turn was running, or because Codex refused the steer before accepting it: the turn ended, another turn was running, or the running turn can't take a steer |
+| `DELIVERED TO INBOX` | 0 | A Claude Code session's inbox took the whole message |
+| `DRY RUN` | 0 | Decided; nothing sent or recorded |
+| `ALREADY SENT` | 3 | This message id went out, or its earlier outcome is unknown; nothing sent |
+| `NOT SENT` | 4 | Nothing reached the conversation: the daemon was unreachable, refused to list the conversation's turns, or answered the turn list unreadably; the conversation is unknown; Codex couldn't be found or run, or `codex queue` refused before sending; the inbox is gone, failed its checks or refused the connection; the role is paused or unbound; or the arguments, the reference or the ledger couldn't be used. The same id is safe to retry |
+| `UNCERTAIN` | 5 | Sent, with no receipt that it arrived: the daemon didn't answer the steer, or `codex queue` didn't finish; the steer drew an unreadable reply, an error that doesn't show it was refused before acceptance, or no receipt for the expected turn; `codex queue` printed no receipt for the bound conversation, or failed after starting; or the inbox connection dropped while sending. The id stays blocked; check with the recipient before sending again |
+
+Every result names the next step, as text or with `--json`.
+
+A daemon or inbox accepting a wake is not the recipient reading it. The
+recipient still acknowledges through the ledger or the task file, and a wake
+grants no authority beyond the work it points to. Nothing is sent automatically
+when a signal is recorded. The command's tests use a fake daemon and a fake
+inbox. Live observations with Codex 0.159.2 exercised the same daemon methods
+before this command existed: a queued message into an idle conversation started
+a turn within the same second, a queued message waited for a busy turn to end,
+and one steered message reached the model at its next input boundary, 108
+seconds after Codex accepted it. The duplicate check is Multithread's own; how
+Codex treats a repeated `clientUserMessageId` is untested.
+
+### Claude Code sessions
+
+A Claude Code session (2.1.224 or later) listens on a private inbox socket and
+exports its path to its own shell. Bind from inside the session you want to
+wake, so the role names that session's inbox:
+
+```sh
+multithread bind reviewer --claude-socket "$CLAUDE_CODE_MESSAGING_SOCKET" --agent claude --session <session>
+```
+
+Bind checks that the path is a socket you own with mode 600 and not a symbolic
+link. `multithread wake reviewer --ref ...` then writes the wake to that inbox
+as one user message: an idle session starts a new turn, and a busy one reads it
+between tool calls without interrupting a running tool. Claude Code has no
+separate steer, so `--steer` changes nothing there and the result says so.
+`DELIVERED TO INBOX` means the socket took the whole message. Claude Code
+shows it as sent by another Claude session, not by the person, and says a peer
+cannot approve anything; the text names the real sender. The session's inbound
+settings (`crossSessionInbound`) may still hold or refuse it, and Claude Code
+drops identical repeats sent close together. When the session ends or restarts
+its inbox goes away: wake reports `NOT SENT` and names the bind to run from the
+new session. In one live test before this command existed, an idle Claude
+Code session started a turn within 8 seconds of such a message.
+
+A Codex desktop turn that wakes a Claude Code session runs inside Codex's
+sandbox. There the installed launcher refuses by design ("unsafe launcher
+ancestry"), and the sandbox may also block a Claude Code inbox socket: run
+`multithread wake` through Codex's approved escalation outside the sandbox, and
+never work around the launcher check. That route has not yet been run live.
 
 ## Prepare a support report from an existing call
 

@@ -515,6 +515,10 @@ class _Driver:
                 self.pending.pop(identifier)
                 return
             self.detail(self.errors, error["message"][:2000])
+            if method == "thread/resume" and "active writer" in error["message"]:
+                raise _ProtocolError("Conversation " + self.resume + " is open in another Codex app, which holds it, so "
+                                     "this call cannot resume it. Reach it there with `multithread bind` and `multithread "
+                                     "wake`, or start a fresh peer session with a summary of what it needs.")
             raise _ProtocolError("Native provider rejected " + method + "; inspect retained output before continuing.")
         result = message["result"]
         if not isinstance(result, dict):
