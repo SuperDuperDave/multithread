@@ -141,7 +141,15 @@ def hook_remedy(readiness, repo, expected_hook, user_file=None):
 
 
 class CodexRejected(_ProtocolError):
-    """Codex answered the request with an error: it refused, rather than went silent."""
+    """Codex answered with a well-formed error: it refused, rather than went silent or garbled.
+
+    The error alone does not say whether a write happened first; callers
+    decide that from the error's code and Codex's own write path.
+    """
+
+    def __init__(self, message, code=None, data=None):
+        super().__init__(message)
+        self.code, self.data = code, data
 
 
 class AppServer:
@@ -197,12 +205,18 @@ class AppServer:
                         continue
                     if message.get("id") != pending:
                         raise _ProtocolError("Codex answered a request that was not pending.")
-                    if "result" in message and isinstance(message["result"], dict):
-                        return message["result"]
-                    error = message.get("error")
-                    detail = error.get("message") if isinstance(error, dict) else None
-                    raise CodexRejected("Codex rejected " + method + (
-                        ": " + detail[:500] if isinstance(detail, str) and detail.isprintable() else "."))
+                    result, error = message.get("result"), message.get("error")
+                    if "error" not in message and isinstance(result, dict):
+                        return result
+                    # Only a well-formed JSON-RPC error is Codex saying no; any
+                    # other answer leaves the request's outcome unknown.
+                    if ("result" not in message and isinstance(error, dict) and type(error.get("code")) is int
+                            and isinstance(error.get("message"), str)):
+                        detail = error["message"][:500]
+                        raise CodexRejected("Codex rejected " + method + (
+                            ": " + detail if detail.isprintable() and detail else "."),
+                            error["code"], error.get("data"))
+                    raise _ProtocolError("Codex gave an unusable answer to " + method + "; its outcome is unknown.")
                 remaining = self.deadline - time.monotonic()
                 if remaining <= 0:
                     raise subprocess.TimeoutExpired(self.process.args, self.timeout)

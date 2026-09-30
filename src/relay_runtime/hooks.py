@@ -42,6 +42,13 @@ _TIMEOUT = 3
 _MAX_FILE = 1024 * 1024
 _MAX_SESSIONS = 64
 WINDOW_HOURS = 24
+# Codex 0.159.2 raises these config write errors in apply_edits before
+# ConfigEditsBuilder persists anything (app-server/src/config_manager_service.rs).
+# Any other error, including userLayerNotFound (raised while building the
+# response after persisting) or an internal error without a code, can follow a
+# write that happened.
+_REFUSED_BEFORE_WRITING = frozenset({"configVersionConflict", "configValidationError",
+                                     "configLayerReadonly", "configRequirementReadonly"})
 _GIT_ENV = {"PATH": "/usr/bin:/bin", "HOME": "/nonexistent", "LC_ALL": "C",
             "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null",
             "GIT_CONFIG_NOSYSTEM": "1", "GIT_TERMINAL_PROMPT": "0", "GIT_OPTIONAL_LOCKS": "0"}
@@ -244,8 +251,17 @@ def _sha(body):
     return None if body is None else hashlib.sha256(body).hexdigest()
 
 
-def _plan(client, action, environ=None):
-    """The exact new file for install or remove; nothing is written."""
+def _named(commands):
+    return [part for text in commands or () for part in ("--command", text)]
+
+
+def _plan(client, action, environ=None, commands=None):
+    """The exact new file for install or remove; nothing is written.
+
+    Remove takes out Multithread's handlers, or with commands only the
+    handlers whose command is exactly one of them: another tool's hooks that
+    the person chose to retire. Nothing else moves except as reported.
+    """
     path = hook_file(client, environ)
     plan = {"client": client, "action": action, "file": str(path), "command": command(client),
             "changes": [], "moved_hooks": [], "reformatted": False}
@@ -282,7 +298,9 @@ def _plan(client, action, environ=None):
                 groups.append({"hooks": [handler(client)]})
                 plan["changes"].append({"event": event, "change": "append", "slot": [len(groups) - 1, 0]})
     else:
-        before = [(event, g, h) for event, g, h, _, item in _slots(value) if not _ours(item)]
+        match = (_ours if not commands else
+                 (lambda item: isinstance(item, dict) and item.get("command") in commands))
+        before = [(event, g, h) for event, g, h, _, item in _slots(value) if not match(item)]
         for event in list(hooks):
             groups = hooks[event]
             if not isinstance(groups, list):
@@ -295,10 +313,11 @@ def _plan(client, action, environ=None):
                     continue
                 removed = False
                 for h in reversed(range(len(handlers))):
-                    if _ours(handlers[h]):
+                    if match(handlers[h]):
+                        plan["changes"].append({"event": event, "change": "remove", "slot": [g, h],
+                                                "command": handlers[h].get("command")})
                         del handlers[h]
                         removed = removed_any = True
-                        plan["changes"].append({"event": event, "change": "remove", "slot": [g, h]})
                 if removed and not handlers:
                     del groups[g]
             if removed_any and not groups:
@@ -368,11 +387,12 @@ def _public(plan):
     return {key: value for key, value in plan.items() if not key.startswith("_")}
 
 
-def _outcome_line(plan, action):
+def _outcome_line(plan, action, named=False):
     """One provider's outcome in a sentence."""
     name = _NAMES[plan["client"]]
     if plan["outcome"] == "applied":
-        done = "now has Multithread's hooks" if action == "install" else "no longer has Multithread's hooks"
+        done = ("now has Multithread's hooks" if action == "install" else
+                "no longer has the named hooks" if named else "no longer has Multithread's hooks")
         return (f"{name}: {plan['file']} {done}"
                 + (f" (previous file kept at {plan['backup']})" if plan.get("backup") else "") + ".")
     if plan["outcome"] == "not_written":
@@ -380,23 +400,26 @@ def _outcome_line(plan, action):
     return f"{name}: {plan['file']} was not changed (not attempted after that failure)."
 
 
-def change_files(action, clients, environ=None, *, expected=None):
+def change_files(action, clients, environ=None, *, expected=None, commands=None):
     """Plan, or with the reviewed plan's digest apply, install or remove.
 
     Files are replaced one at a time. When a later file fails after an earlier
     one was replaced, the result is partly_applied and names each outcome and
     kept copy; it never implies that nothing changed.
     """
-    plans = [_plan(client, action, environ) for client in clients]
+    plans = [_plan(client, action, environ, commands) for client in clients]
     digest = _digest([[p["client"], p["file"], p["before_sha256"], p["after_sha256"]] for p in plans])
+    review = shlex.join(_launcher_command("hooks", action, *_named(commands), "--json"))
     result = {"schema": 1, "action": action, "plans": [_public(p) for p in plans], "plan_sha256": digest,
               "changes_provider_settings": any(p["changes"] for p in plans)}
+    if commands:
+        result["commands"] = list(commands)
     if expected is None:
         result["state"] = "planned" if result["changes_provider_settings"] else "unchanged"
         return result
     if expected != digest:
         raise HooksError("The hook files or the plan changed since it was shown; nothing was written. Review the "
-                         "new plan: " + shlex.join(_launcher_command("hooks", action, "--json")))
+                         "new plan: " + review)
     failed = False
     for plan, public in zip(plans, result["plans"]):
         if not plan["changes"]:
@@ -417,18 +440,22 @@ def change_files(action, clients, environ=None, *, expected=None):
     if not failed:
         result["state"] = "applied" if applied else "unchanged"
         return result
-    lines = " ".join(_outcome_line(public, action) for public in result["plans"] if public["outcome"] != "unchanged")
+    lines = " ".join(_outcome_line(public, action, bool(commands)) for public in result["plans"]
+                     if public["outcome"] != "unchanged")
     if not applied:
-        raise HooksError(lines + " Nothing was changed. Fix the cause, then review a new plan: "
-                         + shlex.join(_launcher_command("hooks", action, "--json")))
-    undo = "remove" if action == "install" else "install"
+        raise HooksError(lines + " Nothing was changed. Fix the cause, then review a new plan: " + review)
+    kept = ("The kept copy is recovery material only: restoring it would also undo anything written to that "
+            "file since.")
+    if commands:
+        undo = "To put the named hooks back, restore the kept copy. " + kept
+    else:
+        undo_action = "remove" if action == "install" else "install"
+        undo = ("To undo the part that was applied, review "
+                + " and ".join(shlex.join(_launcher_command("hooks", undo_action, "--client", public["client"],
+                                                            "--json")) for public in applied) + ". " + kept)
     result.update(state="partly_applied", changes_provider_settings=True, message=(
         lines + " Check with " + shlex.join(_launcher_command("hooks", "status")) + ". To finish, fix the cause "
-        "and review a new plan with " + shlex.join(_launcher_command("hooks", action, "--json"))
-        + ", which plans only what is still needed. To undo the part that was applied, review "
-        + " and ".join(shlex.join(_launcher_command("hooks", undo, "--client", public["client"], "--json"))
-                       for public in applied)
-        + ", or restore the kept copy."))
+        "and review a new plan with " + review + ", which plans only what is still needed. " + undo))
     return result
 
 
@@ -483,6 +510,17 @@ def _user_layer(config):
     return users[0]["name"].get("file"), users[0]["version"]
 
 
+def _listed(listing, cwd):
+    """The hooks Codex lists for exactly the directory asked, or None if the answer does not say."""
+    groups = listing.get("data") if isinstance(listing, dict) else None
+    if not isinstance(groups, list):
+        return None
+    mine = [group for group in groups if isinstance(group, dict) and group.get("cwd") == cwd]
+    if len(mine) != 1 or not isinstance(mine[0].get("hooks"), list):
+        return None
+    return [hook for hook in mine[0]["hooks"] if isinstance(hook, dict)]
+
+
 def _review(listing, cwd, installed):
     """Match each Multithread event to exactly one listed hook Codex will trust.
 
@@ -490,10 +528,10 @@ def _review(listing, cwd, installed):
     key must name the slot the file holds, and Codex's own hash must equal the
     one derived here. Anything else refuses; no other hook is ever included.
     """
-    entries = [group for group in listing.get("data", ()) if isinstance(group, dict) and group.get("cwd") == cwd]
-    if len(entries) != 1 or not isinstance(entries[0].get("hooks"), list):
-        raise HooksError("Codex's hook listing did not answer for the directory asked; nothing was trusted.")
-    listed = [hook for hook in entries[0]["hooks"] if isinstance(hook, dict)]
+    listed = _listed(listing, cwd)
+    if listed is None:
+        raise HooksError("Codex's hook listing did not answer for the directory asked; nothing was trusted. Check "
+                         "that codex starts in a terminal, then run this again.")
     launcher = str(account_launcher())
     reviewed, problems = [], []
     for event, entry in installed["events"].items():
@@ -531,7 +569,7 @@ def _review(listing, cwd, installed):
     return reviewed, problems, {"statuses": others, "needing_review": pending}
 
 
-def trust(codex=None, environ=None, *, revoke=False, expected=None, timeout=20):
+def trust(codex=None, environ=None, *, revoke=False, expected=None, timeout=20, commands=None):
     """Plan, or with the reviewed digest apply, Codex trust for Multithread's hooks.
 
     Trust is recorded exactly as Codex's own /hooks review records it: one
@@ -539,6 +577,9 @@ def trust(codex=None, environ=None, *, revoke=False, expected=None, timeout=20):
     guarded by the configuration version read in the same session. Revoking
     removes only trust records holding Multithread's definition hashes.
     """
+    if commands and not revoke:
+        raise HooksError("--command names other hooks whose trust to revoke; use it with --revoke. Multithread "
+                         "records trust only for its own hooks.")
     executable = _codex(codex)
     installed = inspect("codex", environ)
     if not revoke and installed["state"] != "installed":
@@ -546,7 +587,10 @@ def trust(codex=None, environ=None, *, revoke=False, expected=None, timeout=20):
                          "install them first: " + shlex.join(_launcher_command("hooks", "install", "--client", "codex")))
     action = "revoke" if revoke else "trust"
     result = {"schema": 1, "client": "codex", "action": action, "hook_file": installed["file"],
-              "command": command("codex"), "changes_provider_settings": False, "write": "not_sent"}
+              "command": command("codex"), "changes_provider_settings": False, "write": "not_sent",
+              "selector": (["--revoke"] if revoke else []) + _named(commands)}
+    if commands:
+        result["commands"] = list(commands)
     try:
         return _trust_session(executable, installed, result, revoke, expected, timeout)
     except (ProtocolError, OSError, subprocess.SubprocessError) as exc:
@@ -563,12 +607,27 @@ def _trust_session(executable, installed, result, revoke, expected, timeout):
             config_file, version = _user_layer(server.call("config/read", {"includeLayers": True}))
             result.update(user_config=config_file, user_config_version=version)
             if revoke:
-                hashes = {codex_hash(event) for event in EVENTS["codex"]}
-                prefix = installed["file"] + ":"
                 records = _config_state(config_file) if isinstance(config_file, str) else {}
-                revoked = sorted(key for key, record in records.items() if key.startswith(prefix)
-                                 and isinstance(record, dict) and record.get("trusted_hash") in hashes)
-                result["hooks"] = [{"key": key, "hash": records[key]["trusted_hash"]} for key in revoked]
+                if result.get("commands"):
+                    # The keys come from Codex's own listing of exactly these commands in the user file.
+                    listed = _listed(server.call("hooks/list", {"cwds": [neutral]}), neutral)
+                    if listed is None:
+                        raise HooksError("Codex's hook listing did not answer for the directory asked; nothing "
+                                         "was revoked. Check that codex starts in a terminal, then run this again.")
+                    named = {hook["key"]: hook["command"] for hook in listed
+                             if hook.get("source") == "user" and hook.get("handlerType") == "command"
+                             and hook.get("command") in result["commands"] and isinstance(hook.get("key"), str)
+                             and codex_peer._same_path(hook.get("sourcePath"), installed["file"])}
+                    revoked = sorted(key for key in named if isinstance(records.get(key), dict)
+                                     and "trusted_hash" in records[key])
+                else:
+                    named = {}
+                    hashes = {codex_hash(event) for event in EVENTS["codex"]}
+                    prefix = installed["file"] + ":"
+                    revoked = sorted(key for key, record in records.items() if key.startswith(prefix)
+                                     and isinstance(record, dict) and record.get("trusted_hash") in hashes)
+                result["hooks"] = [{"key": key, "hash": records[key]["trusted_hash"],
+                                    **({"command": named[key]} if key in named else {})} for key in revoked]
                 # Remove the whole record when trust is all it holds; keep a
                 # person's own setting (enabled) and remove only the hash.
                 edits = [{"keyPath": 'hooks.state."' + key.replace("\\", "\\\\").replace('"', '\\"') + '"'
@@ -595,31 +654,40 @@ def _trust_session(executable, installed, result, revoke, expected, timeout):
                 return result
             if expected is None:
                 result["state"] = "planned"
-                result["apply_argv"] = _launcher_command("hooks", "trust", *(["--revoke"] if revoke else []),
+                result["apply_argv"] = _launcher_command("hooks", "trust", *result["selector"],
                                                          "--codex", executable, "--yes", "--expected-plan", digest, "--json")
                 result["apply_command"] = shlex.join(result["apply_argv"])
                 return result
             if expected != digest:
                 raise HooksError("Codex's hooks or configuration changed since the plan was shown; nothing was "
                                  "written. Review the new plan: " + shlex.join(_launcher_command(
-                                     "hooks", "trust", *(["--revoke"] if revoke else []), "--json")))
+                                     "hooks", "trust", *result["selector"], "--json")))
             result["write"] = "sent"
             try:
                 written = server.call("config/batchWrite", {"edits": edits, "expectedVersion": version,
                                                             "reloadUserConfig": True})
             except codex_peer.CodexRejected as exc:
-                check = shlex.join(_launcher_command("hooks", "trust", *(["--revoke"] if revoke else []), "--json"))
-                result.update(state="refused", write="refused_by_codex", message=(
-                    f"Codex refused the {action} write ({exc}), so by its own report nothing was recorded. "
-                    f"Check with {check} before trying again; it shows a fresh plan."))
+                code = exc.data.get("config_write_error_code") if isinstance(exc.data, dict) else None
+                if code not in _REFUSED_BEFORE_WRITING:
+                    raise  # An error that can follow a write: the outcome stays open.
+                check = shlex.join(_launcher_command("hooks", "trust", *result["selector"], "--json"))
+                result.update(state="refused", write="refused_by_codex", refusal_code=code, message=(
+                    f"Codex refused the {action} write before writing anything ({code}: {exc}). Nothing was "
+                    f"recorded. Check with {check} before trying again; it shows a fresh plan."))
                 return result
             result.update(write="acknowledged", changes_provider_settings=True, written_version=written.get("version"))
-            after = server.call("hooks/list", {"cwds": [neutral]})
-    statuses = {hook.get("key"): hook.get("trustStatus")
-                for group in after.get("data", ()) if isinstance(group, dict)
-                for hook in group.get("hooks", ()) if isinstance(hook, dict)}
+            listed = _listed(server.call("hooks/list", {"cwds": [neutral]}), neutral)
+    # Absence is evidence only inside a listing that answered for the directory asked.
+    if listed is None:
+        raise ProtocolError("Codex's listing after the write did not describe the directory asked")
+    statuses = {hook.get("key"): hook.get("trustStatus") for hook in listed}
     for item in result["hooks"]:
         item["status_after"] = statuses.get(item["key"], "not_listed")
+    strange = sorted({item["status_after"] for item in result["hooks"]}
+                     - {"trusted", "untrusted", "modified", "not_listed"}, key=str)
+    if strange:
+        raise ProtocolError("Codex's listing after the write reports an unrecognized trust status ("
+                            + ", ".join(str(status)[:40] for status in strange) + ")")
     if revoke:
         # A record for a slot the file no longer holds is not listed at all.
         verified = all(item["status_after"] != "trusted" for item in result["hooks"])
@@ -642,13 +710,13 @@ def _after_write(result, exc):
     reason = (str(exc)[:300] or exc.__class__.__name__) if isinstance(exc, ProtocolError) else exc.__class__.__name__
     status = shlex.join(_launcher_command("hooks", "status"))
     revoke = result["action"] == "revoke"
-    check = shlex.join(_launcher_command("hooks", "trust", *(["--revoke"] if revoke else []), "--json"))
+    check = shlex.join(_launcher_command("hooks", "trust", *result["selector"], "--json"))
     undo = ("" if revoke else " Undo a recorded write with "
             + shlex.join(_launcher_command("hooks", "trust", "--revoke")) + ".")
     if result["write"] == "sent":
         result.update(state="uncertain", changes_provider_settings=None, message=(
-            f"The {result['action']} write was sent to Codex, but its answer was lost ({reason}), so it may or may "
-            f"not be recorded. Before any retry, check with {check}: "
+            f"The {result['action']} write was sent to Codex, but its answer does not settle whether it was "
+            f"recorded ({reason}), so it may or may not be. Before any retry, check with {check}: "
             + ("nothing_to_revoke means it was applied, planned means it was not." if revoke else
                "already_trusted means it was recorded, planned means it was not.") + undo))
     else:
@@ -884,11 +952,13 @@ def _display_plan(result):
             continue
         if not plan["changes"]:
             print(f"{name}: {plan['file']} already has exactly Multithread's hooks." if result["action"] == "install"
+                  else f"{name}: {plan['file']} has no hook with exactly the named command." if result.get("commands")
                   else f"{name}: {plan['file']} has no Multithread hooks.")
             continue
         print(f"{name}: {plan['file']}")
         for change in plan["changes"]:
-            print(f"  {change['change'].replace('_', ' ')} {change['event']} at position {change['slot'][0]}")
+            print(f"  {change['change'].replace('_', ' ')} {change['event']} at position {change['slot'][0]}"
+                  + (": " + str(change.get("command")) if result.get("commands") else ""))
         if result["action"] == "install":
             print("  Hook command (3-second timeout): " + plan["command"])
         for moved in plan["moved_hooks"]:
@@ -939,6 +1009,10 @@ def hooks_main(argv=None):
         if name == "trust":
             command_parser.add_argument("--revoke", action="store_true",
                                         help="remove the trust records holding Multithread's hook hashes")
+        if name in ("remove", "trust"):
+            command_parser.add_argument("--command", action="append", dest="commands", metavar="EXACT",
+                                        help="act on another hook whose command is exactly this text instead of "
+                                             "Multithread's (repeatable; trust needs --revoke)")
         if name != "status":
             command_parser.add_argument("--yes", action="store_true", help="apply the reviewed plan without a prompt")
             command_parser.add_argument("--expected-plan", help="plan_sha256 from the reviewed --json plan")
@@ -980,11 +1054,12 @@ def hooks_main(argv=None):
             raise HooksError("--yes applies only a reviewed plan: first run the same command with --json, then pass "
                              "its plan_sha256 as --expected-plan.")
         if args.action == "trust":
-            run = lambda expected: trust(args.codex, revoke=args.revoke, expected=expected)
+            run = lambda expected: trust(args.codex, revoke=args.revoke, expected=expected, commands=args.commands)
             display = _display_trust
         else:
             clients = ("codex", "claude") if args.client == "all" else (args.client,)
-            run = lambda expected: change_files(args.action, clients, expected=expected)
+            run = lambda expected: change_files(args.action, clients, expected=expected,
+                                                commands=getattr(args, "commands", None))
             display = _display_plan
         result = run(args.expected_plan if args.yes else None)
         if not args.yes and not args.json and result["state"] == "planned":

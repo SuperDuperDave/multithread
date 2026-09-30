@@ -183,6 +183,28 @@ class FileTests(HomeCase):
         self.assertEqual([{"hooks": [hooks.handler("codex")]}], value["hooks"]["SessionStart"])
         self.assertEqual("installed", hooks.inspect("codex")["state"])
 
+    def test_remove_by_exact_command_takes_out_only_those_hooks(self):
+        self.write("codex", FOREIGN)
+        self.apply("install", ("codex",))
+        lifecycle = "/usr/bin/env -i /bin/bash /opt/dispatch.sh lifecycle"
+        plan = hooks.change_files("remove", ("codex",), commands=[lifecycle])
+        self.assertEqual([{"event": "SessionStart", "change": "remove", "slot": [0, 0], "command": lifecycle},
+                          {"event": "Stop", "change": "remove", "slot": [0, 0], "command": lifecycle}],
+                         plan["plans"][0]["changes"])
+        # Our Stop hook moves from position 1 to 0 once the group before it is empty; the plan says so.
+        self.assertIn({"event": "Stop", "from": [1, 0], "to": [0, 0]}, plan["plans"][0]["moved_hooks"])
+        self.assertEqual([lifecycle], plan["commands"])
+        result = hooks.change_files("remove", ("codex",), commands=[lifecycle], expected=plan["plan_sha256"])
+        self.assertEqual("applied", result["state"])
+        value = json.loads(self.file("codex").read_text())
+        self.assertEqual(FOREIGN["hooks"]["PreToolUse"], value["hooks"]["PreToolUse"], "unnamed hooks stay")
+        self.assertEqual([FOREIGN["hooks"]["SessionStart"][0]["hooks"][1]], value["hooks"]["SessionStart"][0]["hooks"])
+        self.assertEqual("installed", hooks.inspect("codex")["state"], "Multithread's own hooks stay")
+        self.assertEqual("unchanged", hooks.change_files("remove", ("codex",), commands=[lifecycle])["state"])
+        code, output, _ = CommandLineTests.run_hooks(self, "remove", "--client", "codex", "--command", "/no/such")
+        self.assertEqual(0, code)
+        self.assertIn("has no hook with exactly the named command", output)
+
     def test_older_multithread_hook_is_replaced_in_place(self):
         older = {"hooks": {**FOREIGN["hooks"], "Stop": FOREIGN["hooks"]["Stop"] + [{"hooks": [
             {"type": "command", "command": "/home/fixture/.local/bin/relay --repo /alpha provider-hook --client codex",
@@ -269,7 +291,8 @@ class FileTests(HomeCase):
             f"Claude Code: {self.file('claude')} was not changed ({self.file('claude')} changed after the plan was "
             f"made). Check with {LAUNCHER} hooks status. To finish, fix the cause and review a new plan with "
             f"{LAUNCHER} hooks install --json, which plans only what is still needed. To undo the part that was "
-            f"applied, review {LAUNCHER} hooks remove --client codex --json, or restore the kept copy.",
+            f"applied, review {LAUNCHER} hooks remove --client codex --json. The kept copy is recovery material "
+            "only: restoring it would also undo anything written to that file since.",
             result["message"])
         self.assertTrue(Path(codex["backup"]).exists())
         # An OS failure on the second replacement leaves that file and its folder exactly as they were.
@@ -433,6 +456,10 @@ for line in sys.stdin:
             {"name": {"type": "user", "file": spec["config_file"], "profile": None},
              "version": spec["version"], "config": {}, "disabledReason": None}]}})
     elif method == "hooks/list":
+        if spec.get("written") and "listing_after_write" in spec:
+            emit({"id": identifier, "result": json.loads(json.dumps(spec["listing_after_write"]).replace(
+                "CWD", params["cwds"][0]))})
+            continue
         if spec.get("written") and spec.get("fail_after_write"):
             raise SystemExit(0)  # The check after an acknowledged write never answers.
         if spec.get("fail_list"):
@@ -442,7 +469,9 @@ for line in sys.stdin:
             {"cwd": params["cwds"][0], "hooks": spec["hooks"], "warnings": [], "errors": []}]}})
     elif method == "config/batchWrite":
         if params.get("expectedVersion") != spec["version"] or spec.get("reject_write"):
-            emit({"id": identifier, "error": {"code": -32600, "message": "Configuration was modified since last read."}})
+            # Codex's own shape for a refusal raised before it writes anything.
+            emit({"id": identifier, "error": {"code": -32600, "message": "Configuration was modified since last read.",
+                                              "data": {"config_write_error_code": "configVersionConflict"}}})
             continue
         for edit in ([] if spec.get("ignore_write") else params["edits"]):
             if edit["keyPath"] == "hooks.state" and edit["mergeStrategy"] == "upsert":
@@ -461,6 +490,9 @@ for line in sys.stdin:
         spec_path.write_text(json.dumps(spec))
         if spec.get("drop_write_answer"):
             raise SystemExit(0)  # Written, but the answer is lost.
+        if "write_answer" in spec:
+            emit({"id": identifier, **spec["write_answer"]})  # Written, but the answer is unusable.
+            continue
         emit({"id": identifier, "result": {"status": "ok", "version": spec["version"],
                                            "filePath": spec["config_file"], "overriddenMetadata": None}})
     else:
@@ -513,8 +545,9 @@ class TrustTests(HomeCase):
         self.assertIn("before anything was written, so nothing was changed", result["message"])
         cases = {
             "drop_write_answer": ("uncertain", "sent", None,
-                                  "The trust write was sent to Codex, but its answer was lost (Codex ended or exceeded "
-                                  "its bound before answering config/batchWrite.), so it may or may not be recorded. "
+                                  "The trust write was sent to Codex, but its answer does not settle whether it was "
+                                  "recorded (Codex ended or exceeded its bound before answering config/batchWrite.), "
+                                  "so it may or may not be. "
                                   "Before any retry, check with " + check + ": already_trusted means it was recorded, "
                                   "planned means it was not. Undo a recorded write with " + revoke + "."),
             "fail_after_write": ("applied_unverified", "acknowledged", True,
@@ -523,9 +556,9 @@ class TrustTests(HomeCase):
                                  "answering hooks/list.). It is recorded unless something else changed it since; "
                                  "confirm with " + status + " before any retry. Undo a recorded write with " + revoke + "."),
             "reject_write": ("refused", "refused_by_codex", False,
-                             "Codex refused the trust write (Codex rejected config/batchWrite: Configuration was "
-                             "modified since last read.), so by its own report nothing was recorded. Check with "
-                             + check + " before trying again; it shows a fresh plan."),
+                             "Codex refused the trust write before writing anything (configVersionConflict: Codex "
+                             "rejected config/batchWrite: Configuration was modified since last read.). Nothing was "
+                             "recorded. Check with " + check + " before trying again; it shows a fresh plan."),
             "ignore_write": ("uncertain", "acknowledged", True,
                              "Codex acknowledged the trust write, but its listing right after shows SessionStart: "
                              "untrusted, UserPromptSubmit: untrusted, Stop: untrusted, SessionEnd: untrusted, "
@@ -608,6 +641,133 @@ class TrustTests(HomeCase):
         result = hooks.trust(self.codex)
         self.assertEqual("refused", result["state"])
         self.assertIn("Stop: Codex lists 2 Multithread hooks for this event, not one", result["message"])
+
+    def test_only_a_well_formed_error_counts_as_codex_refusing(self):
+        cases = {
+            "null result": ({"result": None}, "unusable"),
+            "error without code": ({"error": {"message": "no code"}}, "unusable"),
+            "result and error": ({"result": {}, "error": {"code": 1, "message": "both"}}, "unusable"),
+            "empty answer": ({}, "unusable"),
+            "well-formed error": ({"error": {"code": -32600, "message": "refused"}}, "refused"),
+        }
+        for name, (answer, kind) in cases.items():
+            with self.subTest(name):
+                self.config(self.ours(), write_answer=answer)
+                with codex_peer.AppServer([str(self.codex)], str(self.base)) as server:
+                    with self.assertRaises(hooks.ProtocolError) as raised:
+                        server.call("config/batchWrite", {"edits": [], "expectedVersion": "sha256:" + "0" * 64})
+                self.assertEqual(kind == "refused", isinstance(raised.exception, codex_peer.CodexRejected), name)
+                if kind == "unusable":
+                    self.assertEqual("Codex gave an unusable answer to config/batchWrite; its outcome is unknown.",
+                                     str(raised.exception))
+        # Through the command: an unusable answer after the write is sent is uncertain, never a refusal.
+        self.config(self.ours())
+        plan = hooks.trust(self.codex)
+        self.config(self.ours(), write_answer={"result": None})
+        code, result = self.cli("trust", "--codex", str(self.codex), "--yes", "--expected-plan", plan["plan_sha256"],
+                                "--json")
+        self.assertEqual((1, "uncertain", "sent", None),
+                         (code, result["state"], result["write"], result["changes_provider_settings"]))
+        self.assertIn("its answer does not settle whether it was recorded (Codex gave an unusable answer to "
+                      "config/batchWrite; its outcome is unknown.), so it may or may not be.", result["message"])
+        self.assertNotIn("othing was recorded", result["message"])
+        # Only a refusal Codex raises before persisting says nothing was recorded.
+        for data, recorded in (({"config_write_error_code": "configValidationError"}, False),
+                               ({"config_write_error_code": "configRequirementReadonly"}, False),
+                               ({"config_write_error_code": "userLayerNotFound"}, None),
+                               (None, None)):
+            with self.subTest(data=data):
+                self.config(self.ours())
+                plan = hooks.trust(self.codex)
+                error = {"code": -32603 if data is None else -32600, "message": "failed to persist config.toml"}
+                if data is not None:
+                    error["data"] = data
+                self.config(self.ours(), write_answer={"error": error})
+                code, result = self.cli("trust", "--codex", str(self.codex), "--yes", "--expected-plan",
+                                        plan["plan_sha256"], "--json")
+                self.assertEqual(1, code)
+                if recorded is False:
+                    self.assertEqual(("refused", "refused_by_codex", False),
+                                     (result["state"], result["write"], result["changes_provider_settings"]))
+                    self.assertIn("before writing anything (" + data["config_write_error_code"] + ": ", result["message"])
+                    self.assertIn("Nothing was recorded.", result["message"])
+                else:
+                    self.assertEqual(("uncertain", "sent", None),
+                                     (result["state"], result["write"], result["changes_provider_settings"]))
+                    self.assertIn("so it may or may not be. Before any retry, check with", result["message"])
+                    self.assertNotIn("othing was recorded", result["message"])
+
+    def test_a_read_back_must_describe_the_directory_asked_before_it_confirms(self):
+        records = "".join(f'[hooks.state.{json.dumps(key)}]\ntrusted_hash = "{NATIVE_HASHES[event]}"\n'
+                          for event, key in self.keys.items())
+        status = shlex.join([str(LAUNCHER), "hooks", "status"])
+        unusable = {
+            "empty result": {},
+            "null data": {"data": None},
+            "another directory": {"data": [{"cwd": "/elsewhere", "hooks": []}]},
+            "hooks not a list": {"data": [{"cwd": "CWD", "hooks": None}]},
+        }
+        for revoke in (False, True):
+            for name, listing in unusable.items():
+                with self.subTest(revoke=revoke, listing=name):
+                    (self.codex_home / "config.toml").write_text(records if revoke else "")
+                    trusted = {"status": "trusted"} if revoke else {}
+                    self.config(self.ours(**{event: trusted for event in hooks.EVENTS["codex"]}))
+                    plan = hooks.trust(self.codex, revoke=revoke)
+                    self.config(self.ours(**{event: trusted for event in hooks.EVENTS["codex"]}),
+                                listing_after_write=listing)
+                    result = hooks.trust(self.codex, revoke=revoke, expected=plan["plan_sha256"])
+                    self.assertEqual(("applied_unverified", "acknowledged", True),
+                                     (result["state"], result["write"], result["changes_provider_settings"]))
+                    self.assertIn("but the check that followed failed (Codex's listing after the write did not "
+                                  "describe the directory asked). It is recorded unless something else changed it "
+                                  "since; confirm with " + status + " before any retry.", result["message"])
+        # An unrecognized status cannot confirm either way.
+        (self.codex_home / "config.toml").write_text(records)
+        trusted = {event: {"status": "trusted"} for event in hooks.EVENTS["codex"]}
+        self.config(self.ours(**trusted))
+        plan = hooks.trust(self.codex, revoke=True)
+        self.config(self.ours(**trusted), listing_after_write={"data": [{"cwd": "CWD", "hooks": [
+            dict(hook, trustStatus="futureStatus") for hook in self.ours()]}]})
+        result = hooks.trust(self.codex, revoke=True, expected=plan["plan_sha256"])
+        self.assertEqual("applied_unverified", result["state"])
+        self.assertIn("reports an unrecognized trust status (futureStatus)", result["message"])
+        # An explicit, valid listing without the old slots does establish that they are gone.
+        self.config(self.ours(**trusted))
+        plan = hooks.trust(self.codex, revoke=True)
+        self.config(self.ours(**trusted), listing_after_write={"data": [{"cwd": "CWD", "hooks": []}]})
+        result = hooks.trust(self.codex, revoke=True, expected=plan["plan_sha256"])
+        self.assertEqual("revoked", result["state"])
+        self.assertEqual({"not_listed"}, {item["status_after"] for item in result["hooks"]})
+
+    def test_named_hooks_lose_only_their_own_trust(self):
+        legacy = "/usr/bin/env -i /bin/bash /opt/dispatch.sh lifecycle"
+        foreign = [listed("SessionStart", self.path + ":session_start:0:0", command=legacy, path=self.path,
+                          status="trusted"),
+                   listed("SessionStart", self.path + ":session_start:0:1",
+                          command="/usr/bin/env -i /bin/bash /opt/dispatch.sh brief", path=self.path, status="trusted"),
+                   listed("Stop", self.path + ":stop:0:0", command=legacy, path=self.path, status="trusted")]
+        self.foreign = foreign
+        (self.codex_home / "config.toml").write_text(
+            f'[hooks.state.{json.dumps(self.path + ":session_start:0:0")}]\ntrusted_hash = "sha256:{"a" * 64}"\n'
+            f'[hooks.state.{json.dumps(self.path + ":session_start:0:1")}]\ntrusted_hash = "sha256:{"b" * 64}"\n'
+            f'[hooks.state.{json.dumps(self.path + ":stop:0:0")}]\ntrusted_hash = "sha256:{"c" * 64}"\nenabled = true\n'
+            + "".join(f'[hooks.state.{json.dumps(key)}]\ntrusted_hash = "{NATIVE_HASHES[event]}"\n'
+                      for event, key in self.keys.items()))
+        self.config(self.ours())
+        with self.assertRaises(hooks.HooksError) as refused:
+            hooks.trust(self.codex, commands=[legacy])
+        self.assertIn("use it with --revoke", str(refused.exception))
+        plan = hooks.trust(self.codex, revoke=True, commands=[legacy])
+        self.assertEqual([self.path + ":session_start:0:0", self.path + ":stop:0:0"],
+                         [item["key"] for item in plan["hooks"]])
+        self.assertEqual({legacy}, {item["command"] for item in plan["hooks"]})
+        self.assertEqual(['hooks.state.' + json.dumps(self.path + ":session_start:0:0"),
+                          'hooks.state.' + json.dumps(self.path + ":stop:0:0") + '.trusted_hash'],
+                         [edit["keyPath"] for edit in plan["edits"]], "the person's own setting stays")
+        self.assertEqual(["hooks", "trust", "--revoke", "--command", legacy, "--codex"], plan["apply_argv"][1:7])
+        result = hooks.trust(self.codex, revoke=True, commands=[legacy], expected=plan["plan_sha256"])
+        self.assertEqual("revoked", result["state"])
 
     def test_a_changed_plan_or_configuration_writes_nothing(self):
         plan = hooks.trust(self.codex)
