@@ -154,6 +154,12 @@ def identity(value):
         ord(character) < 32 or ord(character) == 127 for character in value)
 
 
+def setting_relation(requested, reported):
+    """Compare names literally: an alias can resolve to another reported name."""
+    return ("not_requested" if requested is None else
+            "same_literal" if requested == reported else "different_name_unverified")
+
+
 def _object(pairs):
     value = {}
     for key, item in pairs:

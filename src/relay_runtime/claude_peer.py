@@ -18,7 +18,7 @@ import uuid as uuid_module
 from .native_io import MAX_OUTPUT, Observation, ProtocolError, decode, identity
 from .native_io import (USAGE_SCOPES, MODEL_USAGE_SCOPES, COST_SCOPES,
                         claude_measurements, measurement_scope, replace_measurement_errors,
-                        provider_version_observation)
+                        provider_version_observation, setting_relation)
 
 
 _MAX_INPUTS = 128
@@ -269,12 +269,9 @@ class _Driver:
             if identity(value.get(name)):
                 self.envelope[key] = value[name]
         if identity(value.get("model")):
-            requested = self.envelope.get("requested_model")
             self.envelope["model_observation"] = {
                 "source": "claude_system_init", "reported_model": value["model"],
-                "relation": "not_requested" if requested is None else
-                            "same_literal" if requested == value["model"] else
-                            "different_name_unverified"}
+                "relation": setting_relation(self.envelope.get("requested_model"), value["model"])}
         else:
             # Keep the last reported name but explicitly mark that this init
             # supplied no model metadata. Do not infer its current model.
