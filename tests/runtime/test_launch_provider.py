@@ -563,6 +563,19 @@ class AgentRuleDocumentationTests(unittest.TestCase):
         "skills/multithread/SKILL.md": ("Never run `multithread launch`", "`--multithread` and `--relay` unset"),
     }
 
+    # An agent changes hook settings or trust only through the reviewed commands.
+    HOOK_RULES = {
+        "docs/SETUP.md": "It never edits hook files or Codex's `config.toml` directly",
+        "docs/PROVIDERS.md": "it never edits hook files or Codex's `config.toml` directly",
+        "skills/multithread/SKILL.md": "Never edit hook files or Codex's `config.toml` directly",
+        "docs/PEER-REFERENCE.md": "It changes hook trust only with `multithread hooks trust`, when the person chose",
+    }
+
+    def test_agent_facing_guides_state_the_hook_rule(self):
+        for name, phrase in self.HOOK_RULES.items():
+            with self.subTest(guide=name):
+                self.assertIn(phrase, " ".join((ROOT / name).read_text(encoding="utf-8").split()))
+
     def test_agent_facing_guides_state_the_rule(self):
         for name, phrases in self.RULES.items():
             text = " ".join((ROOT / name).read_text(encoding="utf-8").split())

@@ -19,7 +19,7 @@ installation, enrollment, readiness, or native trust review, follow the current
 Codex lists the Multithread hooks as trusted, not provider authentication, hook
 delivery, tool capability, or a completed collaboration.
 
-Launch is the person's step: never run `multithread launch`. Change provider
+Launch is the person's step. Never run `multithread launch`. Change provider
 hook settings or Codex hook trust only through `multithread hooks install`,
 `trust` or `remove`, only when the person chose that route, and show them the
 `--json` plan before applying it with `--yes --expected-plan`. Never edit hook

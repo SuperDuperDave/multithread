@@ -802,7 +802,9 @@ def _display_trust(result):
               + (f" -> {item['status_after']}" if "status_after" in item else ""))
     others = result.get("other_hooks") or {}
     if others.get("needing_review"):
-        print(f"{others['needing_review']} other hooks await your own review in /hooks; Multithread leaves them to you.")
+        count = others["needing_review"]
+        print(f"{count} other {'hook awaits' if count == 1 else 'hooks await'} your own review in /hooks; "
+              "Multithread leaves them to you.")
 
 
 def hooks_main(argv=None):
@@ -836,7 +838,7 @@ def hooks_main(argv=None):
                 print(json.dumps(result, ensure_ascii=False, sort_keys=True))
             else:
                 for client, entry in result["providers"].items():
-                    line = f"{_NAMES[client]}: {entry['state'].replace('_', ' ')}"
+                    line = f"{_NAMES[client]}: {_condition(entry['state'])}"
                     if entry.get("file"):
                         line += f" ({entry['file']})"
                     if entry.get("trust"):
