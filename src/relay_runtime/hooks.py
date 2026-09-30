@@ -522,14 +522,28 @@ def _user_layer(config):
 
 
 def _listed(listing, cwd):
-    """The hooks Codex lists for exactly the directory asked, or None if the answer does not say."""
+    """The hooks Codex lists for exactly the directory asked, or None if the answer does not settle it.
+
+    One malformed entry makes the whole answer unusable: dropping it would turn
+    it into apparent absence. Each hook needs a text key, once, and a text
+    trust status. An empty list is a valid answer.
+    """
     groups = listing.get("data") if isinstance(listing, dict) else None
-    if not isinstance(groups, list):
+    if not isinstance(groups, list) or not all(isinstance(group, dict) for group in groups):
         return None
-    mine = [group for group in groups if isinstance(group, dict) and group.get("cwd") == cwd]
-    if len(mine) != 1 or not isinstance(mine[0].get("hooks"), list):
+    mine = [group for group in groups if group.get("cwd") == cwd]
+    hooks = mine[0].get("hooks") if len(mine) == 1 else None
+    if not isinstance(hooks, list) or not all(
+            isinstance(hook, dict) and isinstance(hook.get("key"), str) and isinstance(hook.get("trustStatus"), str)
+            for hook in hooks):
         return None
-    return [hook for hook in mine[0]["hooks"] if isinstance(hook, dict)]
+    return hooks if len({hook["key"] for hook in hooks}) == len(hooks) else None
+
+
+def _unusable_listing(done):
+    return (f"Codex's hook listing did not give a usable answer for the directory asked; nothing was {done}. Check "
+            "that codex starts in a terminal, then run this again; if it repeats, report this message"
+            + (", and trust by hand in a Codex terminal's /hooks meanwhile." if done == "trusted" else "."))
 
 
 def _review(listing, cwd, installed):
@@ -541,8 +555,7 @@ def _review(listing, cwd, installed):
     """
     listed = _listed(listing, cwd)
     if listed is None:
-        raise HooksError("Codex's hook listing did not answer for the directory asked; nothing was trusted. Check "
-                         "that codex starts in a terminal, then run this again.")
+        raise HooksError(_unusable_listing("trusted"))
     launcher = str(account_launcher())
     reviewed, problems = [], []
     for event, entry in installed["events"].items():
@@ -605,9 +618,10 @@ def trust(codex=None, environ=None, *, revoke=False, expected=None, timeout=20, 
         result["commands"] = list(commands)
     try:
         return _trust_session(executable, installed, result, revoke, expected, timeout)
-    except (ProtocolError, OSError, subprocess.SubprocessError) as exc:
+    except Exception as exc:
         if result["write"] == "not_sent":
             raise  # Nothing reached Codex's configuration; the caller reports that.
+        # Once the write is sent, no fault may hide that it could have changed Codex's configuration.
         return _after_write(result, exc)
 
 
@@ -624,11 +638,10 @@ def _trust_session(executable, installed, result, revoke, expected, timeout):
                     # The keys come from Codex's own listing of exactly these commands in the user file.
                     listed = _listed(server.call("hooks/list", {"cwds": [neutral]}), neutral)
                     if listed is None:
-                        raise HooksError("Codex's hook listing did not answer for the directory asked; nothing "
-                                         "was revoked. Check that codex starts in a terminal, then run this again.")
+                        raise HooksError(_unusable_listing("revoked"))
                     named = {hook["key"]: hook["command"] for hook in listed
                              if hook.get("source") == "user" and hook.get("handlerType") == "command"
-                             and hook.get("command") in result["commands"] and isinstance(hook.get("key"), str)
+                             and hook.get("command") in result["commands"]
                              and codex_peer._same_path(hook.get("sourcePath"), installed["file"])
                              and hook["key"].startswith(str(hook["sourcePath"]) + ":")}
                     revoked = sorted(key for key in named if isinstance(records.get(key), dict)
@@ -681,18 +694,19 @@ def _trust_session(executable, installed, result, revoke, expected, timeout):
                                                             "reloadUserConfig": True})
             except codex_peer.CodexRejected as exc:
                 code = exc.data.get("config_write_error_code") if isinstance(exc.data, dict) else None
-                if code not in _REFUSED_BEFORE_WRITING:
+                if not isinstance(code, str) or code not in _REFUSED_BEFORE_WRITING:
                     raise  # An error that can follow a write: the outcome stays open.
                 check = shlex.join(_launcher_command("hooks", "trust", *result["selector"], "--json"))
                 result.update(state="refused", write="refused_by_codex", refusal_code=code, message=(
                     f"Codex refused the {action} write before writing anything ({code}: {exc}). Nothing was "
                     f"recorded. Check with {check} before trying again; it shows a fresh plan."))
                 return result
-            result.update(write="acknowledged", changes_provider_settings=True, written_version=written.get("version"))
+            result.update(write="acknowledged", changes_provider_settings=True,
+                          written_version=written["version"] if isinstance(written.get("version"), str) else None)
             listed = _listed(server.call("hooks/list", {"cwds": [neutral]}), neutral)
     # Absence is evidence only inside a listing that answered for the directory asked.
     if listed is None:
-        raise ProtocolError("Codex's listing after the write did not describe the directory asked")
+        raise ProtocolError("Codex's listing after the write was not a usable answer for the directory asked")
     statuses = {hook.get("key"): hook.get("trustStatus") for hook in listed}
     for item in result["hooks"]:
         item["status_after"] = statuses.get(item["key"], "not_listed")

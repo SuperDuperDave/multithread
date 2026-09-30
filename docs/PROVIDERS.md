@@ -465,8 +465,11 @@ and `configRequirementReadonly` (in the error's `data.config_write_error_code`)
 before it persists anything; any other error, such as `userLayerNotFound`,
 which it raises while building the response after persisting, or an internal
 error without a code, can follow a completed write. `hooks trust` reports only
-the first group as refused with nothing recorded, and everything else as
-`uncertain`.
+the first group, as a text code in a well-formed error, as refused with nothing
+recorded, and everything else as `uncertain`. A listing counts as evidence only
+when every entry for the directory asked is an object with a text `key` and
+`trustStatus` and no key repeats: otherwise `hooks trust` refuses before a
+write, and after one reports `applied_unverified`, never an absent hook.
 
 Against Codex 0.159.2 in a disposable `CODEX_HOME`, with no model request or
 thread: the hash derived independently matched `currentHash` for all five

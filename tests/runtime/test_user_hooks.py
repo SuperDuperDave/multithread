@@ -712,6 +712,8 @@ class TrustTests(HomeCase):
                                ({"config_write_error_code": "configRequirementReadonly"}, False),
                                ({"config_write_error_code": "userLayerNotFound"}, None),
                                ("malformed", None),
+                               ({"config_write_error_code": {"code": "configVersionConflict"}}, None),
+                               ({"config_write_error_code": ["configVersionConflict"]}, None),
                                (None, None)):
             with self.subTest(data=data):
                 self.config(self.ours())
@@ -735,16 +737,27 @@ class TrustTests(HomeCase):
                                      (result["state"], result["write"], result["changes_provider_settings"]))
                     self.assertIn("so it may or may not be. Before any retry, check with", result["message"])
                     self.assertNotIn("othing was recorded", result["message"])
+                    self.assertIn("(Codex gave an unusable answer to config/batchWrite" if data == "malformed" else
+                                  "(Codex rejected config/batchWrite: failed to persist config.toml)", result["message"])
 
     def test_a_read_back_must_describe_the_directory_asked_before_it_confirms(self):
         records = "".join(f'[hooks.state.{json.dumps(key)}]\ntrusted_hash = "{NATIVE_HASHES[event]}"\n'
                           for event, key in self.keys.items())
         status = shlex.join([str(LAUNCHER), "hooks", "status"])
+        ours = self.ours()
         unusable = {
             "empty result": {},
             "null data": {"data": None},
             "another directory": {"data": [{"cwd": "/elsewhere", "hooks": []}]},
             "hooks not a list": {"data": [{"cwd": "CWD", "hooks": None}]},
+            # Inside a valid envelope, one malformed entry must not read as absence or crash.
+            "non-object hook": {"data": [{"cwd": "CWD", "hooks": [None]}]},
+            "non-string key": {"data": [{"cwd": "CWD", "hooks": [dict(ours[0], key=[ours[0]["key"]]), *ours[1:]]}]},
+            "non-string status": {"data": [{"cwd": "CWD", "hooks": [dict(ours[0], trustStatus=["trusted"]),
+                                                                    *ours[1:]]}]},
+            "duplicate key": {"data": [{"cwd": "CWD", "hooks": [dict(ours[0], trustStatus="trusted"), *ours,
+                                                                dict(ours[0], trustStatus="untrusted")]}]},
+            "non-object group": {"data": [{"cwd": "CWD", "hooks": ours}, None]},
         }
         for revoke in (False, True):
             for name, listing in unusable.items():
@@ -758,9 +771,9 @@ class TrustTests(HomeCase):
                     result = hooks.trust(self.codex, revoke=revoke, expected=plan["plan_sha256"])
                     self.assertEqual(("applied_unverified", "acknowledged", True),
                                      (result["state"], result["write"], result["changes_provider_settings"]))
-                    self.assertIn("but the check that followed failed (Codex's listing after the write did not "
-                                  "describe the directory asked). It is recorded unless something else changed it "
-                                  "since; confirm with " + status + " before any retry.", result["message"])
+                    self.assertIn("but the check that followed failed (Codex's listing after the write was not a "
+                                  "usable answer for the directory asked). It is recorded unless something else "
+                                  "changed it since; confirm with " + status + " before any retry.", result["message"])
         # An unrecognized status cannot confirm either way.
         (self.codex_home / "config.toml").write_text(records)
         trusted = {event: {"status": "trusted"} for event in hooks.EVENTS["codex"]}
@@ -778,6 +791,37 @@ class TrustTests(HomeCase):
         result = hooks.trust(self.codex, revoke=True, expected=plan["plan_sha256"])
         self.assertEqual("revoked", result["state"])
         self.assertEqual({"not_listed"}, {item["status_after"] for item in result["hooks"]})
+        # Before the write, the same malformed answers refuse and change nothing.
+        for name in ("non-object hook", "non-string key", "non-string status", "duplicate key"):
+            with self.subTest(before_write=name):
+                self.config([])
+                self.spec.write_text(json.dumps(dict(json.loads(self.spec.read_text()),
+                                                     hooks=unusable[name]["data"][0]["hooks"])))
+                for kwargs, done in (({}, "trusted"), ({"revoke": True, "commands": ["/opt/x"]}, "revoked")):
+                    with self.assertRaises(hooks.HooksError) as refused:
+                        hooks.trust(self.codex, **kwargs)
+                    self.assertTrue(str(refused.exception).startswith(
+                        "Codex's hook listing did not give a usable answer for the directory asked; nothing was "
+                        + done + ". Check that codex starts in a terminal, then run this again; if it repeats, "
+                        "report this message"), str(refused.exception))
+                self.assertNotIn("config/batchWrite", self.log.read_text())
+        # Whatever fails once the write is sent, the result still says it may have changed.
+        real, calls = hooks._listed, []
+
+        def failing(listing, cwd):
+            calls.append(cwd)
+            if len(calls) > 1:
+                raise TypeError("fixture fault")
+            return real(listing, cwd)
+        self.config(self.ours())
+        plan = hooks.trust(self.codex)
+        self.config(self.ours(), write_answer={"result": {"status": "ok", "version": ["not", "text"]}})
+        with mock.patch.object(hooks, "_listed", failing):
+            result = hooks.trust(self.codex, expected=plan["plan_sha256"])
+        self.assertEqual(("applied_unverified", "acknowledged", None),
+                         (result["state"], result["write"], result["written_version"]))
+        self.assertIn("(configuration version not reported), but the check that followed failed (TypeError).",
+                      result["message"])
 
     def test_named_hooks_lose_only_their_own_trust(self):
         legacy = "/usr/bin/env -i /bin/bash /opt/dispatch.sh lifecycle"

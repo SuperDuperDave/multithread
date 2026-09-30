@@ -54,10 +54,13 @@ def hook_readiness(result, repo, expected_hook, user_file=None):
     groups = [group for group in groups if group.get("cwd") == repo]
     if len(groups) != 1 or not isinstance(groups[0].get("hooks"), list):
         raise _ProtocolError("Native hook readiness did not identify the selected checkout; no task was submitted.")
+    if not all(isinstance(hook, dict) and isinstance(hook.get("eventName"), str) for hook in groups[0]["hooks"]):
+        # A skipped entry could hide a second handler; the whole answer is unusable.
+        raise _ProtocolError("Native hook readiness could not be read; no task was submitted.")
     listed = {name: [] for name in _HOOK_EVENTS}
     launcher = shlex.split(expected_hook)[0]
     for hook in groups[0]["hooks"]:
-        if (isinstance(hook, dict) and hook.get("eventName") in listed
+        if (hook["eventName"] in listed
                 and (hook.get("source") == "sessionFlags" or _multithread_hook(hook.get("command"), launcher))):
             listed[hook["eventName"]].append(hook)
 

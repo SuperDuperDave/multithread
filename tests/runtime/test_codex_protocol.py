@@ -492,6 +492,14 @@ class CodexProtocolTests(unittest.TestCase):
         self.assertEqual(str(self.repo), receipt["cwd"])
         hook = shlex.join([str(self.relay), "provider-hook", "--client", "codex"])
         self.assertEqual("ready", codex_peer.hook_readiness(listing, str(self.repo), hook)["state"])
+        # A skipped entry could hide a second handler: one malformed entry makes readiness unreadable.
+        for entry in (None, {"eventName": ["stop"]}, {"key": "no event"}):
+            with self.subTest(entry=entry):
+                broken = {"data": [dict(listing["data"][0], hooks=[*listing["data"][0]["hooks"], entry])]}
+                with self.assertRaises(ProtocolError) as refused:
+                    codex_peer.hook_readiness(broken, str(self.repo), hook)
+                self.assertEqual("Native hook readiness could not be read; no task was submitted.",
+                                 str(refused.exception))
         self.configure(hook_updates={"trustStatus": "modified"})
         readiness = codex_peer.hook_readiness(self.list_hooks(), str(self.repo), hook)
         self.assertEqual("needs_review", readiness["state"])
