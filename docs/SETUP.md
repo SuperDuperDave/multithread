@@ -212,7 +212,9 @@ and Codex keeps trusting it. It never edits, reorders or removes another hook,
 reports the ones it leaves in place, and keeps a private copy of each file it
 changes beside it. An agent first runs `hooks install --json` to show you the
 plan, then applies exactly that plan with `--yes --expected-plan
-<plan_sha256>`; a file that changed in between refuses.
+<plan_sha256>`; a file that changed in between refuses. Files change one at a
+time: if the second fails after the first changed, the result is
+`partly_applied` and names which file changed, its kept copy, and which did not.
 
 ### Choose how Codex trusts the hooks
 
@@ -235,7 +237,9 @@ has no per-hook trust. Choose one route:
   `hooks.state` write Codex's own `/hooks` review makes, guarded by the
   configuration version it read. It never includes another hook, and
   `hooks trust --revoke` removes exactly the records holding Multithread's
-  hashes.
+  hashes. Once the write is sent it never reports "nothing changed": a lost
+  answer is `uncertain` and a failed check after an acknowledged write is
+  `applied_unverified`, each naming the read-back to run before any retry.
 
 `~/.local/bin/multithread hooks status` reports installation and trust for
 both providers, each hook command, and the next step. A Codex conversation
