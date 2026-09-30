@@ -225,8 +225,11 @@ def _event_summary(state):
 
 # --- Writing the user hook file ---------------------------------------------
 
-def _serialize(value):
-    return (json.dumps(value, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+def _serialize(value, like=None):
+    """JSON in the file's own style (indent, ASCII escapes), so only our entries change."""
+    indent = re.search(rb"\n( +)\S", like) if like else None
+    return (json.dumps(value, indent=len(indent.group(1)) if indent else 2,
+                       ensure_ascii=bool(like) and like.isascii()) + "\n").encode("utf-8")
 
 
 def _digest(value):
@@ -301,8 +304,8 @@ def _plan(client, action, environ=None):
             if old != new:
                 plan["moved_hooks"].append({"event": old[0], "from": list(old[1:]), "to": list(new[1:])})
         plan["changes"].sort(key=lambda change: (change["event"], change["slot"]))
-    new = _serialize(data) if plan["changes"] else body
-    plan["reformatted"] = bool(plan["changes"]) and body is not None and _serialize(value) != body
+    new = _serialize(data, body) if plan["changes"] else body
+    plan["reformatted"] = bool(plan["changes"]) and body is not None and _serialize(value, body) != body
     plan.update(state=state["state"], before_sha256=_sha(body), after_sha256=_sha(new), _body=new)
     return plan
 
@@ -777,7 +780,7 @@ def _display_plan(result):
             print(f"  Another hook for {moved['event']} moves from {moved['from']} to {moved['to']}"
                   + ("; Codex will ask you to review it again." if plan["client"] == "codex" else "."))
         if plan["reformatted"]:
-            print("  The file is rewritten as 2-space JSON; everything else in it stays the same.")
+            print("  The file's layout is normalized; everything else in it stays the same.")
         if plan.get("backup"):
             print("  The previous file is kept at " + plan["backup"])
         if plan["client"] == "codex" and result["action"] == "install":
@@ -836,6 +839,8 @@ def hooks_main(argv=None):
                     if entry.get("trust"):
                         line += f"; trust: {entry['trust']['state'].replace('_', ' ')} ({entry['trust']['source'].replace('_', ' ')})"
                     print(line)
+                    if entry.get("command") and entry["state"] != "provider_not_found":
+                        print("  Hook command: " + entry["command"])
                     if entry.get("other_hooks"):
                         print("  Other hooks in this file, left as they are: " + ", ".join(
                             f"{event} {count}" for event, count in sorted(entry["other_hooks"].items())))

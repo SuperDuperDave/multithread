@@ -125,7 +125,9 @@ class FileTests(HomeCase):
         backup = Path(result["plans"][0]["backup"])
         self.assertEqual(original, backup.read_bytes())
         self.assertEqual(0o600, stat.S_IMODE(backup.stat().st_mode))
-        self.assertTrue(result["plans"][0]["reformatted"])
+        # The file keeps its own layout: only Multithread's entries are new.
+        self.assertFalse(result["plans"][0]["reformatted"])
+        self.assertIn('\n    "hooks": {', self.file("codex").read_text())
         self.assertEqual("installed", hooks.inspect("codex")["state"])
         self.assertEqual({"PreToolUse": 1, "SessionStart": 2, "Stop": 1}, hooks.inspect("codex")["other_hooks"])
         self.assertEqual("unchanged", self.apply("install", ("codex",))["state"])
@@ -164,6 +166,22 @@ class FileTests(HomeCase):
         self.assertEqual(FOREIGN["hooks"]["SessionStart"], after["hooks"]["SessionStart"])
         self.assertNotIn("Interrupt", after["hooks"])
         self.assertTrue(Path(result["plans"][0]["backup"]).exists())
+
+    def test_a_compact_or_escaped_file_reports_its_normalized_layout(self):
+        self.file("claude").write_text(json.dumps({"note": "caf\u00e9", "hooks": {}}))
+        plan = hooks.change_files("install", ("claude",))
+        self.assertTrue(plan["plans"][0]["reformatted"])
+        hooks.change_files("install", ("claude",), expected=plan["plan_sha256"])
+        self.assertIn('"note": "caf\\u00e9"', self.file("claude").read_text(), "ASCII escapes are kept")
+
+    def test_our_handler_under_a_matcher_is_repaired(self):
+        self.write("codex", {"hooks": {"SessionStart": [{"matcher": "^startup$", "hooks": [hooks.handler("codex")]}]}})
+        state = hooks.inspect("codex")
+        self.assertEqual("mismatched", state["events"]["SessionStart"]["state"])
+        self.apply("install", ("codex",))
+        value = json.loads(self.file("codex").read_text())
+        self.assertEqual([{"hooks": [hooks.handler("codex")]}], value["hooks"]["SessionStart"])
+        self.assertEqual("installed", hooks.inspect("codex")["state"])
 
     def test_older_multithread_hook_is_replaced_in_place(self):
         older = {"hooks": {**FOREIGN["hooks"], "Stop": FOREIGN["hooks"]["Stop"] + [{"hooks": [
