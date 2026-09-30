@@ -30,7 +30,7 @@ from . import account_launcher, hook_argv, hooks as user_hooks
 from .enrollment import NotEnrolled
 from .native_io import (USAGE_SCOPES, MODEL_USAGE_SCOPES, COST_SCOPES,
                         claude_measurements, measurement_scope, canonical_provider_version,
-                        identity as _identity, setting_relation)
+                        identity as _identity, observe_usage_model, setting_relation)
 
 
 class LaunchError(Exception):
@@ -663,6 +663,7 @@ def _interpret(directory, envelope):
         "actual_billed_cost": "unknown",
     })
     envelope.update(claude_measurements(native, envelope))
+    observe_usage_model(envelope)
     measurement_scope(envelope, "usage_scope", "native_main_loop", USAGE_SCOPES)
     measurement_scope(envelope, "model_usage_scope", "native_query_cumulative", MODEL_USAGE_SCOPES)
     measurement_scope(envelope, "cost_scope", "cumulative_through_latest_native_result", COST_SCOPES)

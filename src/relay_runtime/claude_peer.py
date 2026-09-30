@@ -17,8 +17,8 @@ import uuid as uuid_module
 
 from .native_io import MAX_OUTPUT, Observation, ProtocolError, decode, identity
 from .native_io import (USAGE_SCOPES, MODEL_USAGE_SCOPES, COST_SCOPES,
-                        claude_measurements, measurement_scope, replace_measurement_errors,
-                        provider_version_observation, setting_relation)
+                        claude_measurements, measurement_scope, observe_usage_model,
+                        replace_measurement_errors, provider_version_observation, setting_relation)
 
 
 _MAX_INPUTS = 128
@@ -274,10 +274,12 @@ class _Driver:
                 "relation": setting_relation(self.envelope.get("requested_model"), value["model"])}
         else:
             # Keep the last reported name but explicitly mark that this init
-            # supplied no model metadata. Do not infer its current model.
-            if self.envelope.get("model_observation", {}).get("source") == "claude_system_init":
+            # supplied no model metadata. Do not infer its current model. A
+            # usage report stays the latest report of a model until the next.
+            source = self.envelope.get("model_observation", {}).get("source")
+            if source == "claude_system_init":
                 self.envelope["model_observation"]["relation"] = "prior_init_only"
-            else:
+            elif source != "claude_model_usage":
                 self.envelope["model_observation"] = {"source": "unavailable", "reported_model": None,
                                                       "relation": "unknown"}
         self.session = session
@@ -374,6 +376,7 @@ class _Driver:
         self.envelope["estimated_cost_usd"] = record["cumulative_cost_usd"]
         measurement_scope(self.envelope, "cost_scope", "cumulative_through_latest_native_result", COST_SCOPES)
         self.envelope["model_usage"] = measurements["model_usage"]
+        observe_usage_model(self.envelope)
         measurement_scope(self.envelope, "model_usage_scope", "native_query_cumulative", MODEL_USAGE_SCOPES)
         replace_measurement_errors(self.envelope, observation, "estimated_cost_usd", "model_usage")
         if not related:

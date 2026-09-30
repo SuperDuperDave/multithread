@@ -154,6 +154,31 @@ class PeerTests(unittest.TestCase):
         self.assertEqual("opus", prefix[prefix.index("--model") + 1])
         self.assertEqual("high", prefix[prefix.index("--effort") + 1])
 
+    def test_final_json_records_the_one_model_its_usage_names(self):
+        usage = {"inputTokens": 3, "outputTokens": 4, "costUSD": 0.01}
+        unobserved = {"source": "unavailable", "reported_model": None, "relation": "unknown"}
+
+        def observed(relation):
+            return {"source": "claude_model_usage", "reported_model": "claude-opus-5-5", "relation": relation}
+        cases = ((("--model", "opus"), {"claude-opus-5-5": usage}, observed("different_name_unverified")),
+                 (("--model", "claude-opus-5-5"), {"claude-opus-5-5": usage}, observed("same_literal")),
+                 ((), {"claude-opus-5-5": usage}, observed("not_requested")),
+                 # Several names do not say which model answered; nothing is inferred.
+                 (("--model", "opus"), {"claude-opus-5-5": usage, "claude-haiku-4-5": usage}, unobserved),
+                 (("--model", "opus"), {}, unobserved),
+                 (("--model", "opus"), {"claude-opus-5-5\n": usage}, unobserved))
+        for extra, models, observation in cases:
+            with self.subTest(extra=extra, models=list(models)):
+                self.configure(native={"modelUsage": models})
+                code, result, _ = self.invoke(*extra)
+                self.assertEqual((0, "returned"), (code, result["state"]))
+                self.assertEqual(observation, result["model_observation"])
+                self.assertEqual("unknown", result["effective_effort"])
+                # The sanitized report keeps the relation alone, never a model name.
+                call = peer._report_projection(result)
+                self.assertEqual(observation["relation"], call["model_relation"])
+                self.assertNotIn("claude-", json.dumps(call))
+
     def test_claude_effort_choices_are_unchanged(self):
         for effort in ("low", "medium", "high", "xhigh", "max"):
             with self.subTest(effort=effort):

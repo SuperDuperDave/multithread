@@ -160,6 +160,23 @@ def setting_relation(requested, reported):
             "same_literal" if requested == reported else "different_name_unverified")
 
 
+def observe_usage_model(envelope):
+    """Record the model Claude's usage report names, when it names exactly one.
+
+    Usage accumulates over the native query, so a single name is the only
+    model that served it. Several names do not say which one answered, so
+    the earlier observation stands. An unusable name clears the observation.
+    """
+    models = envelope.get("model_usage")
+    if not isinstance(models, dict) or len(models) != 1:
+        return
+    (model,) = models
+    envelope["model_observation"] = (
+        {"source": "claude_model_usage", "reported_model": model,
+         "relation": setting_relation(envelope.get("requested_model"), model)}
+        if identity(model) else {"source": "unavailable", "reported_model": None, "relation": "unknown"})
+
+
 def _object(pairs):
     value = {}
     for key, item in pairs:

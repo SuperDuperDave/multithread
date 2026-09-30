@@ -210,8 +210,10 @@ list is unavailable, the call proceeds and the provider decides. `settings_check
 records which of these happened. The dry run and private receipts preserve the
 request; a clean follow-up preserves both flags.
 
-Claude's native streaming can report a model name, though an alias may resolve
-to another literal name; its effective effort is not verified. Codex reports a
+Claude reports a model name when its native stream starts, and in any output
+mode its usage names the models that have served the session; when that is
+exactly one, the receipt records it. An alias may resolve to another literal name, and
+Claude's effective effort is not verified. Codex reports a
 thread's settings when it opens the thread, so during the call a requested
 setting stays `unknown`; Codex confirms it when a later call resumes that thread.
 The receipt records what Codex reports, including a model it reroutes the turn
