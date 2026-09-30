@@ -32,6 +32,18 @@ EFFORT = "fixture-effort"
 UNOBSERVED = {"source": "unavailable", "reported_model": None, "relation": "unknown"}
 
 
+def listed_model(model, efforts, *, hidden=False):
+    return {"id": model, "model": model, "displayName": model, "description": "fixture", "hidden": hidden,
+            "isDefault": not hidden, "defaultReasoningEffort": efforts[0],
+            "supportedReasoningEfforts": [{"reasoningEffort": effort, "description": "fixture"}
+                                          for effort in efforts]}
+
+
+# The requested model is hidden from the picker: the check must still find it.
+MODEL_PAGES = [[listed_model("fixture-native-selection", ["fixture-default-effort", EFFORT]),
+                listed_model(MODEL, [EFFORT, "fixture-other-effort"], hidden=True)]]
+
+
 SERVER = r'''
 import json, os, sys, time
 from pathlib import Path
@@ -64,6 +76,7 @@ def send_result(message, result):
         raise SystemExit(0)
     emit({'id': identifier, 'result': result})
 
+deferred = []
 while True:
     message = receive()
     method = message.get('method')
@@ -111,6 +124,8 @@ while True:
         turn = {'id': TURN_ID, 'items': [], 'status': 'inProgress', 'error': None}
         turn.update(spec.get('turn_updates', {}))
         send_result(message, {'turn': turn})
+        for identifier in deferred:
+            emit({'id': identifier, 'result': {'data': [], 'nextCursor': None}})
         if 'raw_hex' in spec:
             sys.stdout.buffer.write(bytes.fromhex(spec['raw_hex']))
             sys.stdout.buffer.flush()
@@ -132,6 +147,20 @@ while True:
             raise SystemExit(spec.get('exit', 0))
     elif method == 'turn/interrupt':
         send_result(message, {})
+    elif method == 'model/list':
+        params = message['params']
+        if spec.get('defer_model_list'):
+            deferred.append(message['id'])
+        elif spec.get('model_list_error'):
+            emit({'id': message['id'], 'error': {'code': -32000, 'message': 'fixture listing failure'}})
+        elif 'model_list_result' in spec:
+            emit({'id': message['id'], 'result': spec['model_list_result']})
+        else:
+            pages = spec.get('model_pages', MODEL_PAGES)
+            index = int(params.get('cursor') or 0)
+            emit({'id': message['id'], 'result': {
+                'data': [model for model in pages[index] if params.get('includeHidden') or not model['hidden']],
+                'nextCursor': str(index + 1) if index + 1 < len(pages) else None}})
     else:
         raise SystemExit('unexpected client method')
 '''
@@ -206,7 +235,7 @@ class CodexProtocolTests(unittest.TestCase):
         settings = {"SPEC_PATH": str(self.specification), "RECEIPT_PATH": str(self.receipt),
                     "CALLS_PATH": str(self.calls), "REQUESTS_PATH": str(self.requests),
                     "ENV_KEYS": list(self.environment), "THREAD_ID": THREAD, "TURN_ID": TURN,
-                    "HOOK_COMMAND": hook}
+                    "HOOK_COMMAND": hook, "MODEL_PAGES": MODEL_PAGES}
         source = "".join(f"{key} = {value!r}\n" for key, value in settings.items()) + SERVER
         self.executable(self.provider, source)
         self.configure()
@@ -283,6 +312,8 @@ class CodexProtocolTests(unittest.TestCase):
         self.assertEqual({"source": "codex_thread_start", "reported_model": "fixture-native-selection",
                           "relation": "not_requested"}, result["model_observation"])
         self.assertEqual("unknown", result["effective_effort"])
+        # No setting requested: no model list is read and nothing is checked.
+        self.assertNotIn("settings_check", result)
         self.assertFalse((self.repo / "injected").exists())
         self.assertEqual(self.task.read_bytes(), (directory / "task.txt").read_bytes())
         raw_output = (directory / "stdout.json").read_bytes()
@@ -351,6 +382,13 @@ class CodexProtocolTests(unittest.TestCase):
                 self.assertEqual(0, code, result)
                 self.assertFalse(result["needs_attention"])
                 requests = self.recorded_requests()
+                # The listed model advertises the effort, checked before any thread opens.
+                self.assertEqual(["initialize", "initialized", "hooks/list", "model/list",
+                                  "thread/resume" if resume else "thread/start", "turn/start"],
+                                 [row["method"] for row in requests])
+                self.assertEqual({"includeHidden": True}, requests[3]["params"])
+                self.assertEqual({"status": "verified", "model": MODEL,
+                                  "advertised_efforts": [EFFORT, "fixture-other-effort"]}, result["settings_check"])
                 opened = next(row for row in requests if row["method"] in ("thread/start", "thread/resume"))
                 self.assertEqual({"cwd": str(self.repo), **({"threadId": resume} if resume else {})},
                                  opened["params"])
@@ -383,6 +421,77 @@ class CodexProtocolTests(unittest.TestCase):
         self.assertEqual({"source": "codex_thread_start", "reported_model": "fixture-native-selection",
                           "relation": "not_requested"}, result["model_observation"])
         self.assertEqual("unknown", result["effective_effort"])
+        # With no model requested, the effort is checked against the model the thread reports.
+        self.assertEqual({"status": "verified", "model": "fixture-native-selection",
+                          "advertised_efforts": ["fixture-default-effort", EFFORT]}, result["settings_check"])
+
+    def test_an_effort_the_listed_model_does_not_advertise_is_refused_before_submission(self):
+        cases = ((("--model", MODEL), MODEL, [EFFORT, "fixture-other-effort"],
+                  ["initialize", "initialized", "hooks/list", "model/list"]),
+                 ((), "fixture-native-selection", ["fixture-default-effort", EFFORT],
+                  ["initialize", "initialized", "hooks/list", "model/list", "thread/start"]),
+                 (("--resume", THREAD), "fixture-native-selection", ["fixture-default-effort", EFFORT],
+                  ["initialize", "initialized", "hooks/list", "model/list", "thread/resume"]))
+        for arguments, model, efforts, methods in cases:
+            with self.subTest(arguments=arguments):
+                result = self.assert_attention(self.invoke(*arguments, "--effort", "fixture-unadvertised"))
+                self.assertEqual(methods, [row["method"] for row in self.recorded_requests()])
+                self.assertEqual("not_submitted", result["task_submission"])
+                self.assertIsNone(result["result"])
+                self.assertEqual({"status": "refused", "model": model, "advertised_efforts": efforts},
+                                 result["settings_check"])
+                self.assertIn("Codex lists model " + model + " without effort fixture-unadvertised; it advertises "
+                              + ", ".join(efforts) + ". No task was submitted.", result["message"])
+
+    def test_the_check_follows_every_page_of_the_model_list(self):
+        pages = [[listed_model("fixture-native-selection", ["fixture-default-effort"])], [],
+                 [listed_model(MODEL, ["fixture-other-effort"], hidden=True)]]
+        self.configure(model_pages=pages)
+        code, result, _ = self.invoke("--model", MODEL, "--effort", "fixture-other-effort")
+        self.assertEqual(0, code, result)
+        listings = [row["params"] for row in self.recorded_requests() if row["method"] == "model/list"]
+        self.assertEqual([{"includeHidden": True}, {"includeHidden": True, "cursor": "1"},
+                          {"includeHidden": True, "cursor": "2"}], listings)
+        self.assertEqual({"status": "verified", "model": MODEL, "advertised_efforts": ["fixture-other-effort"]},
+                         result["settings_check"])
+        # The same effort is not advertised by the model on the first page.
+        code, result, _ = self.invoke("--model", "fixture-native-selection", "--effort", "fixture-other-effort")
+        self.assertNotEqual(0, code, result)
+        self.assertEqual("refused", result["settings_check"]["status"])
+
+    def test_a_model_codex_does_not_list_proceeds_unverified(self):
+        code, result, _ = self.invoke("--model", "fixture-unlisted-model", "--effort", "fixture-unadvertised")
+        self.assertEqual(0, code, result)
+        self.assertEqual("returned", result["state"])
+        self.assertFalse(result["needs_attention"])
+        self.assertEqual({"status": "model_unlisted", "model": "fixture-unlisted-model", "advertised_efforts": None},
+                         result["settings_check"])
+        turn = next(row for row in self.recorded_requests() if row["method"] == "turn/start")
+        self.assertEqual(("fixture-unlisted-model", "fixture-unadvertised"),
+                         (turn["params"]["model"], turn["params"]["effort"]))
+
+    def test_an_unavailable_model_list_never_stops_the_call(self):
+        unusable_efforts = listed_model(MODEL, [EFFORT])
+        unusable_efforts["supportedReasoningEfforts"] = [{"description": "fixture"}]
+        cases = ({"model_list_error": True}, {"model_list_result": []},
+                 {"model_list_result": {"data": "fixture"}}, {"model_list_result": {"data": ["fixture"]}},
+                 {"model_list_result": {"data": [], "nextCursor": 7}},
+                 {"model_list_result": {"data": [unusable_efforts], "nextCursor": None}},
+                 {"model_pages": [[], [], []]}, {"defer_model_list": True})
+        for spec in cases:
+            with self.subTest(spec=spec), mock.patch.object(codex_peer, "_MODEL_LIST_PAGES", 2), \
+                    mock.patch.object(codex_peer, "_MODEL_LIST_SECONDS", 0.2):
+                self.configure(**spec)
+                code, result, _ = self.invoke("--model", MODEL, "--effort", "fixture-unadvertised")
+                self.assertEqual(0, code, result)
+                self.assertEqual("returned", result["state"])
+                self.assertEqual(ANSWER, result["result"])
+                self.assertFalse(result["needs_attention"])
+                self.assertEqual([], result["provider_errors"])
+                self.assertEqual({"status": "unavailable", "model": MODEL, "advertised_efforts": None},
+                                 result["settings_check"])
+                turn = next(row for row in self.recorded_requests() if row["method"] == "turn/start")
+                self.assertEqual((MODEL, "fixture-unadvertised"), (turn["params"]["model"], turn["params"]["effort"]))
 
     def test_settings_reported_after_the_turn_is_accepted_describe_the_turn(self):
         cases = ((settings_notification(), MODEL, "same_literal", EFFORT),

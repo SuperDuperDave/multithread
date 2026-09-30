@@ -183,18 +183,27 @@ answer. Multithread makes one invocation and never automatically retries it.
 account profile; with neither, the provider uses its configured default. Claude
 receives them as its native options, as in `--model opus --effort high`, and
 accepts `low`, `medium`, `high`, `xhigh` or `max`. Codex receives both with the
-turn the call starts. Each Codex model advertises its own efforts, so Multithread
-passes the name through and Codex decides whether to accept it. The dry run and
-private receipts preserve the request; a clean follow-up preserves both flags.
+turn the call starts, and each Codex model advertises its own efforts.
+
+Codex runs an effort its model does not advertise without any error, so
+Multithread checks before the turn. It reads Codex's model list, hidden models
+included, and refuses before submitting the task when the listed model (the
+requested one, or else the thread's) does not advertise the requested effort; the
+refusal names the efforts it does advertise. A model Codex does not list, which
+may be an alias or another provider's model, proceeds unverified. If the list is
+unavailable, the call proceeds and Codex decides. `settings_check` records which
+of these happened. The dry run and private receipts preserve the request; a clean
+follow-up preserves both flags.
 
 Claude's native streaming can report a model name, though an alias may resolve
-to another literal name; its effective effort is not verified. Codex reports the
-model and effort its thread uses, and any model it reroutes the turn to; the
-receipt records them as `model_observation` and `effective_effort`. A requested
-setting stays `unknown` until Codex reports it after accepting the turn. On a
-resumed Codex thread the flags apply to this turn
-and, by Codex's definition, to the thread's later turns; a resumed call without
-them keeps whatever settings the thread reports. [Observation details](PEER-REFERENCE.md#receipt-fields-and-capture-limits).
+to another literal name; its effective effort is not verified. Codex reports a
+thread's settings when it opens the thread, so during the call a requested
+setting stays `unknown`; Codex confirms it when a later call resumes that thread.
+The receipt records what Codex reports, including a model it reroutes the turn
+to, as `model_observation` and `effective_effort`. On a resumed thread the flags
+apply to this turn and, by Codex's definition, to the thread's later turns; a
+resumed call without them keeps whatever settings the thread reports.
+[Observation details](PEER-REFERENCE.md#receipt-fields-and-capture-limits).
 
 For a review of working-tree changes, `multithread peer packet --repo
 /absolute/repo --path src/example.py --output-file /absolute/new/packet.txt`

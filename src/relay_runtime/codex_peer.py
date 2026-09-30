@@ -24,6 +24,9 @@ from .native_io import (USAGE_SCOPES, measurement_error, measurement_number,
 _MAX_PENDING = 128
 _MAX_DETAILS = 8
 _MAX_LISTING = 1024 * 1024
+# The settings check is advisory: bounded, and never the reason a call stops.
+_MODEL_LIST_PAGES = 32
+_MODEL_LIST_SECONDS = 10
 _CLIENT_INFO = {"name": "multithread", "title": "Multithread", "version": "0.4.1"}
 _HOOK_EVENTS = ("sessionStart", "userPromptSubmit", "stop", "sessionEnd", "interrupt")
 # Statuses a person resolves in Codex's /hooks review; any other is configuration.
@@ -210,8 +213,83 @@ class _Driver:
         self.observation_only = False
         self.outcome_recorded = False
         self.had_problem = False
+        self.catalog = None
+        self.listing = None
+        self.listing_deadline = None
+        self.listed_pages = 0
+        self.abandoned = set()
         self.envelope.update(state="uncertain", requested_session_id=resume,
                              needs_attention=True, task_submission="not_submitted")
+
+    def after_readiness(self):
+        """Read Codex's model list first, and only when the call requests a setting."""
+        if self.envelope.get("requested_model") is None and self.envelope.get("requested_effort") is None:
+            self.start_thread()
+            return
+        self.catalog = []
+        self.listing_deadline = time.monotonic() + min(_MODEL_LIST_SECONDS, self.remaining() / 4)
+        self.list_models(None)
+
+    def list_models(self, cursor):
+        # Hidden models stay selectable, so the check reads them too.
+        params = {"includeHidden": True}
+        if cursor is not None:
+            params["cursor"] = cursor
+        self.listing = self.request("model/list", params)
+
+    def listed(self, result):
+        """Collect one page; an unusable page leaves the settings unverified."""
+        data = result.get("data") if isinstance(result, dict) else None
+        cursor = result.get("nextCursor") if isinstance(result, dict) else None
+        if (not isinstance(data, list) or any(not isinstance(model, dict) for model in data)
+                or cursor is not None and not _identity(cursor)):
+            return self.listing_done(None)
+        self.catalog.extend(data)
+        self.listed_pages += 1
+        if cursor is None:
+            return self.listing_done(self.catalog)
+        if self.listed_pages >= _MODEL_LIST_PAGES:
+            return self.listing_done(None)
+        self.list_models(cursor)
+
+    def listing_done(self, catalog):
+        self.listing = None
+        self.catalog = catalog
+        if self.envelope.get("requested_model") is not None:
+            self.check_settings(self.envelope["requested_model"])
+        self.start_thread()
+
+    def poll_listing(self):
+        """Stop waiting for a slow model list: the call proceeds and Codex decides."""
+        if self.listing is not None and time.monotonic() >= self.listing_deadline:
+            self.pending.pop(self.listing)
+            self.abandoned.add(self.listing)
+            self.listing_done(None)
+
+    def check_settings(self, model):
+        """Refuse an effort a listed model does not advertise, before any task is submitted.
+
+        Codex accepts an unadvertised effort without error, so only this check
+        catches one. A model Codex does not list may be an alias or another
+        provider's model: it proceeds, recorded as unverified.
+        """
+        effort = self.envelope.get("requested_effort")
+        status, efforts = "unavailable", None
+        if self.catalog is not None and model is not None:
+            offered = [entry.get("supportedReasoningEfforts") for entry in self.catalog
+                       if model in (entry.get("model"), entry.get("id"))]
+            if not offered:
+                status = "model_unlisted"
+            elif all(isinstance(options, list) and all(
+                    isinstance(option, dict) and _identity(option.get("reasoningEffort")) for option in options)
+                    for options in offered):
+                efforts = list(dict.fromkeys(option["reasoningEffort"] for options in offered for option in options))
+                status = "refused" if effort is not None and effort not in efforts else "verified"
+        self.envelope["settings_check"] = {"status": status, "model": model, "advertised_efforts": efforts}
+        if status == "refused":
+            raise _ProtocolError("Codex lists model " + model + " without effort " + effort + "; it advertises "
+                                 + (", ".join(efforts) or "none") + ". No task was submitted. Choose an"
+                                 " advertised effort, or omit --effort to keep the model's default.")
 
     def start_thread(self):
         params = {"cwd": self.repo}
@@ -250,6 +328,7 @@ class _Driver:
         self.next_id += 1
         self.pending[identifier] = (method, control_id)
         self.send({"id": identifier, "method": method, "params": params})
+        return identifier
 
     def observe(self, source, settings):
         """Replace each setting a native report covers; an invalid value clears the claim."""
@@ -303,9 +382,20 @@ class _Driver:
 
     def response(self, message):
         identifier = message["id"]
-        if identifier not in self.pending or (("result" in message) == ("error" in message)):
+        if identifier in self.abandoned:
+            # The call already proceeded without this model list.
+            self.abandoned.discard(identifier)
+            return
+        if identifier not in self.pending:
             raise _ProtocolError("Unmatched or malformed native response; inspect retained output.")
         method, control_id = self.pending[identifier]
+        if method == "model/list":
+            # A rejected or unusable list leaves the settings unverified; it never stops the call.
+            self.pending.pop(identifier)
+            self.listed(None if "error" in message else message.get("result"))
+            return
+        if ("result" in message) == ("error" in message):
+            raise _ProtocolError("Unmatched or malformed native response; inspect retained output.")
         if "error" in message:
             error = message["error"]
             if (not isinstance(error, dict) or type(error.get("code")) is not int
@@ -327,10 +417,10 @@ class _Driver:
             if self.expected_hook is not None:
                 self.request("hooks/list", {"cwds": [self.repo]})
             else:
-                self.start_thread()
+                self.after_readiness()
         elif method == "hooks/list":
             self.hooks_ready(result)
-            self.start_thread()
+            self.after_readiness()
         elif method in ("thread/start", "thread/resume"):
             thread = result.get("thread")
             if not isinstance(thread, dict) or not _identity(thread.get("id")):
@@ -367,6 +457,9 @@ class _Driver:
             reported = {"model": result.get("model"), "effort": result.get("reasoningEffort")}
             self.observe("codex_" + method.replace("/", "_"),
                          {key: value for key, value in reported.items() if requested[key] is None})
+            if requested["model"] is None and requested["effort"] is not None:
+                # With no model requested, the effort applies to the thread's model.
+                self.check_settings(reported["model"] if _identity(reported["model"]) else None)
             turn = {"threadId": self.session, "input": [{"type": "text", "text": self.task}]}
             turn.update((key, value) for key, value in requested.items() if value is not None)
             self.turn_requested = True
@@ -607,6 +700,7 @@ def run(process, task: bytes, repo: str, resume: str | None, directory: Path,
                 if feedback is not None:
                     feedback()
                 driver.poll_control()
+                driver.poll_listing()
                 if driver.outgoing and not writing:
                     selector.register(process.stdin, selectors.EVENT_WRITE, "stdin")
                     writing = True
