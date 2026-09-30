@@ -181,18 +181,18 @@ answer. Multithread makes one invocation and never automatically retries it.
 
 `--model` and `--effort` request settings for this call without changing the
 account profile; with neither, the provider uses its configured default. Claude
-receives them as native options, so `--model opus --effort high` works as it does
-there; Claude accepts `low`, `medium`, `high`, `xhigh` or `max`. Codex receives
-both with the turn the call starts. Each Codex model advertises its own efforts,
-so Multithread passes the name through and Codex decides whether to accept it.
-The dry run and private receipts preserve the request; a clean follow-up
-preserves both flags.
+receives them as its native options, as in `--model opus --effort high`, and
+accepts `low`, `medium`, `high`, `xhigh` or `max`. Codex receives both with the
+turn the call starts. Each Codex model advertises its own efforts, so Multithread
+passes the name through and Codex decides whether to accept it. The dry run and
+private receipts preserve the request; a clean follow-up preserves both flags.
 
 Claude's native streaming can report a model name, though an alias may resolve
 to another literal name; its effective effort is not verified. Codex reports the
-model and effort its thread uses, recorded as `model_observation` and
-`effective_effort`. A requested setting stays `unknown` until Codex reports it
-after accepting the turn. On a resumed Codex thread the flags apply to this turn
+model and effort its thread uses, and any model it reroutes the turn to; the
+receipt records them as `model_observation` and `effective_effort`. A requested
+setting stays `unknown` until Codex reports it after accepting the turn. On a
+resumed Codex thread the flags apply to this turn
 and, by Codex's definition, to the thread's later turns; a resumed call without
 them keeps whatever settings the thread reports. [Observation details](PEER-REFERENCE.md#receipt-fields-and-capture-limits).
 
