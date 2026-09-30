@@ -363,7 +363,8 @@ for line in sys.stdin:
                         if hook["key"] == key:
                             hook["trustStatus"] = "trusted" if record["trusted_hash"] == hook["currentHash"] else "modified"
             elif edit["value"] is None:
-                key = json.loads(edit["keyPath"][len("hooks.state."):-len(".trusted_hash")])
+                path = edit["keyPath"][len("hooks.state."):]
+                key = json.loads(path[:-len(".trusted_hash")] if path.endswith(".trusted_hash") else path)
                 for hook in spec["hooks"]:
                     if hook["key"] == key:
                         hook["trustStatus"] = "untrusted"
@@ -483,14 +484,17 @@ class TrustTests(HomeCase):
         records[self.path + ":session_start:0:0"] = "sha256:" + "e" * 64
         records["/<session-flags>/config.toml:stop:0:0"] = NATIVE_HASHES["Stop"]
         (self.codex_home / "config.toml").write_text("".join(
-            f'[hooks.state.{json.dumps(key)}]\ntrusted_hash = "{value}"\n' for key, value in records.items()))
+            f'[hooks.state.{json.dumps(key)}]\ntrusted_hash = "{value}"\n'
+            + ("enabled = true\n" if key == self.keys["Stop"] else "") for key, value in records.items()))
         self.config(self.ours(**{event: {"status": "trusted"} for event in hooks.EVENTS["codex"]}))
         plan = hooks.trust(self.codex, revoke=True)
         self.assertEqual(sorted(self.keys.values()), [item["key"] for item in plan["hooks"]])
         self.assertEqual({"replace"}, {edit["mergeStrategy"] for edit in plan["edits"]})
         self.assertEqual({None}, {edit["value"] for edit in plan["edits"]})
-        self.assertIn('hooks.state.' + json.dumps(self.keys["Stop"]) + '.trusted_hash',
-                      [edit["keyPath"] for edit in plan["edits"]])
+        # A record holding only trust goes; the person's own setting beside it stays.
+        self.assertEqual(sorted(['hooks.state.' + json.dumps(key) + ('.trusted_hash' if event == "Stop" else '')
+                                 for event, key in self.keys.items()]),
+                         sorted(edit["keyPath"] for edit in plan["edits"]))
         result = hooks.trust(self.codex, revoke=True, expected=plan["plan_sha256"])
         self.assertEqual("revoked", result["state"])
         self.assertEqual({"untrusted"}, {item["status_after"] for item in result["hooks"]})

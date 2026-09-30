@@ -499,7 +499,10 @@ def trust(codex=None, environ=None, *, revoke=False, expected=None, timeout=20):
                 revoked = sorted(key for key, record in records.items() if key.startswith(prefix)
                                  and isinstance(record, dict) and record.get("trusted_hash") in hashes)
                 result["hooks"] = [{"key": key, "hash": records[key]["trusted_hash"]} for key in revoked]
-                edits = [{"keyPath": 'hooks.state."' + key.replace("\\", "\\\\").replace('"', '\\"') + '".trusted_hash',
+                # Remove the whole record when trust is all it holds; keep a
+                # person's own setting (enabled) and remove only the hash.
+                edits = [{"keyPath": 'hooks.state."' + key.replace("\\", "\\\\").replace('"', '\\"') + '"'
+                          + ("" if set(records[key]) == {"trusted_hash"} else ".trusted_hash"),
                           "value": None, "mergeStrategy": "replace"} for key in revoked]
             else:
                 reviewed, problems, others = _review(server.call("hooks/list", {"cwds": [neutral]}), neutral, installed)
