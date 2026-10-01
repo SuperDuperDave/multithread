@@ -260,6 +260,20 @@ class WakeBindingTests(WakeLedgerCase):
                                     expected_generation=first["generation"] + 1)
         self.assertEqual(before, self.store.events())
 
+    def test_handover_notices_preserve_long_valid_claude_identities(self):
+        agent, old, new = "a" * 200, "o" * 200, "n" * 200
+        first = self.store.wake_bind("reviewer", provider="claude", endpoint="unix:///srv/old.sock",
+                                     replace=False, agent=agent, session=old)["binding"]
+        moved = self.store.wake_bind("reviewer", provider="claude", endpoint="unix:///srv/new.sock",
+                                     replace=True, agent=agent, session=new,
+                                     expected_generation=first["generation"], reason="Approved synthetic transfer",
+                                     approval_ref="receipt:approval")["binding"]
+        self.assertGreater(moved["generation"], first["generation"])
+        for session in (old, new):
+            notices = self.store.inbox(agent, session=session)["pending_signals"]
+            self.assertEqual(1, len(notices))
+            self.assertEqual(f"{agent}:{session}", notices[0]["target"])
+
     def test_a_change_to_a_stale_generation_fails_closed(self):
         generation = self.bind()["binding"]["generation"]
         self.bind(OTHER, replace=True)

@@ -89,5 +89,14 @@ class SessionInboxTests(fixtures.RelayTestCase):
             self.assertEqual(session, receipt["event"]["session"])
             self.assertEqual([], store.inbox("codex", session=session)["pending_signals"])
 
+    def test_maximum_agent_and_session_pair_can_receive_and_ack_exact_target(self):
+        agent, session = "a" * 200, "s" * 200
+        with self.open_store() as store:
+            seq = self.handoff(store, 1, f"{agent}:{session}")
+            self.assertEqual([seq], [item["seq"] for item in store.inbox(agent, session=session)["pending_signals"]])
+            receipt = store.acknowledge(seq, agent=agent, session=session)
+            self.assertEqual(f"{agent}:{session}", receipt["event"]["target"])
+            self.assertEqual([], store.inbox(agent, session=session)["pending_signals"])
+
 if __name__ == "__main__":
     unittest.main()

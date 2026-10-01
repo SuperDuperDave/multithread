@@ -73,7 +73,8 @@ def build_parser() -> argparse.ArgumentParser:
     signal.add_argument("--work-id")
     signal.add_argument("--target")
     signal.add_argument("--scope")
-    signal.add_argument("--artifact")
+    signal.add_argument("--artifact", help="required for work.handoff/review.requested unless --commit is used; "
+                        "git:<full-oid>, sha256:<64-hex-digest> or receipt:<stable-id>")
     signal.add_argument(
         "--commit",
         help="resolve a commit and use its immutable OID + bounded subject as the handoff capsule",
