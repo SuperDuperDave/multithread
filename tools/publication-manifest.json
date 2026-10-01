@@ -65,6 +65,7 @@
     "tests/core/test_relay_channel_pending.py",
     "tests/core/test_relay_decisions.py",
     "tests/core/test_relay_wake.py",
+    "tests/core/test_session_inbox.py",
     "tests/providers/claude_startup_probe.py",
     "tests/providers/codex_discovery_probe.py",
     "tests/run_tests.py",

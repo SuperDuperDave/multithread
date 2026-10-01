@@ -234,11 +234,12 @@ _META_KEYS: dict[str, frozenset[str]] = {
         }
     ),
     "wake.bound": frozenset(
-        {"role", "provider", "thread", "endpoint", "cwd", "replaces"}
+        {"role", "provider", "thread", "endpoint", "cwd", "replaces",
+         "charter", "role_scope", "reason", "approval_ref", "previous_holder"}
     ),
-    "wake.unbound": frozenset({"role", "generation"}),
-    "wake.paused": frozenset({"role", "generation"}),
-    "wake.resumed": frozenset({"role", "generation"}),
+    "wake.unbound": frozenset({"role", "generation", "reason", "approval_ref"}),
+    "wake.paused": frozenset({"role", "generation", "reason", "approval_ref"}),
+    "wake.resumed": frozenset({"role", "generation", "reason", "approval_ref"}),
     "wake.attempted": frozenset(
         {
             "role",
@@ -468,6 +469,15 @@ def _wake_target(meta: Mapping[str, Any]) -> None:
 
 def _validate_wake(kind: str, meta: Mapping[str, Any]) -> None:
     canonical_wake_role(meta.get("role"))
+    if "approval_ref" in meta:
+        if not _ARTIFACT_RE.fullmatch(str(meta["approval_ref"])):
+            raise ValidationError("approval_ref must be an immutable git:, sha256: or receipt: reference")
+        _one_line("reason", meta.get("reason"), 300)
+    for key in ("charter", "role_scope", "reason"):
+        if key in meta:
+            _one_line(key, meta[key], 300)
+    if "previous_holder" in meta:
+        _identifier("previous_holder", meta["previous_holder"])
     if kind == "wake.bound":
         _wake_target(meta)
         endpoint = _one_line("endpoint", meta.get("endpoint"), 408)
