@@ -157,6 +157,8 @@ From the chosen checkout:
 This read-only check verifies runtime identity, repository integrity and ledger
 status, then prepares invocation plans for providers found on `PATH`. It prints
 exact next commands. Add `--json` for structured observations and next actions.
+The installed version is at `runtime.data.activation.version` in that JSON,
+alongside `release_id` and `activation_id`; it is not a top-level setup field.
 For Codex it also asks Codex's app server for this checkout's hook listing, the
 same check a Codex peer call makes before any task: `initialize` and `hooks/list`
 only, with no thread, turn, model call or trust change. Setup runs no other
@@ -185,7 +187,7 @@ Select reviewed provider paths explicitly when necessary:
 |---|---|---|
 | Runtime verified | Healthy installed status and exact release/activation identity | Any installation refusal needs its specific inspection or recovery action. |
 | Repository verified | Enrollment, exact Git identity, healthy integrity check and matching ledger status | Preserve state on refusal or unavailable observation; do not delete or forge enrollment markers. |
-| Provider prepared | Executable path, where its hooks come from (`hook_source`: `user` for the installed user-level hooks, `session_flags` when only launch and peer pass them) and a matching plan; for Codex, all five Multithread hooks listed as trusted for this checkout | Provider version, sign-in and tool capability are not checked. `needs_hook_review` names each event Codex lists as untrusted, modified or disabled; `needs_hook_configuration` names hooks that are missing, duplicated or not as installed. A missing provider can be installed or located through its normal interface. |
+| Provider prepared | Executable path, where its hooks come from (`hook_source`: `user` for the installed user-level hooks, `session_flags` when only launch and peer pass them) and a matching plan; for Codex, all Multithread hooks listed as trusted for this checkout | Provider version, sign-in and tool capability are not checked. `needs_hook_review` names each event Codex lists as untrusted, modified or disabled; `needs_hook_configuration` names hooks that are missing, duplicated or not as installed. A missing provider can be installed or located through its normal interface. |
 | Coverage | `hook_coverage`: recent Codex and Claude sessions in this repository that left no ledger events, with the cause and fix | See [when a session cannot reach its ledger](#when-a-session-cannot-reach-its-ledger). |
 | Hook/context delivery | Not checked by setup | Observe the Multithread context in an authorized native session. A generated plan or zero hook exit does not prove delivery. |
 | Provider tools | Not checked by setup | Observe an authorized native tool action. Tool execution alone does not establish a completed collaboration workflow. |
@@ -197,6 +199,19 @@ followed by incomplete enrollment remains a successful code installation with
 repository setup unresolved. After a timeout or uncertain enrollment result,
 run the printed read-only check before deciding whether to retry. Keep local
 diagnostics private and sanitize anything shared.
+
+For a linked worktree, run this check from that worktree as well. Confirm its
+absolute Git common directory matches the enrolled checkout's: they share the
+ledger, but the new worktree's own path and Git metadata must also pass the
+[folder checks](#folder-permissions). A ready primary checkout does not establish
+that a newly created worktree is ready.
+
+If the installed launcher reports `unsafe launcher ancestry` inside an agent's
+sandbox, even `--help`, `--version` and setup checks refuse before dispatch.
+Use the installed launcher through the agent host's approved execution route
+outside that sandbox, or an ordinary account terminal. See
+[launcher diagnosis](SUPPORT.md#diagnose-without-changing-live-configuration);
+keep the ancestry checks intact.
 
 ### Folder permissions
 
@@ -217,16 +232,27 @@ multithread: enrollment directory permissions are unsafe: other users could chan
 A umask of 002 creates directories with group write, so a fresh clone can start this way.
 ```
 
-Run the listed commands, then check or enroll again. Nothing was written before
-the refusal. A clone made under `umask 022` starts without group write.
+Review the listed paths and apply only the authorized, directory-specific fixes,
+then check or enroll again. Nothing was written before the refusal. Ordinary
+checkout and Git directories may be `0755` or `0700`; group/other write bits
+(`0022`) must be clear. Private Multithread state and account-registry directories
+must have no group/other access (`0077`), normally mode `0700`. Use the exact
+mode requirement printed for each path; a general `0755` fix is unsuitable for
+private state.
+
+Create new clones and linked worktrees with `umask 022` for that operation to
+avoid group-write directories. It leaves existing parents and the shared Git
+directory unchanged. Check a linked worktree's checkout path, its ancestors,
+the shared Git directory and `.git/worktrees` entries using the readiness check
+above. Do not run recursive `chmod`, change ownership, or relax the checks.
 
 ## Connect every session
 
 Hooks connect a Codex or Claude session to its checkout's ledger: the session
 records its lifecycle and receives the coordination brief. Installed once for
 your account, they reach every session in an enrolled repository however it was
-started: the Codex app, a terminal, an IDE, `launch` or a peer call. In a
-repository you have not enrolled they do nothing.
+started with those settings enabled: the Codex app, a terminal, an IDE, `launch`
+or a peer call. In a repository you have not enrolled they do nothing.
 
 ```sh
 ~/.local/bin/multithread hooks install
@@ -253,7 +279,7 @@ has no per-hook trust. Choose one route:
   and the desktop app's hook screen may not
   ([openai/codex#47283](https://github.com/openai/codex/issues/47283)). Run
   `codex` in your home directory, type `/hooks`, and for SessionStart,
-  UserPromptSubmit, Stop, SessionEnd and Interrupt trust the hook from
+  UserPromptSubmit, PostToolUse, Stop, SessionEnd and Interrupt trust the hook from
   `~/.codex/hooks.json` whose command is exactly the one `hooks status` prints.
   Leave other hooks as you choose.
 - **Agent-assisted.** Your agent runs `~/.local/bin/multithread hooks trust`.
@@ -274,6 +300,16 @@ both providers, each hook command, and the next step. A Codex conversation
 that started earlier may keep running without them: start a new one after
 trusting. Claude Code normally picks up hook changes in a running session.
 
+The `PostToolUse` event adds a bounded, nonblocking pending-work reminder using
+the same installed hook command and a read-only ledger observation. A runtime
+update does not edit existing user hook settings or trust this new Codex event.
+If you choose to add it, review the exact
+hook plan and complete your normal Codex trust step. It never acknowledges work
+automatically; use [the session inbox and role views](PEER.md#inspect-pending-work-and-role-handovers)
+for the reminder's ten-second suppression rules and to inspect and consume
+pending work explicitly. Native reminder delivery remains unverified until
+observed in that session.
+
 With user-level hooks installed, `launch` and peer calls add no invocation copy,
 so each event runs once; a partial or altered installation makes them refuse
 and name the fix. To take the hooks out, run `hooks trust --revoke` (Codex),
@@ -284,6 +320,15 @@ by you and closed to others; `mkdir -m 700 -p` leaves an existing directory's
 mode as it was, so it checks the owner, the mode and that the path is not a
 symbolic link. A settings file that does not exist is recorded as absent, not
 as a failed copy.
+
+An intentionally restricted Claude invocation can exclude user settings with
+[`--setting-sources`](https://code.claude.com/docs/en/cli-reference), for example
+`--setting-sources project,local`. It then excludes the installed user-level
+Multithread hooks too. Setup can verify their installation without proving that
+this particular session loaded them; when user hooks are installed, launch and
+peer add no invocation copy. Preserve the invocation's chosen restriction and
+report missing delivery explicitly. Do not enable broader settings or change
+global hooks merely to make that session appear covered.
 
 To retire another tool's hooks that you no longer want, for example an older
 lifecycle dispatcher, name each exact command with `--command`, first for its

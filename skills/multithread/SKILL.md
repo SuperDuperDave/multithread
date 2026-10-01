@@ -18,6 +18,16 @@ installation, enrollment, readiness, or native trust review, follow the current
 `multithread setup --repo <checkout> --check` reports preparation and whether
 Codex lists the Multithread hooks as trusted, not provider authentication, hook
 delivery, tool capability, or a completed collaboration.
+Its JSON version is `runtime.data.activation.version`. Check readiness in the
+actual linked worktree, whose path and shared Git metadata must also be safe.
+An intentionally restricted Claude `--setting-sources` invocation that omits
+`user` does not load installed user-level hooks; report that delivery limit
+without changing its settings restriction or global configuration.
+
+An `unsafe launcher ancestry` refusal happens before command dispatch, including
+help, version and setup. Use the installed launcher through the agent host's
+approved execution route outside that sandbox, or report the ordinary-terminal
+route to the person. Never bypass or weaken the launcher checks.
 
 Launch is the person's step. Never run `multithread launch`. Change provider
 hook settings or Codex hook trust only through `multithread hooks install`,
@@ -40,16 +50,26 @@ Choose the interaction that fits the task:
   dry run inspects the invocation without checking readiness (`setup --check`
   does); `peer ... --json` executes it.
 - For durable coordination between separate sessions and worktrees, use the
-  installed `status`, `brief`, and command help with the
+  installed `status`, `brief`, `inbox`, `roles`, and command help with the
   [provider walkthrough](https://github.com/SuperDuperDave/multithread/blob/main/docs/PROVIDERS.md).
   Hooks provide this session's coordination identity and bounded pending state.
   Respect exact claim ownership, immutable commit handoffs, explicit ACKs,
   documented manual wakes, and the operator's Git responsibilities.
+  For authorized ledger writes, use both `--agent` and `--session` with your
+  exact coordination identity (or existing `RELAY_AGENT`/`RELAY_SESSION`). A
+  handoff accepts `--commit REVISION`, `--artifact git:FULL_OID`, or
+  `--artifact sha256:FULL_64_HEX_DIGEST`; a file path alone is not an artifact.
+  Read [session inbox and handover guidance](https://github.com/SuperDuperDave/multithread/blob/main/docs/PEER.md#inspect-pending-work-and-role-handovers)
+  before acknowledging work or changing a role. Reads and pending reminders
+  never ACK; a role takeover requires release or actual user authority, not
+  `--replace` alone. Old messages and claims keep their original ownership.
 - To point an already-open Codex conversation or Claude Code session at new
   work, bind it to a role once and send it a pointer with `multithread wake`, as
   the [peer guide](https://github.com/SuperDuperDave/multithread/blob/main/docs/PEER.md#wake-an-existing-conversation)
   describes. A wake names a task file or ledger sequence, never its content, and
-  its result says whether it was sent and what to do next. Inside Codex's
+  its result says whether it was sent and what to do next. Use `wake ROLE
+  --status` to inspect original-binding attempts and ACK evidence without
+  resending; transport acceptance does not prove consumption. Inside Codex's
   sandbox the installed launcher refuses by design ("unsafe launcher ancestry"),
   and the sandbox may also block a Claude Code inbox socket: run `multithread
   wake` through Codex's approved escalation outside the sandbox, and never work
