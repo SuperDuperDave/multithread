@@ -164,6 +164,33 @@ class SetupTests(unittest.TestCase):
         self.assertEqual(1, code)
         self.assertEqual("unavailable", result["repository"]["doctor"]["state"])
 
+    def test_a_folder_outside_git_is_never_told_to_enroll(self):
+        refusal = b'multithread: "/fixture" is not a Git checkout: run from an enrolled checkout or pass --repo <checkout>\n'
+        step = [{"stage": "repository", "action": "This folder is not inside a Git checkout, so Multithread can't "
+                 "use it here. Run setup from your repository's checkout, or pass --repo <checkout>."}]
+        self.responses["doctor"] = self.responses["init"] = (66, b"", refusal)
+        for extra in ((), ("--apply",)):
+            with self.subTest(extra=extra), mock.patch.object(setup.provider, "prepare") as prepare:
+                code, result = self.invoke(*extra)
+                self.assertEqual(1, code)
+                self.assertEqual("not_ready", result["state"])
+                self.assertEqual("not_a_checkout", result["repository"]["state"])
+                self.assertEqual("not_a_checkout", result["repository"]["doctor"]["state"])
+                self.assertEqual("not_a_checkout" if extra else "not_requested",
+                                 result["repository"]["enrollment"]["state"])
+                self.assertNotIn("message", result["repository"]["enrollment"])
+                self.assertEqual(step, result["next_actions"])
+                prepare.assert_not_called()
+                lines = self.display(result).splitlines()
+                self.assertEqual("Multithread is installed; this folder is not a Git checkout.", lines[0])
+                self.assertIn("Repository: not_a_checkout", lines)
+                self.assertFalse([line for line in lines if line.startswith("Diagnostic: ")])
+                self.assertNotIn("--apply", "\n".join(lines))
+        # Only the installed command's own status means outside Git; the same text alone does not.
+        self.responses["doctor"] = (1, b"", refusal)
+        code, result = self.invoke()
+        self.assertEqual("failed", result["repository"]["state"])
+
     def test_unenrolled_checkout_gets_one_plain_next_step(self):
         refusal = b"multithread: this checkout is not enrolled: \"/fixture\". If this ...\n"
         self.responses["doctor"] = (78, b"", refusal)

@@ -299,17 +299,23 @@ def _outcome(status, happened, next_step, **details):
             "happened": happened, "next": next_step, **details}
 
 
+def _printable(text):
+    """Text for the terminal: a control character in a path or reply is shown escaped, never run."""
+    return "".join(character if character.isprintable() else json.dumps(character)[1:-1]
+                   for character in str(text))
+
+
 def _emit(result, as_json):
     if as_json:
         print(json.dumps(result, ensure_ascii=False, sort_keys=True))
     else:
-        print(f"{result['status']}: {result['happened']}")
+        print(_printable(f"{result['status']}: {result['happened']}"))
         if result.get("text") and result["status"] in ("STEERED", "QUEUED", "DELIVERED TO INBOX", "UNCERTAIN",
                                                         "DRY RUN"):
-            print(f"Message {result['message_id']}: {json.dumps(result['text'], ensure_ascii=False)}")
+            print(_printable(f"Message {result['message_id']}: {json.dumps(result['text'], ensure_ascii=False)}"))
         if result.get("warning"):
-            print("Warning: " + result["warning"])
-        print("Next: " + result["next"])
+            print(_printable("Warning: " + result["warning"]))
+        print(_printable("Next: " + result["next"]))
     return result["exit_code"]
 
 
@@ -875,17 +881,17 @@ def bind_main(argv=None, *, ledger=launcher_ledger):
     try:
         shown = _show(ledger, repo, canonical_wake_role(args.role) if args.role is not None else None)
     except (ValidationError, LedgerRefused) as exc:
-        print(f"multithread bind: {exc}" + (f". Next: {exc.next_step}" if isinstance(exc, LedgerRefused) else ""),
-              file=sys.stderr)
+        print(_printable(f"multithread bind: {exc}" + (f". Next: {exc.next_step}" if isinstance(exc, LedgerRefused)
+                                                        else "")), file=sys.stderr)
         return 1
     if args.json:
         print(json.dumps({"schema": 1, **shown}, ensure_ascii=False, sort_keys=True))
         return 0
     bound = [item for item in shown["bindings"] if item["state"] != "unbound"]
     for item in bound:
-        print("\n".join(_describe(item)))
+        print("\n".join(_printable(line) for line in _describe(item)))
     if not bound:
-        print(f"{'No roles are' if args.role is None else args.role + ' is not'} bound in the ledger at "
-              f"{shown['ledger']}.")
+        print(_printable(f"{'No roles are' if args.role is None else args.role + ' is not'} bound in the ledger "
+                         f"at {shown['ledger']}."))
         print(f"Next: multithread bind {args.role or '<role>'} --thread <codex conversation id>")
     return 0

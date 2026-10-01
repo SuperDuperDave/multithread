@@ -2813,8 +2813,8 @@ def _git_path(cwd: Path, flag: str) -> Path:
     except subprocess.CalledProcessError as exc:
         if "not a git repository" in (exc.stderr or "").lower():
             raise StateError(
-                f"{cwd} is not a Git checkout: run from an enrolled checkout or pass "
-                "--repo <checkout>"
+                f"{json.dumps(str(cwd), ensure_ascii=True)} is not a Git checkout: run from an "
+                "enrolled checkout or pass --repo <checkout>"
             ) from exc
         raise StateError(f"cannot resolve Multithread repository identity: {exc}") from exc
     except (OSError, subprocess.SubprocessError) as exc:

@@ -85,6 +85,20 @@ class EnrollmentTests(unittest.TestCase):
                                      str(refused.exception))
                     self.assertEqual(before, snapshot(self.base))
 
+    def test_a_folder_outside_git_is_named_escaped_with_its_own_status(self):
+        for name in ("notes", "notes\x1b[2J\u202e"):
+            with self.subTest(name=name):
+                folder = self.base / name
+                folder.mkdir()
+                before = snapshot(self.base)
+                with self.assertRaises(subject.NotACheckout) as refused:
+                    self.registry.enroll(folder)
+                self.assertEqual(66, refused.exception.exit_code)
+                self.assertEqual(json.dumps(str(folder), ensure_ascii=True) + " is not a Git checkout: run from an "
+                                 "enrolled checkout or pass --repo <checkout>", str(refused.exception))
+                self.assertTrue(str(refused.exception).isprintable())
+                self.assertEqual(before, snapshot(self.base))
+
     def test_state_without_an_enrollment_is_never_called_unenrolled(self):
         self.registry.enroll(self.second_repo())
         for leftover in (self.repo / ".relay", self.repo / ".git" / "relay-enrollment.json"):

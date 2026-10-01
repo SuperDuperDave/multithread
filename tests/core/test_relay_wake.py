@@ -384,8 +384,8 @@ class NotACheckoutTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="relay-not-git-") as folder:
             with self.assertRaises(StateError) as refused:
                 RelayStore.open(repo=folder, state_home=Path(folder) / "state")
-            self.assertEqual(f"{Path(folder).resolve()} is not a Git checkout: run from an enrolled checkout or "
-                             "pass --repo <checkout>", str(refused.exception))
+            self.assertEqual(f"{json.dumps(str(Path(folder).resolve()))} is not a Git checkout: run from an "
+                             "enrolled checkout or pass --repo <checkout>", str(refused.exception))
             self.assertFalse((Path(folder) / "state").exists())
 
 

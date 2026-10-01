@@ -51,6 +51,18 @@ class NotEnrolled(EnrollmentError):
         self.root = root
 
 
+class NotACheckout(EnrollmentError):
+    """Git itself says the folder is outside any repository."""
+
+    # sysexits EX_NOINPUT. Setup reads this status as a folder outside Git.
+    exit_code = 66
+
+    def __init__(self, path: Path):
+        super().__init__(json.dumps(str(path), ensure_ascii=True)
+                         + " is not a Git checkout: run from an enrolled checkout or pass --repo <checkout>")
+        self.path = path
+
+
 def command_text(argv: list[str]) -> str:
     """A command to paste, or JSON when an argument could disturb the terminal."""
     if all(argument.isprintable() for argument in argv):
@@ -491,12 +503,12 @@ def _git_identity(directory: _Directory) -> tuple[Path, Path, Path]:
         )
     except subprocess.CalledProcessError as exc:
         if "not a git repository" in (exc.stderr or "").lower():
-            raise EnrollmentError(f"{directory.path} is not a Git checkout: run from an enrolled checkout "
-                                  "or pass --repo <checkout>") from exc
-        raise EnrollmentError(f"Git could not inspect {directory.path} as a checkout: run from an enrolled "
-                              "checkout or pass --repo <checkout>") from exc
+            raise NotACheckout(directory.path) from exc
+        raise EnrollmentError(f"Git could not inspect {json.dumps(str(directory.path), ensure_ascii=True)} as a "
+                              "checkout: run from an enrolled checkout or pass --repo <checkout>") from exc
     except (OSError, subprocess.SubprocessError) as exc:
-        raise EnrollmentError(f"cannot resolve a supported Git workspace at {directory.path} "
+        raise EnrollmentError("cannot resolve a supported Git workspace at "
+                              f"{json.dumps(str(directory.path), ensure_ascii=True)} "
                               f"({exc.__class__.__name__})") from exc
     directory.custody.verify()
     lines = result.stdout.splitlines()

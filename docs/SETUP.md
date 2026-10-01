@@ -170,7 +170,9 @@ To explicitly enroll a new chosen repository, then run the same checks:
 
 A checkout that is not enrolled yet reports `not_enrolled`, with this command as
 its one next step. `status`, `doctor`, `peer` and `launch` in that checkout
-name the same command.
+name the same command. A folder outside any Git checkout reports
+`not_a_checkout` instead: run setup from your repository's checkout, or pass
+`--repo` with it.
 
 Select reviewed provider paths explicitly when necessary:
 

@@ -874,6 +874,19 @@ class WakeLedgerTests(WakeCase):
                          result["next"])
         self.assertEqual([], self.codex_calls())
 
+    def test_text_output_shows_a_control_character_escaped(self):
+        folder = self.base / "notes\x1b[2J\u202e"
+        folder.mkdir()
+        # The reference itself is refused when it carries one; here only the checkout path does.
+        for main, argv in ((wake.wake_main, ["operator", "--ref", str(self.task)]),
+                           (wake.bind_main, ["operator", "--thread", THREAD])):
+            with self.subTest(main=main.__name__):
+                code, out = self.run_helper(main, *argv, "--agent", "claude", "--session", "s", "--repo", str(folder))
+                self.assertEqual(4, code)
+                self.assertNotIn("\x1b", out)
+                self.assertNotIn("\u202e", out)
+                self.assertIn("ledger at " + str(self.base) + "/notes\\u001b[2J\\u202e", out)
+
     def test_an_unenrolled_checkout_is_pointed_at_enrollment_not_doctor(self):
         refusal = (f"this checkout is not enrolled: {json.dumps(str(self.repo))}. If this is the repository you "
                    f"want Multithread in, enroll it with: {LAUNCHER} setup --repo {self.repo} --apply")
@@ -898,14 +911,15 @@ class WakeLedgerTests(WakeCase):
         code, out = self.run_helper(wake.wake_main, "operator", "--ref", str(folder / "task.md"), "--agent",
                                     "claude", "--session", "s", "--repo", str(folder))
         self.assertEqual(4, code)
-        self.assertEqual([f"NOT SENT: The ledger at {folder} couldn't record this wake: {folder} is not a Git "
-                          "checkout: run from an enrolled checkout or pass --repo <checkout>. Nothing was sent.",
-                          "Next: Run it from an enrolled checkout, or pass --repo <checkout>."], out.splitlines())
+        self.assertEqual([f"NOT SENT: The ledger at {folder} couldn't record this wake: {json.dumps(str(folder))} "
+                          "is not a Git checkout: run from an enrolled checkout or pass --repo <checkout>. Nothing "
+                          "was sent.", "Next: Run it from an enrolled checkout, or pass --repo <checkout>."],
+                         out.splitlines())
         code, out = self.run_helper(wake.bind_main, "operator", "--thread", THREAD, "--agent", "claude",
                                     "--session", "s", "--repo", str(folder))
         self.assertEqual(4, code)
         self.assertTrue(out.startswith(f"NOT BOUND: Nothing was recorded: the ledger at {folder} couldn't show its "
-                                       f"bindings: {folder} is not a Git checkout"))
+                                       f"bindings: {json.dumps(str(folder))} is not a Git checkout"))
         self.assertTrue(out.endswith("Next: Run it from an enrolled checkout, or pass --repo <checkout>.\n"))
         self.assertEqual(0, self.daemon.connections)
 

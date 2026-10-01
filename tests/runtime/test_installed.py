@@ -141,16 +141,25 @@ registry = Registry(pathlib.Path({str(self.registry)!r}))
     def test_a_folder_outside_git_names_itself_and_the_fix(self):
         folder = self.base / "relay-notes"
         folder.mkdir()
-        expected = (f"multithread: {folder} is not a Git checkout: run from an enrolled checkout or pass "
-                    "--repo <checkout>")
+        expected = (f"multithread: {json.dumps(str(folder))} is not a Git checkout: run from an enrolled checkout "
+                    "or pass --repo <checkout>")
         for args in (("status",), ("signal", "work.intent", "--agent", "codex", "--session", "s", "--work-id", "w",
                                    "--summary", "note"), ("claim", "code:x", "--agent", "codex", "--session", "s",
                                                            "--purpose", "p")):
             for placement in ({"repo": folder}, {"cwd": folder}):
                 with self.subTest(command=args[0], **{key: True for key in placement}):
                     result = self.command(*args, **placement)
-                    self.assertNotEqual(0, result.returncode)
-                    self.assertEqual(expected, result.stderr.strip().splitlines()[-1])
+                    self.assertEqual(66, result.returncode)
+                    self.assertEqual(expected + "\n", result.stderr)
+        # A control character in the folder's name reaches the terminal escaped, never raw.
+        odd = self.base / "notes\x1b[2J\u202e"
+        odd.mkdir()
+        result = self.command("status", repo=odd)
+        self.assertEqual(66, result.returncode)
+        self.assertEqual(f"multithread: {json.dumps(str(odd))} is not a Git checkout: run from an enrolled "
+                         "checkout or pass --repo <checkout>\n", result.stderr)
+        self.assertNotIn("\x1b", result.stderr)
+        self.assertNotIn("\u202e", result.stderr)
         self.assertFalse(self.registry.exists())
 
     def test_state_overrides_refuse_before_enrollment(self):
