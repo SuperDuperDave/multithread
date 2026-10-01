@@ -31,7 +31,8 @@ from . import account_launcher, hooks
 from .enrollment import NotEnrolled
 
 SOCKET = Path("app-server-control") / "app-server-control.sock"
-EXIT_CODES = {"STEERED": 0, "QUEUED": 0, "DELIVERED TO INBOX": 0, "DRY RUN": 0, "BOUND": 0, "ALREADY BOUND": 0,
+EXIT_CODES = {"STEERED": 0, "QUEUED": 0, "DELIVERED TO INBOX": 0, "DRY RUN": 0, "STATUS": 0,
+              "BOUND": 0, "ALREADY BOUND": 0,
               "ALREADY SENT": 3, "NOT SENT": 4, "NOT BOUND": 4, "UNCERTAIN": 5}
 _CLIENT_INFO = {"name": "multithread-wake", "title": "Multithread wake", "version": "1"}
 _WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
@@ -296,7 +297,9 @@ def launcher_ledger(repo, *arguments):
 
 def _outcome(status, happened, next_step, **details):
     return {"schema": 1, "status": status, "exit_code": EXIT_CODES[status],
-            "happened": happened, "next": next_step, **details}
+            "happened": happened, "next": next_step, "consumption_state": "unknown",
+            "recipient_state": {"reachability": "unknown", "turn_state": "unknown", "source": "unobserved"},
+            **details}
 
 
 def _printable(text):
@@ -315,6 +318,15 @@ def _emit(result, as_json):
             print(_printable(f"Message {result['message_id']}: {json.dumps(result['text'], ensure_ascii=False)}"))
         if result.get("warning"):
             print(_printable("Warning: " + result["warning"]))
+        if result["status"] == "STATUS":
+            history = result["history"]
+            for attempt in history.get("attempts", []):
+                print(_printable(f"Attempt {attempt['seq']}: {attempt['outcome']}; recipient "
+                                 f"{attempt['recipient']} under binding {attempt['generation']}; "
+                                 f"consumption {attempt['consumption_state']}"))
+            if history.get("has_more"):
+                print(_printable(f"More attempts remain; read wake-ledger history {result['role']} "
+                                 f"--before {history['next_before']}."))
         print(_printable("Next: " + result["next"]))
     return result["exit_code"]
 
@@ -398,6 +410,26 @@ def _next_id(message_id):
     return stem[:128 - len(suffix)] + suffix
 
 
+def wake_status(args, ledger=launcher_ledger):
+    """Read durable attempts without reading a referenced file or contacting its recipient."""
+    repo = Path(args.repo or os.getcwd()).absolute()
+    try:
+        role = canonical_wake_role(args.role)
+        ref = canonical_wake_ref(args.ref) if args.ref is not None else None
+    except ValidationError as exc:
+        return _outcome("NOT SENT", f"Status wasn't read: {exc}.", "Correct that and run this again.")
+    code, history, problem = ledger(repo, "wake-ledger", "history", role,
+                                    *(["--ref", ref] if ref is not None else []))
+    if code != 0:
+        return _outcome("NOT SENT", f"The ledger at {repo} couldn't report wake status: {problem}.",
+                        _ledger_next(code, repo, "read status again"), role=role, ref=ref)
+    return _outcome("STATUS", f"Read recorded wake attempts for {role}. Nothing was sent; recipient reachability "
+                    "and current turn state were not probed.",
+                    "Inspect each attempt's outcome and consumption_state; transport acceptance is not consumption.",
+                    role=role, ref=ref, history=history, ledger=history.get("ledger", str(repo)),
+                    consumption_state=(history["attempts"][0]["consumption_state"] if history.get("attempts") else "unknown"))
+
+
 def wake(args, ledger=launcher_ledger):
     repo = Path(args.repo or os.getcwd()).absolute()
     requested = "steer" if args.steer else "queue"
@@ -430,7 +462,9 @@ def wake(args, ledger=launcher_ledger):
                         f"this wake: {problem}. Nothing was sent.", _ledger_next(code, repo, "run this again"))
     status, binding, message_id = decision["status"], decision["binding"], decision["message_id"]
     base = {"role": role, "ref": ref, "requested": requested, "ledger": decision["ledger"],
-            "message_id": message_id, **({"ref_sha256": content[1], "ref_size": int(content[3])} if content else {})}
+            "message_id": message_id,
+            "recipient_state": {"reachability": "unknown", "turn_state": "unknown", "source": "unobserved"},
+            **({"ref_sha256": content[1], "ref_size": int(content[3])} if content else {})}
     if status == "unbound":
         return _outcome("NOT SENT", f"No conversation is bound to {role} in the ledger at {decision['ledger']}. "
                         "Nothing was sent.", f"Bind one with `multithread bind {role} --thread <codex conversation "
@@ -506,9 +540,9 @@ def wake(args, ledger=launcher_ledger):
                 return conclude(_outcome("NOT SENT", f"The daemon doesn't know conversation {binding['thread']} "
                                          f"({exc}). Nothing was sent.", f"Check the binding with `multithread bind "
                                          f"{role}`: the conversation may be archived, or the id is wrong. If it "
-                                         f"moved, rebind with `multithread bind {role} --thread <conversation id> "
-                                         "--replace`, then run this wake again; the new binding gives it a new "
-                                         "message id.", **base), "not_sent", "conversation_unknown",
+                                         "moved, have the exact holder refresh its binding, or make an explicitly "
+                                         "authorized handover with --replace, --expected-generation, --reason and "
+                                         "--approval-ref. Then run this wake again.", **base), "not_sent", "conversation_unknown",
                                 detail=str(exc))
             return conclude(_outcome("NOT SENT", f"The daemon refused to list conversation {binding['thread']}'s "
                                      f"turns ({exc}). Nothing was sent.", retry, **base), "not_sent",
@@ -523,6 +557,11 @@ def wake(args, ledger=launcher_ledger):
         latest = turns[0] if turns else None
         turn_id = latest.get("id") if latest else None
         live = isinstance(turn_id, str) and latest.get("status") == "inProgress"
+        observed_status = latest.get("status") if latest else None
+        base["recipient_state"] = {"reachability": "reachable", "turn_state":
+                                   observed_status if observed_status in ("inProgress", "completed", "interrupted", "failed")
+                                   else "unknown" if latest else "no_turns",
+                                   "source": "codex_turn_list"}
         if args.dry_run:
             plan = f"steer into running turn {turn_id}" if args.steer and live else "queue"
             seen = (f"latest turn {turn_id} is {latest.get('status')}" if latest
@@ -559,15 +598,15 @@ def wake(args, ledger=launcher_ledger):
                     return conclude(_outcome("UNCERTAIN", f"The daemon answered the steer with {what}, not a "
                                              f"receipt for turn {turn_id}. It may or may not have arrived.", unsure,
                                              **base), "uncertain", "unusable_reply", "steer", detail=what)
-                return conclude(_outcome("STEERED", f"Folded into running turn {turn_id}. The recipient reads it "
-                                         "at its next pause, without interruption.", _WAIT, **base),
+                return conclude(_outcome("STEERED", f"Codex accepted the steer for running turn {turn_id}. "
+                                         "Recipient consumption is unobserved.", _WAIT, **base),
                                 "steered", "live_turn", "steer", _native(turn_id))
     finally:
         daemon.close()
 
     reason = "requested" if not args.steer else declined[0] if declined else "no_live_turn"
     why = {"requested": "Queued as asked.",
-           "no_live_turn": "No turn was running, so it was queued instead of steered."}.get(reason)
+           "no_live_turn": "No running turn was observed, so it was queued instead of steered."}.get(reason)
     why = why or declined[1]
     first = f" The steer was declined first (Codex: {declined[2]})." if declined else ""
     codex = args.codex or shutil.which("codex")
@@ -603,8 +642,8 @@ def wake(args, ledger=launcher_ledger):
                                      f"conversation {binding['thread']} ({said}). The message may or may not have "
                                      "been queued." + first, unsure, **base), "uncertain", "no_receipt", "queue",
                             detail=said)
-        return conclude(_outcome("QUEUED", why + " It starts a new turn if the conversation is idle, or right after "
-                                 "the current one.", _WAIT, **base), "queued", reason, "queue", receipt.group(1))
+        return conclude(_outcome("QUEUED", why + " Codex accepted the queue entry; a recipient turn and "
+                                 "consumption are unobserved.", _WAIT, **base), "queued", reason, "queue", receipt.group(1))
     if _refused_before_sending(completed):
         return conclude(_outcome("NOT SENT", f"codex queue refused before sending: {said}. Nothing was queued."
                                  + first, "Check `codex app-server daemon version`, then retry with the same message "
@@ -629,14 +668,16 @@ def _refused_before_sending(completed):
 def _wake_inbox(args, role, path, text, message_id, base, conclude):
     """Claude Code: one line into the session's inbox. There is no separate steer."""
     unsteered = " Claude Code has no separate steer, so --steer changed nothing." if args.steer else ""
-    rebind = (f"From the session you want to wake, bind it again: multithread bind {role} --claude-socket "
-              "\"$CLAUDE_CODE_MESSAGING_SOCKET\" --replace. Then run this wake again; the new binding gives it a "
-              "new message id.")
+    rebind = (f"Have the exact holder refresh {role} from its own Claude Code session with "
+              "--claude-socket \"$CLAUDE_CODE_MESSAGING_SOCKET\". Moving it to another owner requires an explicitly "
+              "authorized handover with --replace, --expected-generation, --reason and --approval-ref. "
+              "Then run this wake again.")
     problem = inbox_problem(path)
     if problem is not None:
         reason, why = problem
-        gone = (f"The Claude Code inbox at {path} is gone, so that session ended or restarted."
+        gone = (f"The Claude Code inbox at {path} is missing; the session's state is unknown."
                 if reason == "inbox_missing" else f"The Claude Code inbox at {path} failed its checks: {why}.")
+        base["recipient_state"] = {"reachability": "unavailable", "turn_state": "unknown", "source": "inbox_path"}
         return conclude(_outcome("NOT SENT", gone + " Nothing was sent.", rebind, **base), "not_sent", reason)
     if args.dry_run:
         return _outcome("DRY RUN", f"Would deliver to the Claude Code inbox at {path} for {role}. Nothing was "
@@ -648,12 +689,14 @@ def _wake_inbox(args, role, path, text, message_id, base, conclude):
                                  "that session may have ended. Nothing was sent.", rebind, **base),
                         "not_sent", "inbox_refused", "inbox")
     except NoAnswer as exc:
+        base["recipient_state"] = {"reachability": "reachable", "turn_state": "unknown", "source": "inbox_connection"}
         return conclude(_outcome("UNCERTAIN", f"The connection to the Claude Code inbox at {path} dropped while "
                                  f"sending ({exc}). The message may or may not have arrived.", "Don't resend "
                                  "blindly: check the recipient's session or ask them. If it didn't arrive, send it "
                                  f"with --id {_next_id(message_id)}.", **base), "uncertain", "dropped", "inbox")
-    return conclude(_outcome("DELIVERED TO INBOX", f"Delivered to the Claude Code inbox at {path}. An idle session "
-                             "starts a new turn; a busy one reads it between tool calls." + unsteered,
+    base["recipient_state"] = {"reachability": "reachable", "turn_state": "unknown", "source": "inbox_connection"}
+    return conclude(_outcome("DELIVERED TO INBOX", f"The Claude Code inbox at {path} accepted the message. "
+                             "Recipient turn state and consumption are unobserved." + unsteered,
                              "Wait for the recipient's acknowledgement. The session may still hold or refuse the "
                              "message under its inbound settings (crossSessionInbound); if nothing arrives, ask "
                              "the person to check that session.", **base), "delivered", "inbox_accepted", "inbox")
@@ -662,13 +705,14 @@ def _wake_inbox(args, role, path, text, message_id, base, conclude):
 def wake_main(argv=None, *, ledger=launcher_ledger):
     parser = argparse.ArgumentParser(prog="multithread wake", description=(
         "Send `Multithread wake from <agent>: <ref>` to what a role is bound to. A Codex conversation gets it "
-        "through the shared Codex daemon, queued by default: it starts a new turn when the conversation is "
-        "idle, or right after the current one; --steer folds it into the running turn instead, and queues "
-        "when none is running. A Claude Code session gets it in its inbox: an idle session starts a turn, a "
-        "busy one reads it between tool calls. Each attempt is recorded in this ledger. Exit 0 sent or dry "
-        "run, 3 already sent, 4 not sent, 5 uncertain."))
+        "through the shared Codex daemon, queued by default; --steer submits it to the observed running turn "
+        "instead, and queues when none is running. A Claude Code session gets it in its inbox. Acceptance "
+        "does not establish a new turn or consumption. Each attempt is recorded in this ledger; --status "
+        "reads its original recipient and explicit acknowledgement. Exit 0 sent, status or dry run, 3 already "
+        "sent, 4 not sent, 5 uncertain."))
     parser.add_argument("role", help="the bound role, for example operator")
-    parser.add_argument("--ref", required=True, help="absolute task-file path, or a ledger sequence number")
+    parser.add_argument("--ref", help="absolute task-file path, or a ledger sequence number; optional for --status")
+    parser.add_argument("--status", action="store_true", help="read recorded attempts and acknowledgements; never read the task file or send")
     parser.add_argument("--steer", action="store_true",
                         help="for news about a Codex recipient's current work: fold into the running turn")
     parser.add_argument("--id", dest="message_id",
@@ -680,7 +724,11 @@ def wake_main(argv=None, *, ledger=launcher_ledger):
     parser.add_argument("--repo", help="checkout whose ledger holds the binding; default: current directory")
     parser.add_argument("--json", action="store_true", help="one JSON object with the same outcome")
     args = parser.parse_args(argv)
-    return _emit(wake(args, ledger), args.json)
+    if not args.status and args.ref is None:
+        parser.error("--ref is required unless --status is used")
+    if args.status and (args.steer or args.dry_run or args.message_id is not None):
+        parser.error("--status cannot be combined with --steer, --dry-run or --id")
+    return _emit(wake_status(args, ledger) if args.status else wake(args, ledger), args.json)
 
 
 # --- bind ------------------------------------------------------------------------
@@ -739,6 +787,10 @@ def _describe(binding):
              f"(binding {binding['generation']}, by {binding['bound_by']} at {binding['bound_at']})"]
     if binding["provider"] == "codex":
         lines.append(f"  cwd when bound: {binding['cwd']}; daemon: {binding['endpoint']}")
+    if binding.get("role_scope") is not None:
+        lines.append(f"  scope: {binding['role_scope']}")
+    if binding.get("charter") is not None:
+        lines.append(f"  charter: {binding['charter']}")
     last = binding.get("last_attempt")
     if last:
         lines.append(f"  last wake: {last['message_id']} {last['outcome']} at {last['at']} "
@@ -804,15 +856,28 @@ def bind(args, ledger=launcher_ledger):
     target = _target(wanted)
     base = {"role": role, **wanted, "ledger": shown["ledger"]}
     if current["state"] != "unbound":
-        if current["thread"] == thread and current["endpoint"] == endpoint:
+        same_holder = (current.get("bound_agent"), current.get("bound_session")) == (agent, session) or (
+            current["provider"] == "codex" and agent == "codex" and session == current["thread"])
+        same_recipient = current["provider"] == provider and (provider == "claude" or current["thread"] == thread)
+        unchanged = current["provider"] == provider and current["thread"] == thread and current["endpoint"] == endpoint
+        metadata_unchanged = (args.scope is None or args.scope == current.get("role_scope")) and (
+            args.charter is None or args.charter == current.get("charter"))
+        if unchanged and metadata_unchanged and args.expected_generation is None:
             return _outcome("ALREADY BOUND", f"{role} already wakes {target} (binding {current['generation']}, "
                             f"{current['state']}); nothing was recorded.", "Nothing.",
                             generation=current["generation"], **base)
-        if not args.replace:
-            flag = f"--thread {thread}" if inbox is None else f"--claude-socket {shlex.quote(inbox)}"
+        refresh = same_holder and same_recipient
+        if not refresh and (not args.replace or args.expected_generation is None or not args.reason or not args.approval_ref):
             return _outcome("NOT BOUND", f"{role} is already bound to {_target(current)} (binding "
                             f"{current['generation']}, since {current['bound_at']}). Nothing was recorded.",
-                            f"To move it, run: multithread bind {role} {flag} --replace", **base)
+                            f"Have its exact holder {current['bound_by']} refresh its existing recipient, or make "
+                            "an explicitly authorized handover with --replace, "
+                            f"--expected-generation {current['generation']}, --reason <reason> and "
+                            "--approval-ref <immutable approval reference>.", **base)
+        if refresh and args.expected_generation is None:
+            args.expected_generation = current["generation"]
+        if refresh:
+            args.replace = True
     if inbox is not None:
         problem = inbox_problem(inbox)
         if problem is not None:
@@ -829,13 +894,18 @@ def bind(args, ledger=launcher_ledger):
         coverage = _coverage(ledger, thread, cwd)
         record = ["--thread", thread, "--cwd", cwd]
         extra = {"warning": coverage["message"]} if "message" in coverage else {}
+    options = ["--replace"] if args.replace else []
+    for flag, value in (("--scope", args.scope), ("--charter", args.charter), ("--reason", args.reason),
+                        ("--expected-generation", args.expected_generation), ("--approval-ref", args.approval_ref)):
+        if value is not None:
+            options.extend([flag, str(value)])
     code, recorded, problem = ledger(repo, "wake-ledger", "bind", role, "--agent", agent, "--session", session,
-                                     "--endpoint", endpoint, *record, *(["--replace"] if args.replace else []))
+                                     "--endpoint", endpoint, *record, *options)
     if code != 0:
         return _outcome("NOT BOUND", f"The ledger at {repo} didn't record the binding: {problem}.",
                         _ledger_next(code, repo, "run bind again"), coverage=coverage, **base)
     binding = recorded["binding"]
-    base.update(generation=binding["generation"], coverage=coverage)
+    base.update(generation=binding["generation"], binding_state=binding["state"], coverage=coverage)
     if recorded["duplicate"]:
         return _outcome("ALREADY BOUND", f"{role} already wakes {target} (binding {binding['generation']}); "
                         "nothing was recorded.", "Nothing.", **base, **extra)
@@ -843,14 +913,19 @@ def bind(args, ledger=launcher_ledger):
     replaces = (f" It replaces binding {replaced['generation']} ({_target(replaced)}); message ids start over "
                 "under this binding, so a file already sent under the old one can be sent again."
                 if replaced else "")
+    paused = binding["state"] == "paused"
+    if paused:
+        replaces += " Wakes remain paused."
+    next_wake = (f"The role remains paused. Its holder can deliberately resume with `multithread resume {role}` "
+                 "using its exact identity, then send a wake." if paused else None)
     if inbox is not None:
         return _outcome("BOUND", f"{role} now wakes the Claude Code session whose inbox is {inbox}, as binding "
                         f"{binding['generation']} in the ledger at {shown['ledger']}." + replaces,
-                        f"Send a wake with: multithread wake {role} --ref <task file>. If that session ends or "
-                        "restarts, bind again from the new one.", **base)
+                        next_wake or (f"Send a wake with: multithread wake {role} --ref <task file>. If that session "
+                                      "ends or restarts, bind again from the new one."), **base)
     return _outcome("BOUND", f"{role} now wakes Codex conversation {thread} ({status}; cwd {base['cwd']}) as "
                     f"binding {binding['generation']} in the ledger at {shown['ledger']}." + replaces,
-                    f"Send a wake with: multithread wake {role} --ref <task file>", **base, **extra)
+                    next_wake or f"Send a wake with: multithread wake {role} --ref <task file>", **base, **extra)
 
 
 def bind_main(argv=None, *, ledger=launcher_ledger):
@@ -862,7 +937,12 @@ def bind_main(argv=None, *, ledger=launcher_ledger):
     parser.add_argument("role", nargs="?", help="a lowercase role name, for example operator")
     parser.add_argument("--thread", help="a Codex conversation's exact UUID")
     parser.add_argument("--claude-socket", help="a Claude Code session's inbox: its $CLAUDE_CODE_MESSAGING_SOCKET")
-    parser.add_argument("--replace", action="store_true", help="move a role that is bound elsewhere")
+    parser.add_argument("--replace", action="store_true", help="request an authorized handover; also requires generation, reason and approval reference")
+    parser.add_argument("--scope", help="the role's declared work scope")
+    parser.add_argument("--charter", help="the role's declared responsibility")
+    parser.add_argument("--reason", help="why this binding is refreshed or handed over")
+    parser.add_argument("--expected-generation", type=int, help="the exact current binding generation; required for handover")
+    parser.add_argument("--approval-ref", help="immutable handover approval: git:<full OID>, sha256:<digest>, or receipt:<id>")
     parser.add_argument("--agent", help="who records the binding; default RELAY_AGENT")
     parser.add_argument("--session", help="that agent's session; default RELAY_SESSION")
     parser.add_argument("--repo", help="checkout whose ledger holds the binding; default: current directory")
@@ -875,6 +955,11 @@ def bind_main(argv=None, *, ledger=launcher_ledger):
         parser.error("a target needs a role")
     if args.replace and not targeted:
         parser.error("--replace needs --thread or --claude-socket")
+    if not targeted and any(value is not None for value in (
+            args.scope, args.charter, args.reason, args.expected_generation, args.approval_ref)):
+        parser.error("binding metadata and handover options need --thread or --claude-socket")
+    if args.expected_generation is not None and args.expected_generation < 1:
+        parser.error("--expected-generation must be positive")
     if targeted:
         return _emit(bind(args, ledger), args.json)
     repo = Path(args.repo or os.getcwd()).absolute()

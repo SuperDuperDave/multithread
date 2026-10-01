@@ -8,6 +8,7 @@ deliberate follow-up. This reference covers:
 - [Support reports from retained calls](#prepare-a-support-report-from-an-existing-call)
 - [Frozen review packets](#freeze-a-review-packet)
 - [Input to a running peer](#update-a-running-peer)
+- [Session inboxes, role handovers and wake status](PEER.md#inspect-pending-work-and-role-handovers)
 - [Coordination and native verification evidence](#coordination-and-verification-scope)
 - [The reviewed source entry](#use-the-source-entry)
 
@@ -19,6 +20,12 @@ available to the agent when the person chose
 [agent-assisted trust](SETUP.md#choose-how-codex-trusts-the-hooks). When a call
 refuses because hooks are not ready, the agent reports the refusal and its
 printed remedy, and never runs `launch` or retries around it.
+
+For commit/file handoff artifacts and the caller's exact `--agent` and
+`--session` identity, use [the scoped-task examples](PEER.md#send-a-scoped-task).
+For intentionally restricted Claude settings sources, see
+[session hook coverage](SETUP.md#connect-every-session). Installed hook readiness
+and delivery into a particular provider invocation are separate observations.
 
 ## Receipt fields and capture limits
 

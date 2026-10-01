@@ -106,7 +106,7 @@ while True:
         hooks = [{'eventName': event, 'command': HOOK_COMMAND, 'handlerType': 'command',
                   'source': 'sessionFlags', 'enabled': True, 'trustStatus': 'trusted',
                   'timeoutSec': 3, 'matcher': None, 'async': False}
-                 for event in ('sessionStart','sessionEnd','userPromptSubmit','stop','interrupt')]
+                 for event in ('sessionStart','sessionEnd','userPromptSubmit','postToolUse','stop','interrupt')]
         for hook in hooks:
             hook.update(spec.get('hook_updates', {}))
             hook.update(spec.get('event_updates', {}).get(hook['eventName'], {}))
@@ -229,7 +229,7 @@ class CodexProtocolTests(unittest.TestCase):
         # Codex hooks name no checkout: trust is keyed by command text, not checkout.
         hook = shlex.join([str(self.relay), "provider-hook", "--client", "codex"])
         self.native_arguments = []
-        events = ["SessionStart", "UserPromptSubmit", "Stop", "SessionEnd", "Interrupt"]
+        events = ["SessionStart", "UserPromptSubmit", "PostToolUse", "Stop", "SessionEnd", "Interrupt"]
         for event in events:
             self.native_arguments.extend(["-c", "hooks." + event + "=[{hooks=[{type=\"command\",command="
                                           + json.dumps(hook, ensure_ascii=False) + ",timeout=3}]}]"])
@@ -695,8 +695,8 @@ class CodexProtocolTests(unittest.TestCase):
         self.assertEqual(identifier, resume["params"]["threadId"])
 
     def test_hook_readiness_stops_before_a_thread_or_task_when_review_is_needed(self):
-        events = ('sessionStart', 'userPromptSubmit', 'stop', 'sessionEnd', 'interrupt')
-        review = "open /hooks and trust the five Multithread hooks running " + shlex.join(
+        events = ('sessionStart', 'userPromptSubmit', 'postToolUse', 'stop', 'sessionEnd', 'interrupt')
+        review = "open /hooks and trust the six Multithread hooks running " + shlex.join(
             [str(self.relay), "provider-hook", "--client", "codex"])
         # Diagnosis an agent may run: setup's plan, never a launch.
         configuration = "compare the plan in " + shlex.join(

@@ -32,6 +32,9 @@ NATIVE_HASHES = {
     "SessionStart": "sha256:5379e65f63592aeaca88bd027f6d246d6a56aaffe2d37c1f9a541239fd2f1cc1",
     "SessionEnd": "sha256:ee88381341fa8dc5bd1538625189d80205f2ac3283404fe7e78090b69fa7f642",
     "UserPromptSubmit": "sha256:807c0a2aa9754e4d85e9c03593030dd5b3c25b805154fb0bddffce640b8a449f",
+    # Synthetic extension of the existing native fixtures using the documented
+    # normalized identity; this event was not observed in the old native listing.
+    "PostToolUse": "sha256:376e8fe9f50a0b81cb293c74fe14158f0a9fa5b34516ca3c59734f90c7877d42",
     "Stop": "sha256:3764dbec9a925010b1b2b4ef5f9e7697669a2c7496261c9ea3464c84c9b77cc4",
     "Interrupt": "sha256:6d8979f070262055db3797a69be3f167350dba50e5b609a74f16e1452a223666",
 }
@@ -93,7 +96,7 @@ class DefinitionTests(HomeCase):
             self.assertEqual(CODEX_COMMAND, shlex.join(hook_argv(LAUNCHER, "codex", "/any/checkout")))
         self.assertTrue(codex_peer._multithread_hook(CLAUDE_COMMAND, str(LAUNCHER)))
 
-    def test_codex_hash_reproduces_codex_own_listing(self):
+    def test_codex_hash_reproduces_existing_native_and_new_synthetic_fixtures(self):
         self.assertEqual(NATIVE_HASHES, {event: hooks.codex_hash(event) for event in hooks.EVENTS["codex"]})
 
     def test_provider_homes_follow_the_provider_own_variables(self):
@@ -390,6 +393,28 @@ class FileTests(HomeCase):
 
 
 class DeliveryTests(HomeCase):
+    def test_legacy_registration_remains_usable_and_optional_install_is_separate(self):
+        for client in ("codex", "claude"):
+            value = {"hooks": {event: [{"hooks": [hooks.handler(client)]}]
+                               for event in hooks.EVENTS[client] if event != "PostToolUse"}}
+            self.write(client, value)
+            state = hooks.inspect(client)
+            self.assertEqual("installed", state["state"])
+            self.assertEqual("missing", state["events"]["PostToolUse"]["state"])
+            delivery = hooks.delivery(client)
+            self.assertEqual(("user", ["PostToolUse"]),
+                             (delivery["source"], delivery["optional_events_missing"]))
+            plan = hooks.change_files("install", (client,))
+            self.assertTrue(plan["changes_provider_settings"])
+            for malformed in ({}, [None], [{"hooks": None}], [{"hooks": [None]}]):
+                self.write(client, {"hooks": {**value["hooks"], "PostToolUse": malformed}})
+                with self.assertRaises(hooks.HooksError):
+                    hooks.delivery(client)
+            self.write(client, {"hooks": {**value["hooks"], "PostToolUse": [
+                {"hooks": [{**hooks.handler(client), "timeout": 9}]}]}})
+            with self.assertRaises(hooks.HooksError):
+                hooks.delivery(client)
+
     """Launch and peer pass invocation hooks only when no user-level copy exists."""
 
     def prepare(self, client):
@@ -530,6 +555,31 @@ for line in sys.stdin:
 
 
 class TrustTests(HomeCase):
+    def test_legacy_optional_absence_has_no_trust_slot_and_keeps_required_checks(self):
+        value = json.loads(self.file("codex").read_text())
+        del value["hooks"]["PostToolUse"]
+        self.write("codex", value)
+        installed = hooks.inspect("codex")
+        listing = {"data": [{"cwd": str(self.base), "hooks": [
+            item for item in self.ours(**{event: {"status": "trusted"} for event in hooks.EVENTS["codex"]})
+            if item["eventName"] != "postToolUse"]}]}
+        reviewed, problems, _ = hooks._review(listing, str(self.base), installed)
+        self.assertEqual([], problems)
+        self.assertEqual(5, len(reviewed))
+        readiness = codex_peer.hook_readiness(listing, str(self.base), installed["command"], installed["file"])
+        self.assertEqual("ready", readiness["state"])
+        self.assertEqual(5, len(readiness["ready_events"]))
+        self.assertEqual(["postToolUse"], readiness["optional_events_missing"])
+        optional = self.ours()[-1].copy()
+        optional.update(eventName="postToolUse", timeoutSec=9)
+        broken = {"data": [{"cwd": str(self.base), "hooks": listing["data"][0]["hooks"] + [optional]}]}
+        self.assertEqual("needs_configuration", codex_peer.hook_readiness(
+            broken, str(self.base), installed["command"], installed["file"])["state"])
+        records = {self.keys[event]: {"trusted_hash": hooks.codex_hash(event)}
+                   for event in hooks.EVENTS["codex"] if event != "PostToolUse"}
+        with mock.patch.object(hooks, "_config_state", return_value=records):
+            self.assertEqual("trusted", hooks.trust_estimate())
+
     def setUp(self):
         super().setUp()
         self.write("codex", FOREIGN)
@@ -590,7 +640,7 @@ class TrustTests(HomeCase):
                              "recorded. Check with " + check + " before trying again; it shows a fresh plan."),
             "ignore_write": ("uncertain", "acknowledged", True,
                              "Codex acknowledged the trust write, but its listing right after shows SessionStart: "
-                             "untrusted, UserPromptSubmit: untrusted, Stop: untrusted, SessionEnd: untrusted, "
+                             "untrusted, UserPromptSubmit: untrusted, PostToolUse: untrusted, Stop: untrusted, SessionEnd: untrusted, "
                              "Interrupt: untrusted. Something else may have changed these hooks meanwhile. Inspect "
                              + status + " before any retry."),
         }
@@ -611,7 +661,7 @@ class TrustTests(HomeCase):
     def requests(self):
         return [json.loads(line)["method"] for line in self.log.read_text().splitlines()]
 
-    def test_plan_then_apply_records_exactly_the_five_hooks_codex_listed(self):
+    def test_plan_then_apply_records_exactly_the_six_hooks_codex_listed(self):
         plan = hooks.trust(self.codex)
         self.assertEqual("planned", plan["state"])
         self.assertNotIn("config/batchWrite", self.requests())

@@ -125,6 +125,7 @@ _RESOURCE_ALIASES = {
     "integrate:main": "integration:main",
 }
 _IDENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@/+\-]{0,199}$")
+_RECIPIENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@/+\-]{0,400}$")
 _FINGERPRINT_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{2,79}$")
 _DECISION_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{2,79}$")
 _DECISION_OPTION_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
@@ -234,11 +235,12 @@ _META_KEYS: dict[str, frozenset[str]] = {
         }
     ),
     "wake.bound": frozenset(
-        {"role", "provider", "thread", "endpoint", "cwd", "replaces"}
+        {"role", "provider", "thread", "endpoint", "cwd", "replaces",
+         "charter", "role_scope", "reason", "approval_ref", "previous_holder"}
     ),
-    "wake.unbound": frozenset({"role", "generation"}),
-    "wake.paused": frozenset({"role", "generation"}),
-    "wake.resumed": frozenset({"role", "generation"}),
+    "wake.unbound": frozenset({"role", "generation", "reason", "approval_ref"}),
+    "wake.paused": frozenset({"role", "generation", "reason", "approval_ref"}),
+    "wake.resumed": frozenset({"role", "generation", "reason", "approval_ref"}),
     "wake.attempted": frozenset(
         {
             "role",
@@ -351,6 +353,25 @@ def canonical_agent(value: Any) -> str:
     """Validate an agent identifier at read-only command boundaries."""
 
     return _identifier("agent", value)
+
+
+def session_target(agent: Any, session: Any) -> str:
+    """An exact recipient outside the legacy agent-identifier namespace."""
+    return json.dumps([canonical_agent(agent), canonical_agent(session)], separators=(",", ":"))
+
+
+def canonical_target(value: Any) -> str | None:
+    """Normalize exact recipients before deriving events or retry identities."""
+    target = _optional_line("target", value, 4096)
+    if target is not None and target.startswith("["):
+        try:
+            pair = json.loads(target)
+        except ValueError as exc:
+            raise ValidationError("exact target must be a JSON string containing an agent/session pair") from exc
+        if not isinstance(pair, list) or len(pair) != 2:
+            raise ValidationError("exact target must contain exactly an agent and session")
+        return session_target(*pair)
+    return _optional_line("target", target, 407)
 
 
 def canonical_work_id(value: Any) -> str:
@@ -468,6 +489,17 @@ def _wake_target(meta: Mapping[str, Any]) -> None:
 
 def _validate_wake(kind: str, meta: Mapping[str, Any]) -> None:
     canonical_wake_role(meta.get("role"))
+    if "approval_ref" in meta:
+        if not _ARTIFACT_RE.fullmatch(str(meta["approval_ref"])):
+            raise ValidationError("approval_ref must be an immutable git:, sha256: or receipt: reference")
+        _one_line("reason", meta.get("reason"), 300)
+    for key in ("charter", "role_scope", "reason"):
+        if key in meta:
+            _one_line(key, meta[key], 300)
+    if "previous_holder" in meta:
+        previous_holder = _one_line("previous_holder", meta["previous_holder"], 401)
+        if not _RECIPIENT_RE.fullmatch(previous_holder):
+            raise ValidationError("previous_holder contains unsupported characters")
     if kind == "wake.bound":
         _wake_target(meta)
         endpoint = _one_line("endpoint", meta.get("endpoint"), 408)
@@ -552,7 +584,8 @@ def normalize_event(raw: Mapping[str, Any], *, internal: bool = False) -> Event:
     work_id = _optional_identifier("work_id", raw.get("work_id"))
     if kind == "work.intent" and work_id is None:
         raise ValidationError("work.intent requires a stable work_id")
-    target = _optional_line("target", raw.get("target"), 200)
+    # Two 200-character identifiers plus compact JSON delimiters: at most 407.
+    target = canonical_target(raw.get("target"))
     scope = _optional_line("scope", raw.get("scope"), 240)
     artifact = _optional_line("artifact", raw.get("artifact"), 200)
     if artifact is not None and not _ARTIFACT_RE.fullmatch(artifact):

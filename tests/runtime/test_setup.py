@@ -85,7 +85,7 @@ class SetupTests(unittest.TestCase):
             {"eventName": event, "command": hook, "handlerType": "command", "source": "sessionFlags",
              "enabled": True, "trustStatus": self.hook_statuses.get(event, "trusted"),
              "timeoutSec": 3, "matcher": None, "async": False}
-            for event in ("sessionStart", "userPromptSubmit", "stop", "sessionEnd", "interrupt")]}]}
+            for event in ("sessionStart", "userPromptSubmit", "postToolUse", "stop", "sessionEnd", "interrupt")]}]}
 
     def invoke(self, *extra):
         output = io.StringIO()
@@ -416,7 +416,7 @@ class SetupTests(unittest.TestCase):
         self.assertEqual("ready", review["state"])
         codex = review["providers"]["codex"]
         self.assertEqual("needs_hook_review", codex["state"])
-        self.assertEqual({"sessionStart": "untrusted", "userPromptSubmit": "trusted", "stop": "modified",
+        self.assertEqual({"sessionStart": "untrusted", "userPromptSubmit": "trusted", "postToolUse": "trusted", "stop": "modified",
                           "sessionEnd": "trusted", "interrupt": "trusted"}, codex["hook_trust"]["events"])
         self.assertEqual("Codex hooks are not ready (modified: stop; untrusted: sessionStart); Codex peer calls refuse until then",
                          codex["message"])
@@ -424,7 +424,7 @@ class SetupTests(unittest.TestCase):
         self.assertIn("Multithread is ready for this repository; Codex peer calls need one hook review first.", output)
         self.assertIn("codex: needs_hook_review; Codex hooks are not ready (modified: stop; untrusted: sessionStart)", output)
         action = next(entry for entry in review["next_actions"] if entry["stage"] == "codex")
-        self.assertIn("open /hooks and trust the five Multithread hooks running "
+        self.assertIn("open /hooks and trust the six Multithread hooks running "
                       + shlex.join([self.launcher, "provider-hook", "--client", "codex"]), action["action"])
         self.assertIn("covers every enrolled checkout", action["action"])
         self.assertEqual(codex["launch_command"], action["command"])

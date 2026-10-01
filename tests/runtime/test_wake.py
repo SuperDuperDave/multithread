@@ -29,6 +29,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
 from relay_core import cli as core_cli
 from relay_core.store import RelayStore
+from relay_core.protocol import session_target
 from relay_runtime import cli as runtime_cli, hooks, wake
 
 THREAD = "a0000000-0000-7000-8000-000000000001"
@@ -312,7 +313,7 @@ class WakeCase(unittest.TestCase):
         out = io.StringIO()
         with redirect_stdout(out):
             code = core_cli.main(["--repo", str(self.repo), "--home", str(self.home), action, role,
-                                  "--agent", "david", "--session", "desk"])
+                                  "--agent", "claude", "--session", "binder"])
         return code, out.getvalue()
 
     def store(self):
@@ -345,6 +346,11 @@ class WakeCase(unittest.TestCase):
         self.assertEqual(0, code, out)
         return self.events("wake.bound")[-1]["seq"]
 
+    def handover(self, thread=OTHER, *extra):
+        generation = self.events("wake.bound")[-1]["seq"]
+        return self.bind("--replace", "--expected-generation", str(generation), "--reason", "approved fixture move",
+                         "--approval-ref", "receipt:fixture-handover", *extra, thread=thread)
+
     def conclusion(self):
         return self.events("wake.concluded")[-1]["meta"]
 
@@ -353,12 +359,79 @@ class WakeCase(unittest.TestCase):
 
 
 class WakeOutcomeTests(WakeCase):
+    def test_status_reads_original_attempt_after_ref_vanishes_without_native_contact(self):
+        generation = self.bound()
+        sent = self.wake()
+        self.task.unlink()
+        before = len(self.events())
+        daemon_calls = list(self.daemon.methods())
+        queue_calls = self.codex_calls()
+        with mock.patch.object(wake, "fingerprint", side_effect=AssertionError("status must not open the ref")):
+            code, out = self.run_helper(wake.wake_main, "operator", "--status", "--ref", str(self.task), "--json")
+        result = json.loads(out)
+        self.assertEqual((0, "STATUS"), (code, result["status"]))
+        attempt = result["history"]["attempts"][0]
+        self.assertEqual((generation, f"codex:{THREAD}", sent["message_id"], "queued", "unknown"),
+                         tuple(attempt[key] for key in ("generation", "recipient", "message_id", "outcome", "consumption_state")))
+        self.assertEqual({"reachability": "unknown", "turn_state": "unknown", "source": "unobserved"},
+                         result["recipient_state"])
+        self.assertEqual(before, len(self.events()))
+        self.assertEqual(daemon_calls, self.daemon.methods())
+        self.assertEqual(queue_calls, self.codex_calls())
+        self.assertEqual(("wake-ledger", "history", "operator", "--ref", str(self.task)), self.ledger_calls[-1][1])
+
+    def test_status_keeps_old_recipient_and_explicit_ack_after_handover(self):
+        generation = self.bound()
+        with self.store() as store:
+            signal = store.emit({"kind": "work.handoff", "agent": "claude", "session": "sender",
+                                 "target": session_target("codex", THREAD), "summary": "synthetic scoped handoff",
+                                 "artifact": "receipt:fixture-handoff"})
+        ref = str(signal["event"]["seq"])
+        sent = self.wake(ref=ref)
+        with self.store() as store:
+            ack = store.acknowledge(int(ref), agent="codex", session=THREAD)
+        self.daemon.threads[OTHER] = dict(self.daemon.threads[THREAD])
+        self.assertEqual(0, self.handover()[0])
+        before = len(self.events())
+        code, out = self.run_helper(wake.wake_main, "operator", "--status", "--ref", ref, "--json")
+        result = json.loads(out)
+        self.assertEqual(0, code)
+        attempt = result["history"]["attempts"][0]
+        self.assertEqual((generation, f"codex:{THREAD}", sent["message_id"], "acknowledged", ack["event"]["seq"]),
+                         tuple(attempt[key] for key in ("generation", "recipient", "message_id", "consumption_state", "acknowledgement_seq")))
+        self.assertEqual(OTHER, result["history"]["binding"]["thread"])
+        self.assertEqual("acknowledged", result["consumption_state"])
+        self.assertEqual(before, len(self.events()))
+
+    def test_status_without_ref_or_actor_reads_empty_history_and_prints_no_false_delivery(self):
+        code, out = self.run_helper(wake.wake_main, "operator", "--status", "--json")
+        result = json.loads(out)
+        self.assertEqual((0, "STATUS", []), (code, result["status"], result["history"]["attempts"]))
+        self.assertEqual(0, self.daemon.connections)
+        self.assertEqual([], self.codex_calls())
+        self.assertEqual([], self.events())
+        code, out = self.run_helper(wake.wake_main, "operator", "--status")
+        self.assertEqual(0, code)
+        self.assertIn("STATUS: Read recorded wake attempts", out)
+        self.assertIn("Nothing was sent", out)
+
+    def test_status_refuses_send_options_and_send_still_requires_ref(self):
+        for extra in (("--status", "--steer"), ("--status", "--dry-run"), ("--status", "--id", "another"), ()):
+            with self.subTest(extra=extra), redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as raised:
+                self.run_helper(wake.wake_main, "operator", *extra)
+            self.assertEqual(2, raised.exception.code)
+        self.assertEqual([], self.ledger_calls)
+        self.assertEqual(0, self.daemon.connections)
+
     def test_queue_by_default_records_the_attempt_and_the_native_id(self):
         generation = self.bound()
         result = self.wake()
         self.assertEqual(("QUEUED", 0), (result["status"], result["exit_code"]))
-        self.assertEqual("Queued as asked. It starts a new turn if the conversation is idle, or right after the "
-                         "current one.", result["happened"])
+        self.assertEqual("Queued as asked. Codex accepted the queue entry; a recipient turn and consumption are "
+                         "unobserved.", result["happened"])
+        self.assertEqual("unknown", result["consumption_state"])
+        self.assertEqual({"reachability": "reachable", "turn_state": "completed", "source": "codex_turn_list"},
+                         result["recipient_state"])
         self.assertEqual("Nothing. Wait for the recipient's acknowledgement.", result["next"])
         text = f"Multithread wake from claude: {self.task}"
         self.assertEqual([["queue", "--remote", f"unix://{self.socket}", "--thread", THREAD, "--message", text]],
@@ -382,8 +455,10 @@ class WakeOutcomeTests(WakeCase):
         self.live()
         result = self.wake("--steer")
         self.assertEqual(("STEERED", 0), (result["status"], result["exit_code"]))
-        self.assertEqual(f"Folded into running turn {LIVE_TURN}. The recipient reads it at its next pause, "
-                         "without interruption.", result["happened"])
+        self.assertEqual(f"Codex accepted the steer for running turn {LIVE_TURN}. Recipient consumption is "
+                         "unobserved.", result["happened"])
+        self.assertEqual("unknown", result["consumption_state"])
+        self.assertEqual("inProgress", result["recipient_state"]["turn_state"])
         steer = [m for m in self.daemon.requests if m.get("method") == "turn/steer"]
         self.assertEqual([{"threadId": THREAD, "expectedTurnId": LIVE_TURN, "clientUserMessageId":
                            result["message_id"], "input": [{"type": "text", "text": result["text"]}]}],
@@ -398,7 +473,7 @@ class WakeOutcomeTests(WakeCase):
             self.daemon.threads[THREAD]["turns"] = turns
             result = self.wake("--steer", "--id", f"no-live-{len(turns)}")
             self.assertEqual("QUEUED", result["status"])
-            self.assertTrue(result["happened"].startswith("No turn was running, so it was queued instead of steered."))
+            self.assertTrue(result["happened"].startswith("No running turn was observed, so it was queued instead of steered."))
             self.assertEqual(("queued", "no_live_turn", "queue"),
                              tuple(self.conclusion()[key] for key in ("outcome", "reason", "transport")))
         self.assertNotIn("turn/steer", self.daemon.methods())
@@ -421,8 +496,8 @@ class WakeOutcomeTests(WakeCase):
                 self.daemon.steer = behavior
                 result = self.wake("--steer", "--id", f"declined-{behavior}")
                 self.assertEqual("QUEUED", result["status"])
-                self.assertEqual(why + " It starts a new turn if the conversation is idle, or right after the "
-                                 "current one.", result["happened"])
+                self.assertEqual(why + " Codex accepted the queue entry; a recipient turn and consumption are "
+                                 "unobserved.", result["happened"])
                 self.assertEqual(number, self.daemon.methods().count("turn/steer"))
                 self.assertEqual(number, len(self.codex_calls()))
                 attempt = self.events("wake.attempted")[-1]
@@ -624,13 +699,13 @@ class WakeOutcomeTests(WakeCase):
         self.assertEqual(f"The daemon doesn't know conversation {THREAD} (Codex -32600: thread not found). Nothing "
                          "was sent.", result["happened"])
         self.assertEqual("Check the binding with `multithread bind operator`: the conversation may be archived, "
-                         "or the id is wrong. If it moved, rebind with `multithread bind operator --thread "
-                         "<conversation id> --replace`, then run this wake again; the new binding gives it a new "
-                         "message id.", result["next"])
+                         "or the id is wrong. If it moved, have the exact holder refresh its binding, or make an "
+                         "explicitly authorized handover with --replace, --expected-generation, --reason and "
+                         "--approval-ref. Then run this wake again.", result["next"])
         self.assertEqual([], self.codex_calls())
         self.assertEqual("conversation_unknown", self.conclusion()["reason"])
         self.daemon.threads[OTHER] = {"cwd": str(self.repo), "status": "idle", "turns": []}
-        self.assertEqual(0, self.bind("--replace", thread=OTHER)[0])
+        self.assertEqual(0, self.handover()[0])
         moved = self.wake()
         self.assertEqual("QUEUED", moved["status"], "following the next step delivers it")
         self.assertNotEqual(result["message_id"], moved["message_id"])
@@ -750,7 +825,7 @@ class WakeLedgerTests(WakeCase):
         self.assertEqual("QUEUED", self.wake()["status"])
         self.assertEqual("ALREADY SENT", self.wake()["status"])
         self.daemon.threads[OTHER] = dict(self.daemon.threads[THREAD])
-        self.assertEqual(0, self.bind("--replace", thread=OTHER)[0])
+        self.assertEqual(0, self.handover()[0])
         again = self.wake()
         self.assertEqual("QUEUED", again["status"], "the same unchanged file is a new message under a new binding")
         self.assertEqual(2, len(self.codex_calls()))
@@ -941,7 +1016,7 @@ class WakeLedgerTests(WakeCase):
         self.assertEqual(0, code)
         attempt = self.events("wake.attempted")[-1]["meta"]
         self.assertEqual([
-            "QUEUED: Queued as asked. It starts a new turn if the conversation is idle, or right after the current one.",
+            "QUEUED: Queued as asked. Codex accepted the queue entry; a recipient turn and consumption are unobserved.",
             f"Message {attempt['message_id']}: \"Multithread wake from claude: {self.task}\"",
             "Next: Nothing. Wait for the recipient's acknowledgement.",
         ], out.splitlines())
@@ -1055,8 +1130,11 @@ class ClaudeTests(WakeCase):
         self.bind_inbox()
         result = self.wake_inbox()
         self.assertEqual(("DELIVERED TO INBOX", 0), (result["status"], result["exit_code"]))
-        self.assertEqual(f"Delivered to the Claude Code inbox at {self.inbox_path}. An idle session starts a new "
-                         "turn; a busy one reads it between tool calls.", result["happened"])
+        self.assertEqual(f"The Claude Code inbox at {self.inbox_path} accepted the message. Recipient turn state "
+                         "and consumption are unobserved.", result["happened"])
+        self.assertEqual("unknown", result["consumption_state"])
+        self.assertEqual({"reachability": "reachable", "turn_state": "unknown", "source": "inbox_connection"},
+                         result["recipient_state"])
         self.assertEqual("Wait for the recipient's acknowledgement. The session may still hold or refuse the message "
                          "under its inbound settings (crossSessionInbound); if nothing arrives, ask the person to "
                          "check that session.", result["next"])
@@ -1090,9 +1168,10 @@ class ClaudeTests(WakeCase):
 
     def test_an_ended_session_or_a_refused_connection_sends_nothing_and_names_the_rebind(self):
         self.bind_inbox()
-        rebind = ('From the session you want to wake, bind it again: multithread bind reviewer --claude-socket '
-                  '"$CLAUDE_CODE_MESSAGING_SOCKET" --replace. Then run this wake again; the new binding gives it a '
-                  'new message id.')
+        rebind = ('Have the exact holder refresh reviewer from its own Claude Code session with --claude-socket '
+                  '"$CLAUDE_CODE_MESSAGING_SOCKET". Moving it to another owner requires an explicitly authorized '
+                  'handover with --replace, --expected-generation, --reason and --approval-ref. Then run this wake '
+                  'again.')
         self.inbox.close()  # The listener is gone but its socket file remains: a refused connection.
         refused = self.wake_inbox()
         self.assertEqual(("NOT SENT", 4), (refused["status"], refused["exit_code"]))
@@ -1104,7 +1183,7 @@ class ClaudeTests(WakeCase):
                          tuple(self.conclusion()[key] for key in ("outcome", "reason", "transport")))
         self.inbox_path.unlink()
         gone = self.wake_inbox()
-        self.assertEqual(f"The Claude Code inbox at {self.inbox_path} is gone, so that session ended or restarted. "
+        self.assertEqual(f"The Claude Code inbox at {self.inbox_path} is missing; the session's state is unknown. "
                          "Nothing was sent.", gone["happened"])
         self.assertEqual(rebind, gone["next"])
         self.assertEqual(refused["message_id"], gone["message_id"], "a message that was not sent keeps its id")
@@ -1118,7 +1197,7 @@ class ClaudeTests(WakeCase):
         self.assertEqual("inbox_unsafe", self.conclusion()["reason"])
         restarted = FakeInbox(self.codex_home / "7740.sock")
         self.addCleanup(restarted.close)
-        self.assertEqual(0, self.bind_inbox("--replace", path=restarted.path)[0])
+        self.assertEqual(0, self.bind_inbox(path=restarted.path)[0])
         delivered = self.wake_inbox()
         self.assertEqual("DELIVERED TO INBOX", delivered["status"], "following the next step delivers it")
         self.assertNotEqual(gone["message_id"], delivered["message_id"])
@@ -1147,6 +1226,87 @@ class ClaudeTests(WakeCase):
 
 
 class BindTests(WakeCase):
+    def test_paused_role_stays_paused_through_refresh_and_authorized_handover(self):
+        self.bound()
+        self.assertEqual(0, self.control("pause")[0])
+        code, out = self.bind("--charter", "Updated paused responsibility", "--json")
+        refreshed = json.loads(out)
+        self.assertEqual((0, "BOUND", "paused"), (code, refreshed["status"], refreshed["binding_state"]))
+        self.assertIn("Wakes remain paused", refreshed["happened"])
+        self.assertIn("deliberately resume", refreshed["next"])
+        self.daemon.threads[OTHER] = dict(self.daemon.threads[THREAD])
+        code, out = self.handover(OTHER, "--json")
+        moved = json.loads(out)
+        self.assertEqual((0, "paused"), (code, moved["binding_state"]))
+        self.assertIn("deliberately resume", moved["next"])
+        self.assertEqual(3, len(self.events("wake.paused")))
+        daemon_calls = list(self.daemon.methods())
+        refused = self.wake()
+        self.assertEqual("NOT SENT", refused["status"])
+        self.assertIn("paused", refused["happened"])
+        self.assertEqual(daemon_calls, self.daemon.methods())
+        self.assertEqual([], self.codex_calls())
+        self.assertEqual([], self.events("wake.attempted"))
+        self.assertEqual(0, self.control("resume")[0])
+        self.assertEqual("QUEUED", self.wake()["status"])
+
+    def test_handover_requires_each_authorization_field_before_recipient_probe(self):
+        generation = self.bound()
+        self.daemon.threads[OTHER] = dict(self.daemon.threads[THREAD])
+        fields = (("--expected-generation", str(generation)), ("--reason", "approved fixture move"),
+                  ("--approval-ref", "receipt:fixture-handover"))
+        for missing in range(len(fields)):
+            extra = [part for index, field in enumerate(fields) if index != missing for part in field]
+            with self.subTest(missing=fields[missing][0]):
+                code, out = self.bind("--replace", *extra, thread=OTHER)
+                self.assertEqual(4, code, out)
+                self.assertIn("--approval-ref", out)
+        self.assertEqual(1, self.daemon.connections)
+        self.assertEqual(1, len(self.events("wake.bound")))
+
+    def test_binding_metadata_and_same_holder_refresh_forward_observed_generation(self):
+        code, out = self.bind("--scope", "docs:review", "--charter", "Review scoped docs", "--json")
+        self.assertEqual(0, code, out)
+        first = self.events("wake.bound")[-1]["seq"]
+        code, out = self.bind("--charter", "Review docs and receipts", "--reason", "scope clarification", "--json")
+        result = json.loads(out)
+        self.assertEqual((0, "BOUND"), (code, result["status"]))
+        binding_call = self.ledger_calls[-1][1]
+        self.assertIn("--replace", binding_call)
+        self.assertEqual(str(first), binding_call[binding_call.index("--expected-generation") + 1])
+        with self.store() as store:
+            binding = store.wake_bindings("operator")["bindings"][0]
+        self.assertEqual(("docs:review", "Review docs and receipts"), (binding["role_scope"], binding["charter"]))
+        code, out = self.run_helper(wake.bind_main, "operator")
+        self.assertEqual(0, code)
+        self.assertIn("  scope: docs:review", out)
+        self.assertIn("  charter: Review docs and receipts", out)
+
+    def test_actual_codex_recipient_can_refresh_and_stale_generation_refuses(self):
+        first = self.bound()
+        code, out = self.run_helper(wake.bind_main, "operator", "--thread", THREAD, "--agent", "codex",
+                                    "--session", THREAD, "--charter", "Current recipient responsibility", "--json")
+        self.assertEqual((0, "BOUND"), (code, json.loads(out)["status"]))
+        self.assertEqual(str(first), self.ledger_calls[-1][1][self.ledger_calls[-1][1].index("--expected-generation") + 1])
+        before = len(self.events())
+        code, out = self.run_helper(wake.bind_main, "operator", "--thread", THREAD, "--agent", "codex",
+                                    "--session", THREAD, "--expected-generation", str(first), "--json")
+        self.assertEqual((4, "NOT BOUND"), (code, json.loads(out)["status"]))
+        self.assertIn("generation", json.loads(out)["happened"])
+        self.assertEqual(before, len(self.events()))
+
+    def test_foreign_holder_needs_complete_authorization_even_for_same_recipient_metadata(self):
+        self.bound()
+        before = len(self.events())
+        connections = self.daemon.connections
+        code, out = self.run_helper(wake.bind_main, "operator", "--thread", THREAD, "--agent", "claude",
+                                    "--session", "another-holder", "--charter", "New responsibility", "--replace", "--json")
+        result = json.loads(out)
+        self.assertEqual((4, "NOT BOUND"), (code, result["status"]))
+        self.assertIn("--approval-ref", result["next"])
+        self.assertEqual(before, len(self.events()))
+        self.assertEqual(connections, self.daemon.connections)
+
     def test_bind_checks_the_conversation_and_records_its_generation(self):
         code, out = self.run_helper(wake.bind_main, "operator", "--thread", THREAD, "--agent", "claude",
                                     "--session", "binder", "--json")
@@ -1222,7 +1382,7 @@ class BindTests(WakeCase):
                           "Next: Check `codex app-server daemon version`, then run bind again."], out.splitlines())
         self.assertEqual([], self.events("wake.bound"))
 
-    def test_bind_refuses_a_bound_role_until_replace_and_replace_starts_a_generation(self):
+    def test_bind_refuses_a_recipient_move_until_authorized_handover(self):
         first = self.bound()
         self.daemon.threads[OTHER] = {"cwd": str(self.repo), "status": "active", "turns": []}
         code, out = self.bind(thread=OTHER)
@@ -1231,10 +1391,16 @@ class BindTests(WakeCase):
         bound_at = self.events("wake.bound")[-1]["recorded_at"]
         self.assertEqual([f"NOT BOUND: operator is already bound to Codex conversation {THREAD} (binding {first}, since "
                           f"{bound_at}). Nothing was recorded.",
-                          f"Next: To move it, run: multithread bind operator --thread {OTHER} --replace"],
+                          "Next: Have its exact holder claude:binder refresh its existing recipient, or make an "
+                          f"explicitly authorized handover with --replace, --expected-generation {first}, "
+                          "--reason <reason> and --approval-ref <immutable approval reference>."],
                          out.splitlines())
         old_id = self.wake("--dry-run")["message_id"]
         code, out = self.bind("--replace", thread=OTHER)
+        self.assertEqual(4, code, out)
+        self.assertNotIn("To move it, run:", out)
+        self.assertEqual(2, self.daemon.connections, "bare replacement never reaches the daemon")
+        code, out = self.handover()
         self.assertEqual(0, code, out)
         second = self.events("wake.bound")[-1]
         self.assertEqual(first, second["meta"]["replaces"])
@@ -1352,6 +1518,7 @@ class RoutingTests(unittest.TestCase):
     def test_read_only_worker_profile_covers_exactly_the_wake_reads(self):
         parser = runtime_cli._parser()
         for argv, expected in ((["wake-ledger", "show"], True), (["wake-ledger", "observed", THREAD], True),
+                               (["wake-ledger", "history", "operator"], True),
                                (["wake-ledger", "plan", "operator", "--ref", "1", "--requested", "queue"], True),
                                (["wake-ledger", "begin", "operator", "--ref", "1", "--requested", "queue"], False),
                                (["wake-ledger", "conclude", "3", "--outcome", "queued", "--reason", "requested"], False),

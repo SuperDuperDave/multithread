@@ -32,6 +32,7 @@ from .protocol import (
     WAKE_CONCLUSIONS,
     WAKE_REQUESTS,
     canonical_agent,
+    session_target,
     canonical_decision_id,
     canonical_decision_option,
     canonical_resource,
@@ -714,11 +715,13 @@ class RelayStore:
         agent: str,
         *,
         limit: int = BRIEF_DEFAULT_LIMIT,
+        session: str | None = None,
     ) -> dict[str, Any]:
         """Return bounded coordination context for one agent.
 
-        Targeted and broadcast signals are delivered oldest-first and remain
-        visible until that agent records an explicit acknowledgement event.
+        Exact-session work is shown newest-first before the oldest generic
+        and broadcast work; pages remain sequence ordered. Signals stay
+        visible until their intended recipient explicitly acknowledges them.
         This is at-least-once delivery without a mutable inbox table.
         """
 
@@ -733,23 +736,8 @@ class RelayStore:
             """,
             (limit + 1,),
         ).fetchall()
-        placeholders = ",".join("?" for _ in DELIVERY_SIGNAL_KINDS)
-        signal_rows = self._execute(
-            f"""
-            SELECT signal.* FROM events AS signal
-            WHERE signal.kind IN ({placeholders})
-              AND (signal.target = ? OR signal.target IS NULL)
-              AND NOT EXISTS (
-                SELECT 1 FROM events AS acknowledgement
-                WHERE acknowledgement.kind = 'delivery.acknowledged'
-                  AND acknowledgement.target = ?
-                  AND acknowledgement.scope =
-                      ('signal:' || CAST(signal.seq AS TEXT))
-              )
-            ORDER BY signal.seq ASC LIMIT ?
-            """,
-            (*DELIVERY_SIGNAL_KINDS, agent, agent, limit + 1),
-        ).fetchall()
+        pending = self.inbox(agent, session=session, limit=limit)
+        signal_rows = pending["pending_signals"]
         actionable_ratchet = [
             item
             for item in self.ratchet_review()
@@ -761,12 +749,15 @@ class RelayStore:
         return {
             "brief_version": 1,
             "agent": agent,
+            "session": session,
+            "pending_count": pending["pending_count"],
+            "targeted_count": pending["targeted_count"],
             "last_seq": max_seq,
             "limit_per_section": limit,
             "truncated": {
                 "active_claims": len(claims) > limit,
                 "recent_intents": len(intent_rows) > limit,
-                "pending_signals": len(signal_rows) > limit,
+                "pending_signals": pending["has_more"],
                 "ratchet_items": len(actionable_ratchet) > limit,
             },
             "active_claims": [
@@ -776,14 +767,58 @@ class RelayStore:
                 self._brief_event(self._event_row(row))
                 for row in intent_rows[:limit]
             ],
-            "pending_signals": [
-                self._brief_event(self._event_row(row))
-                for row in signal_rows[:limit]
-            ],
+            "pending_signals": [self._brief_event(row) for row in signal_rows],
             "ratchet_items": [
                 self._compact_ratchet_item(item)
                 for item in actionable_ratchet[:limit]
             ],
+        }
+
+    def inbox(
+        self, agent: str, *, session: str | None = None,
+        limit: int = BRIEF_DEFAULT_LIMIT, after: int | None = None,
+    ) -> dict[str, Any]:
+        """Bounded pending delivery. Exact-session work leads a brief; pages use seq order."""
+        agent = canonical_agent(agent)
+        exact = session_target(agent, session) if session is not None else None
+        limit = _inbox_limit(limit)
+        if after is not None and (not isinstance(after, int) or isinstance(after, bool) or after < 0):
+            raise ValidationError("inbox --after must be a nonnegative sequence")
+        placeholders = ",".join("?" for _ in DELIVERY_SIGNAL_KINDS)
+        where = f"""
+            signal.kind IN ({placeholders})
+            AND (signal.target IN (?, ?) OR signal.target IS NULL)
+            AND NOT EXISTS (
+                SELECT 1 FROM events AS ack
+                WHERE ack.kind = 'delivery.acknowledged'
+                AND ack.target = CASE WHEN signal.target = ? THEN ? ELSE ? END
+                AND ack.scope = ('signal:' || CAST(signal.seq AS TEXT))
+            )
+        """
+        params = (*DELIVERY_SIGNAL_KINDS, agent, exact, exact, exact, agent)
+        counts = self._execute(
+            f"SELECT COUNT(*), COALESCE(SUM(signal.target = ?), 0) FROM events AS signal WHERE {where}",
+            (exact, *params),
+        ).fetchone()
+        if after is None:
+            order = "CASE WHEN signal.target = ? THEN 0 ELSE 1 END, " \
+                    "CASE WHEN signal.target = ? THEN -signal.seq ELSE signal.seq END"
+            rows = self._execute(
+                f"SELECT signal.* FROM events AS signal WHERE {where} ORDER BY {order} LIMIT ?",
+                (*params, exact, exact, limit + 1),
+            ).fetchall()
+        else:
+            rows = self._execute(
+                f"SELECT signal.* FROM events AS signal WHERE {where} AND signal.seq > ? "
+                "ORDER BY signal.seq LIMIT ?",
+                (*params, after, limit + 1),
+            ).fetchall()
+        selected = rows[:limit]
+        return {
+            "agent": agent, "session": session, "pending_count": int(counts[0]),
+            "targeted_count": int(counts[1]), "has_more": len(rows) > limit,
+            "next_after": int(selected[-1]["seq"]) if selected and after is not None else None,
+            "pending_signals": [self._event_row(row) for row in selected],
         }
 
     def channel_pending(
@@ -1069,9 +1104,8 @@ class RelayStore:
     ) -> dict[str, Any]:
         """Append acknowledgement of one signal delivered to ``agent``.
 
-        Acknowledgement is a set keyed by signal and target agent.  A retry
-        from a later session returns the original event as a duplicate rather
-        than appending delivery noise.
+        Acknowledgement is keyed by signal and recipient. Exact-session targets
+        require that session; generic/broadcast ACKs remain agent scoped.
         """
 
         with self._transaction():
@@ -1145,7 +1179,13 @@ class RelayStore:
         agent = canonical_agent(agent)
         acknowledgement_scope = f"signal:{signal_seq}"
 
-        digest = hashlib.sha256(agent.encode("utf-8")).hexdigest()[:24]
+        exact = session_target(agent, session)
+        if signal["target"] not in {None, agent, exact}:
+            raise ConflictError(
+                f"signal {signal_seq} is targeted to {signal['target']}, not {exact}"
+            )
+        recipient = exact if signal["target"] == exact else agent
+        digest = hashlib.sha256(recipient.encode("utf-8")).hexdigest()[:24]
         event = normalize_event(
             {
                 "v": 1,
@@ -1154,7 +1194,7 @@ class RelayStore:
                 "agent": agent,
                 "session": session,
                 "work_id": signal["work_id"],
-                "target": agent,
+                "target": recipient,
                 "scope": acknowledgement_scope,
                 "summary": f"Acknowledged delivery of Relay signal {signal_seq}",
                 "meta": {
@@ -1165,11 +1205,6 @@ class RelayStore:
             },
             internal=True,
         )
-        if signal["target"] is not None and signal["target"] != event.agent:
-            raise ConflictError(
-                f"signal {signal_seq} is targeted to {signal['target']}, not {event.agent}"
-            )
-
         existing = self._db.execute(
             """
             SELECT * FROM events
@@ -1177,7 +1212,7 @@ class RelayStore:
               AND target = ? AND scope = ?
             ORDER BY seq LIMIT 1
             """,
-            (event.agent, acknowledgement_scope),
+            (recipient, acknowledgement_scope),
         ).fetchone()
         if existing is not None:
             return self._event_receipt(int(existing["seq"]), duplicate=True)
@@ -1221,6 +1256,11 @@ class RelayStore:
         provider: str = "codex",
         thread: str | None = None,
         cwd: str | None = None,
+        charter: str | None = None,
+        role_scope: str | None = None,
+        expected_generation: int | None = None,
+        reason: str | None = None,
+        approval_ref: str | None = None,
     ) -> dict[str, Any]:
         """Bind a role to a Codex conversation, or to a Claude Code session's inbox."""
 
@@ -1229,9 +1269,14 @@ class RelayStore:
             thread = canonical_wake_thread(thread)
         with self._transaction():
             current = self._wake_binding(role)
+            if current is None and expected_generation is not None:
+                raise ConflictError("role binding changed; expected generation is no longer bound")
             if current is not None:
+                if expected_generation is not None and expected_generation != current["generation"]:
+                    raise ConflictError("role binding changed; inspect the current generation before handover")
                 if current["thread"] == thread and current["endpoint"] == endpoint:
-                    return {"duplicate": True, "binding": self._wake_state(role)}
+                    if charter is None and role_scope is None:
+                        return {"duplicate": True, "binding": self._wake_state(role)}
                 if not replace:
                     where = (
                         f"through {current['endpoint']}" if current["thread"] == thread
@@ -1241,6 +1286,18 @@ class RelayStore:
                         f"{role} is already bound {where} (binding "
                         f"{current['generation']}); pass --replace to move it"
                     )
+                same_owner = (canonical_agent(agent), canonical_agent(session)) == (current["bound_agent"], current["bound_session"]) or (
+                    current["provider"] == "codex" and agent == "codex" and session == current["thread"]
+                )
+                same_recipient = provider == current["provider"] and (
+                    provider == "claude" or thread == current["thread"]
+                )
+                if not (same_owner and same_recipient):
+                    if expected_generation is None or not reason or not approval_ref:
+                        raise ConflictError(
+                            "moving another holder's role requires its release, or explicit user authorization "
+                            "with --expected-generation, --reason and --approval-ref; --replace alone is insufficient"
+                        )
             summary = (
                 f"Bound {role} to Codex conversation {thread}" if provider == "codex"
                 else f"Bound {role} to the Claude Code inbox {endpoint.removeprefix('unix://')}"
@@ -1254,7 +1311,18 @@ class RelayStore:
             }
             if current is not None:
                 meta["replaces"] = current["generation"]
+                meta["previous_holder"] = (
+                    f"codex:{current['thread']}" if current["provider"] == "codex" else current["bound_by"]
+                )
                 summary += f", replacing binding {current['generation']}"
+            for key, value in (("charter", charter), ("role_scope", role_scope),
+                               ("reason", reason), ("approval_ref", approval_ref)):
+                if value is not None:
+                    meta[key] = value
+            if current is not None:
+                for key in ("charter", "role_scope"):
+                    if key not in meta and current.get(key) is not None:
+                        meta[key] = current[key]
             event = normalize_event(
                 {
                     "v": 1,
@@ -1267,7 +1335,28 @@ class RelayStore:
                 },
                 internal=True,
             )
-            self._insert_event(event)
+            seq, _ = self._insert_event(event)
+            if current is not None and current["paused_seq"] is not None:
+                self._insert_event(normalize_event({
+                    "kind": "wake.paused", "agent": agent, "session": session,
+                    "target": role, "summary": f"Preserved paused wakes to {role} (binding {seq})",
+                    "meta": {"role": role, "generation": seq},
+                }, internal=True))
+            if current is not None and not (same_owner and same_recipient):
+                for recipient, detail in (
+                    (session_target("codex", current["thread"]) if current["provider"] == "codex"
+                     else session_target(current["bound_agent"], current["bound_session"]),
+                     "Your role binding was explicitly handed over"),
+                    (session_target("codex", thread) if provider == "codex" else session_target(agent, session),
+                     "Review outstanding work from the previous binding before accepting a handover"),
+                ):
+                    notice = normalize_event({
+                        "kind": "work.handoff", "agent": agent, "session": session,
+                        "target": recipient, "artifact": f"receipt:binding:{seq}",
+                        "summary": f"{detail}: {role}; inspect roles {role} --history. "
+                                   "Original messages and claim ownership are unchanged.",
+                    })
+                    self._insert_event(notice)
             return {
                 "duplicate": False,
                 "binding": self._wake_state(role),
@@ -1275,7 +1364,9 @@ class RelayStore:
             }
 
     def wake_control(
-        self, action: str, role: str, *, agent: str, session: str
+        self, action: str, role: str, *, agent: str, session: str,
+        expected_generation: int | None = None, reason: str | None = None,
+        approval_ref: str | None = None,
     ) -> dict[str, Any]:
         """Unbind, pause or resume the current binding; a no-op is a duplicate."""
 
@@ -1294,6 +1385,14 @@ class RelayStore:
                     "--thread <codex conversation id>, or --claude-socket "
                     "\"$CLAUDE_CODE_MESSAGING_SOCKET\" from a Claude Code session"
                 )
+            if expected_generation is not None and expected_generation != current["generation"]:
+                raise ConflictError("role binding changed; inspect the current generation")
+            owner = (canonical_agent(agent), canonical_agent(session)) == (current["bound_agent"], current["bound_session"]) or (
+                current["provider"] == "codex" and agent == "codex" and session == current["thread"]
+            )
+            if not owner and (expected_generation is None or not reason or not approval_ref):
+                raise ConflictError("changing another holder's role requires explicit user authorization "
+                                    "with --expected-generation, --reason and --approval-ref")
             paused = current["paused_seq"] is not None
             if (action == "pause" and paused) or (action == "resume" and not paused):
                 return {"duplicate": True, "binding": self._wake_state(role)}
@@ -1311,7 +1410,9 @@ class RelayStore:
                     "session": session,
                     "target": role,
                     "summary": summary,
-                    "meta": {"role": role, "generation": generation},
+                    "meta": {"role": role, "generation": generation,
+                             **({"reason": reason} if reason is not None else {}),
+                             **({"approval_ref": approval_ref} if approval_ref is not None else {})},
                 },
                 internal=True,
             )
@@ -1558,6 +1659,10 @@ class RelayStore:
                     "cwd": meta.get("cwd"),
                     "bound_at": row["recorded_at"],
                     "bound_by": f"{row['agent']}:{row['session']}",
+                    "bound_agent": row["agent"],
+                    "bound_session": row["session"],
+                    "charter": meta.get("charter"),
+                    "role_scope": meta.get("role_scope"),
                     "paused_seq": None,
                 }
                 continue
@@ -1593,6 +1698,28 @@ class RelayStore:
             "last_attempt": self._wake_attempt(last) if last is not None else None,
         }
 
+    def wake_history(self, role: str, *, limit: int = 30, before: int | None = None,
+                     ref: str | None = None) -> dict[str, Any]:
+        """Read outstanding original-generation attempts; never redirect or resend."""
+        role = canonical_wake_role(role)
+        limit = _inbox_limit(limit)
+        if before is not None and (not isinstance(before, int) or isinstance(before, bool) or before < 1):
+            raise ValidationError("history --before must be a positive sequence")
+        where = "target = ? AND kind = 'wake.attempted'"
+        params: list[Any] = [role]
+        if before is not None:
+            where += " AND seq < ?"
+            params.append(before)
+        if ref is not None:
+            where += " AND json_extract(meta_json, '$.ref') = ?"
+            params.append(canonical_wake_ref(ref))
+        rows = self._execute(f"SELECT * FROM events WHERE {where} ORDER BY seq DESC LIMIT ?",
+                             (*params, limit + 1)).fetchall()
+        attempts = [self._wake_attempt(row) for row in rows[:limit]]
+        return {"ledger": str(self.paths.repo_root), "binding": self._wake_state(role),
+                "attempts": attempts, "has_more": len(rows) > limit,
+                "next_before": attempts[-1]["seq"] if attempts else None}
+
     def _wake_attempt(self, row: sqlite3.Row) -> dict[str, Any]:
         self._assert_canonical_event_row(row)
         meta = json.loads(row["meta_json"])
@@ -1610,6 +1737,27 @@ class RelayStore:
             "requested": meta["requested"],
             "outcome": "open",
         }
+        bound = self._execute("SELECT * FROM events WHERE seq = ?", (meta["generation"],)).fetchone()
+        if bound is None or bound["kind"] != "wake.bound":
+            raise StateError("wake attempt has no original binding")
+        self._assert_canonical_event_row(bound)
+        holder = json.loads(bound["meta_json"])
+        recipient_agent, recipient_session = ("codex", holder["thread"]) if holder["provider"] == "codex" else (bound["agent"], bound["session"])
+        recipient = f"{recipient_agent}:{recipient_session}"
+        attempt.update(recipient=recipient, consumption_state="unknown")
+        signal = self._execute("SELECT kind FROM events WHERE seq = ?", (int(meta["ref"]),)).fetchone() if meta["ref"].isdigit() else None
+        if signal is not None and signal["kind"] in DELIVERY_SIGNAL_KINDS:
+            acknowledgement = self._execute(
+                "SELECT * FROM events WHERE kind = 'delivery.acknowledged' AND scope = ? "
+                "ORDER BY CASE WHEN agent = ? AND session = ? THEN 0 ELSE 1 END, seq LIMIT 1",
+                (f"signal:{meta['ref']}", recipient_agent, recipient_session)
+            ).fetchone()
+            attempt["consumption_state"] = "not_acknowledged"
+            if acknowledgement is not None:
+                self._assert_canonical_event_row(acknowledgement)
+                consumed_by = f"{acknowledgement['agent']}:{acknowledgement['session']}"
+                attempt.update(consumption_state="acknowledged" if (acknowledgement['agent'], acknowledgement['session']) == (recipient_agent, recipient_session) else "acknowledged_elsewhere",
+                               acknowledgement_seq=int(acknowledgement["seq"]), consumed_by=consumed_by)
         conclusion = self._execute(
             "SELECT * FROM events WHERE event_id = ?",
             (f"wake-concluded:{int(row['seq'])}",),
@@ -2934,6 +3082,12 @@ def _require_decision_rollout(value: Any) -> None:
         raise ValidationError(
             "decision protocol rollout fence requires active-clients-refreshed"
         )
+
+
+def _inbox_limit(value: int) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or not 1 <= value <= 100:
+        raise ValidationError("inbox/history limit must be between 1 and 100")
+    return value
 
 
 def _brief_limit(value: int) -> int:

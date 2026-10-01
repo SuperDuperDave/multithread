@@ -25,7 +25,7 @@ class LaunchProviderTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.base = Path(temporary.name)
         self.repo = self.base / "checkout 'quote' 雪 ;$(touch injected)"
-        self.repo.mkdir()
+        self.repo.mkdir(mode=0o700)
         self.relay = self.base / "multithread"
         self.provider = self.base / "provider entry"
         self.plan_file = self.base / "configuration.json"
@@ -64,7 +64,7 @@ class LaunchProviderTests(unittest.TestCase):
     def configuration(self, client, launcher=None):
         selector = [] if client == "codex" else ["--repo", str(self.repo)]
         hook = shlex.join([str(launcher or self.relay), *selector, "provider-hook", "--client", client])
-        events = ["SessionStart", "UserPromptSubmit", "Stop", "SessionEnd"]
+        events = ["SessionStart", "UserPromptSubmit", "PostToolUse", "Stop", "SessionEnd"]
         if client == "codex":
             events.append("Interrupt")
         hooks = {event: [{"hooks": [{"type": "command", "command": hook, "timeout": 3}]}]
@@ -184,6 +184,21 @@ class LaunchProviderTests(unittest.TestCase):
                      "--launcher-name", "multithread"],
                     json.loads(received.read_text()))
                 provider_call.assert_not_called()
+
+    def test_writable_checkout_refusal_names_narrow_repair_without_changing_permissions(self):
+        self.repo.chmod(0o775)
+        with (mock.patch.object(launch.subprocess, "run", return_value=self.mocked_result(returncode=9)),
+              mock.patch.object(launch.subprocess, "call") as provider_call):
+            value = self.assert_unavailable(self.invoke())
+        self.assertIn(repr(str(self.repo)), value["message"])
+        self.assertIn("mode 0775", value["message"])
+        self.assertIn("No provider was started", value["message"])
+        self.assertIn(shlex.join(["chmod", "g-w,o-w", str(self.repo)]), value["message"])
+        self.assertIn(shlex.join([str(self.relay), "setup", "--repo", str(self.repo), "--check"]),
+                      value["message"])
+        self.assertNotIn("chmod -R", value["message"])
+        self.assertEqual(0o775, self.repo.stat().st_mode & 0o777)
+        provider_call.assert_not_called()
 
     def test_unenrolled_checkout_is_named_with_the_command_that_enrolls_it(self):
         self.make_executable(self.relay, "raise SystemExit(78)\n")
@@ -393,7 +408,7 @@ class LaunchProviderTests(unittest.TestCase):
             self.assertIn("Checkout: " + str(self.repo), output)
             self.assertIn("Hook command: " + plan["hook_command"], output)
             self.assertIn("3-second timeout", output)
-            self.assertIn("SessionStart, UserPromptSubmit, Stop, SessionEnd", output)
+            self.assertIn("SessionStart, UserPromptSubmit, PostToolUse, Stop, SessionEnd", output)
             self.assertEqual(client == "codex", "Interrupt" in output)
             self.assertNotIn("incorrect-description", output)
             self.assertNotIn("native_arguments", output)

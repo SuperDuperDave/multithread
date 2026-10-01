@@ -155,6 +155,34 @@ or explicitly say no material findings. Acknowledge the handoff after review;
 release any claim you acquired. Report anything that remains incomplete.
 ```
 
+Publish that handoff only when the task authorizes a ledger write, using the
+initiating session's exact coordination identity from its Multithread context:
+
+```sh
+~/.local/bin/multithread --repo /absolute/enrolled/author-checkout signal work.handoff \
+  --agent codex --session EXACT_AUTHOR_SESSION --work-id review-example \
+  --target claude --scope src/example.py --summary 'Review the committed change' \
+  --commit HEAD
+```
+
+`--commit` resolves a revision to its immutable full Git OID and records a
+bounded commit capsule. Alternatively use `--artifact git:FULL_COMMIT_OID` or
+`--artifact sha256:FULL_64_HEX_DIGEST` for reviewed frozen bytes. A pathname,
+branch name, or bare digest is not an immutable artifact. The digest identifies
+bytes; it does not deliver the file or authorize sharing it. Do not combine
+`--commit` with `--artifact` or `--commit-oid`.
+
+Use both `--agent` and `--session` for ledger mutations unless their exact
+values are already supplied by `RELAY_AGENT` and `RELAY_SESSION`. These identify
+the caller, not the peer's native resume session or a role name. Replace the
+example identity with your own; do not invent or borrow another session's ID.
+To address one reviewer session, use `--target claude --target-session EXACT_REVIEWER_SESSION`;
+`--target claude` addresses Claude generally. See [the session inbox](#inspect-pending-work-and-role-handovers).
+Exact recipients are stored as a compact JSON pair, such as `["claude","reviewer-session"]`.
+For direct event emission use a string containing that pair as `target`; bare labels containing
+colons retain their existing generic-agent meaning.
+The [first read-only collaboration](#first-collaboration) needs no handoff.
+
 Use the installed launcher's actual path, normally:
 
 ```sh
@@ -374,7 +402,9 @@ send it short wakes through the shared Codex daemon's control socket in your
 Codex home. A wake carries a pointer to the work, never the work itself:
 
 ```sh
-multithread bind operator --thread <conversation uuid> --agent claude --session <session>
+multithread bind operator --thread <conversation uuid> --scope project/workstream \
+  --charter 'Review this workstream and resolve its open questions' \
+  --agent claude --session <session>
 multithread wake operator --ref /absolute/path/task.md --agent claude --session <session>
 ```
 
@@ -386,11 +416,15 @@ run them in, or of `--repo`.
 - **Bind** asks the daemon whether the conversation exists, shows its directory
   and status, and records the binding; its sequence is the binding's
   generation. It refuses an unknown conversation, an unreachable daemon, or a
-  role already bound elsewhere (`--replace` moves it). When the conversation has
+  role already bound elsewhere; `--replace` alone does not authorize moving
+  another holder or recipient. See [role handovers](#inspect-pending-work-and-role-handovers).
+  When the conversation has
   left no events in the ledger of its own checkout, bind warns: that
   conversation gets no Multithread brief, so each wake must carry a task-file
   path. `multithread bind` alone lists bindings and their last wake;
-  `multithread unbind`, `pause` and `resume` change one.
+  `multithread roles` also shows scope, charter and holder;
+  `multithread unbind`, `pause` and `resume` change one under the ownership rules
+  below.
 - **Wake queues by default.** The message starts a new turn when the
   conversation is idle, or right after its current turn. Use `--steer` only for
   news about the recipient's current work: it joins the running turn at its next
@@ -401,8 +435,9 @@ run them in, or of `--repo`.
 - Each attempt is recorded before it is sent and concluded after. The default
   message id comes from the ledger, role, binding generation and reference, and
   for a task file from its bytes too: the attempt records the file's sha256 and
-  size, the content-addressed reference `signal --artifact sha256:<digest>`
-  records by hand. A file that changed is a new message; the same unchanged file
+  size, matching the content-addressed `--artifact sha256:<digest>` that a
+  [work signal](#send-a-scoped-task) can record explicitly. A file that changed
+  is a new message; the same unchanged file
   sent twice reports `ALREADY SENT` and names the `--id` that sends it again on
   purpose. A rebind starts a new generation, so message ids start over: a file
   already sent under the old binding can be sent again. `--dry-run` decides and
@@ -414,15 +449,17 @@ run them in, or of `--repo`.
 | `QUEUED` | 0 | Queued as asked, because no turn was running, or because Codex refused the steer before accepting it: the turn ended, another turn was running, or the running turn can't take a steer |
 | `DELIVERED TO INBOX` | 0 | A Claude Code session's inbox took the whole message |
 | `DRY RUN` | 0 | Decided; nothing sent or recorded |
+| `STATUS` | 0 | Read original-binding attempts and recorded consumption evidence; nothing sent, and recipient reachability/current turn state were not probed |
 | `ALREADY SENT` | 3 | This message id went out, or its earlier outcome is unknown; nothing sent |
 | `NOT SENT` | 4 | Nothing reached the conversation: the daemon was unreachable, refused to list the conversation's turns, or answered the turn list unreadably; the conversation is unknown; Codex couldn't be found or run, or `codex queue` refused before sending; the inbox is gone, failed its checks or refused the connection; the role is paused or unbound; or the arguments, the reference or the ledger couldn't be used. The same id is safe to retry |
 | `UNCERTAIN` | 5 | Sent, with no receipt that it arrived: the daemon didn't answer the steer, or `codex queue` didn't finish; the steer drew an unreadable reply, an error that doesn't show it was refused before acceptance, or no receipt for the expected turn; `codex queue` printed no receipt for the bound conversation, or failed after starting; or the inbox connection dropped while sending. The id stays blocked; check with the recipient before sending again |
 
 Every result names the next step, as text or with `--json`.
 
-A daemon or inbox accepting a wake is not the recipient reading it. The
-recipient still acknowledges through the ledger or the task file, and a wake
-grants no authority beyond the work it points to. Nothing is sent automatically
+A daemon or inbox accepting a wake is not the recipient reading it. Use
+[wake status and explicit acknowledgement](#inspect-pending-work-and-role-handovers)
+to inspect consumption separately. A wake grants no authority beyond the work
+it points to. Nothing is sent automatically
 when a signal is recorded. The command's tests use a fake daemon and a fake
 inbox. Live observations with Codex 0.159.2 exercised the same daemon methods
 before this command existed: a queued message into an idle conversation started
@@ -438,7 +475,9 @@ exports its path to its own shell. Bind from inside the session you want to
 wake, so the role names that session's inbox:
 
 ```sh
-multithread bind reviewer --claude-socket "$CLAUDE_CODE_MESSAGING_SOCKET" --agent claude --session <session>
+multithread bind reviewer --claude-socket "$CLAUDE_CODE_MESSAGING_SOCKET" \
+  --scope project/workstream --charter 'Review the requested change' \
+  --agent claude --session <session>
 ```
 
 Bind checks that the path is a socket you own with mode 600 and not a symbolic
@@ -451,8 +490,9 @@ shows it as sent by another Claude session, not by the person, and says a peer
 cannot approve anything; the text names the real sender. The session's inbound
 settings (`crossSessionInbound`) may still hold or refuse it, and Claude Code
 drops identical repeats sent close together. When the session ends or restarts
-its inbox goes away: wake reports `NOT SENT` and names the bind to run from the
-new session. In one live test before this command existed, an idle Claude
+its inbox goes away: wake reports `NOT SENT` and names the binding recovery
+route. The same owner can refresh its inbox; a new holder needs release or
+[authorized handover](#inspect-pending-work-and-role-handovers). In one live test before this command existed, an idle Claude
 Code session started a turn within 8 seconds of such a message.
 
 A Codex desktop turn that wakes a Claude Code session runs inside Codex's
@@ -460,6 +500,77 @@ sandbox. There the installed launcher refuses by design ("unsafe launcher
 ancestry"), and the sandbox may also block a Claude Code inbox socket: run
 `multithread wake` through Codex's approved escalation outside the sandbox, and
 never work around the launcher check. That route has not yet been run live.
+
+## Inspect pending work and role handovers
+
+Read the inbox with your exact coordination identity, using `next_after` as the
+next `--after` cursor while `has_more` is true:
+
+```sh
+multithread inbox --agent codex --session EXACT_SESSION --after 0 --limit 30 --json
+multithread brief --agent codex --session EXACT_SESSION --json
+```
+
+Inbox pages run oldest first. The bounded brief prioritizes the newest
+exact-session signals, then the oldest agent-wide and broadcast signals.
+`pending_count` counts all pending signals for that identity; `targeted_count`
+counts those for its exact session. Counts and truncation show when the brief
+is incomplete. Reading either view is not an ACK. After consuming an authorized
+signal, explicitly record `multithread acknowledge SEQ --agent codex --session
+EXACT_SESSION`; an ACK records consumption, not approval or task completion.
+An exact-session signal requires that recipient's exact identity. Do not
+acknowledge on another session's behalf.
+
+Inspect the role before changing it, and page its original-binding attempts
+with the returned `next_before` cursor:
+
+```sh
+multithread roles --json
+multithread roles operator --json
+multithread roles operator --history --before SEQ --limit 30 --json
+multithread wake operator --status --json
+multithread wake operator --status --ref /absolute/path/task.md --json
+```
+
+For the first history page omit `--before`; use the returned sequence for older
+pages. `roles` shows the binding generation, holder, declared scope and charter.
+History preserves each attempt's original generation and recipient, transport
+outcome and consumption evidence. `wake --status` is read-only: it neither
+rereads the task file (which may have vanished), probes the recipient nor sends
+again. `QUEUED`, `STEERED` and `DELIVERED TO INBOX` record transport acceptance.
+File-pointer and non-delivery-event consumption remain `unknown`; a wake naming
+an acknowledgeable ledger signal can show
+`not_acknowledged`, `acknowledged` by its original recipient, or
+`acknowledged_elsewhere`. A later turn alone does not establish consumption.
+
+The binding owner or its Codex recipient can pause, resume or unbind its own
+role; a same-owner Claude binding can refresh its inbox. A different holder or
+recipient needs the holder's release, or actual user authorization for the
+handover. For that authorized replacement, add `--replace
+--expected-generation N --reason 'why this handover is authorized'
+--approval-ref sha256:FULL_64_HEX_DIGEST` to the new `bind` command, preserving
+the approved scope and charter. The immutable reference identifies the reviewed
+approval artifact. These flags audit authority already held; they do not grant
+permission or authenticate a user. For another holder's `unbind`, `pause` or
+`resume`, the same authorization and generation/reason/approval-reference flags
+are required. A stale generation refuses; inspect again before deciding.
+
+An authorized handover records targeted notices for the old and new recipients.
+Outstanding messages keep their original recipients and binding generations;
+claims keep their exact owners. Nothing redirects old messages or expires claims.
+Review that outstanding work explicitly before accepting the new responsibility.
+
+When configured and trusted, `PostToolUse` hooks can remind a session about
+pending work between tools. They read the ledger without writing events and
+include pending counts, up to three signals and the inbox command for
+the rest. They are nonblocking and never ACK automatically. For the same
+repository, provider and session, an identical notice is suppressed for ten
+seconds; changed reminder content bypasses that suppression. The temporary
+cache records only suppression state, not delivery or consumption. A cache
+failure permits repeat notices, never an ACK or a claim that the inbox is empty.
+Adding this event remains an explicit user-reviewed settings/trust step.
+Installation or configuration does not prove native reminder delivery; see
+[hook delivery](SETUP.md#confirm-delivery-in-a-real-session).
 
 ## Prepare a support report from an existing call
 

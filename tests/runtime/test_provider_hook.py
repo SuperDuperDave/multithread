@@ -1,6 +1,7 @@
 """Installed provider-hook acceptance; no provider process or real account config."""
 
 import hashlib
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -9,9 +10,12 @@ import shlex
 import sqlite3
 import stat
 import subprocess
+import tempfile
+from types import SimpleNamespace
 import unittest
 
 import test_installed as installed
+from relay_runtime import cli as runtimecli
 
 
 def snapshot(root):
@@ -225,7 +229,7 @@ class ProviderHookTests(unittest.TestCase):
         # Unenrolled checkouts and plain directories degrade without state.
         before = snapshot(self.fixture.base)
         for directory in (stray, plain):
-            for event in ("SessionStart", "UserPromptSubmit", "Stop", "SessionEnd", "Interrupt"):
+            for event in ("SessionStart", "UserPromptSubmit", "PostToolUse", "Stop", "SessionEnd", "Interrupt"):
                 with self.subTest(directory=directory.name, event=event):
                     self.silent(run(directory, event, turn_id="stray-turn"), degraded=True)
         self.assertEqual(before, snapshot(self.fixture.base))
@@ -371,6 +375,86 @@ RelayStore.brief = checked_brief
         self.assertNotIn("claim.released", kinds)
         self.assertNotIn("claim.broken", kinds)
 
+    def test_post_tool_use_prioritizes_exact_session_without_ledger_writes_or_payload_leakage(self):
+        self.fixture.initialize()
+        marker = "PRIVATE_TOOL_PAYLOAD_SENTINEL"
+        for client in ("codex", "claude"):
+            for index in range(5):
+                self.fixture.success(
+                    "signal", "work.handoff", "--agent", "sender", "--session", "author",
+                    "--commit", "HEAD", "--target", client, "--work-id", f"generic-{client}-{index}",
+                    "--summary", "Generic pending " + "\U0001f3cb" * 280)
+            own = self.fixture.success(
+                "signal", "work.handoff", "--agent", "sender", "--session", "author",
+                "--commit", "HEAD", "--target", client, "--target-session", "owner", "--work-id", "own-" + client,
+                "--summary", "Exact session pending " + client)["event"]
+            foreign = self.fixture.success(
+                "signal", "work.handoff", "--agent", "sender", "--session", "author",
+                "--commit", "HEAD", "--target", client, "--target-session", "other", "--work-id", "other-" + client,
+                "--summary", "OTHER_SESSION_MUST_NOT_APPEAR")["event"]
+            before_rows, before_state = self.rows(), snapshot(self.fixture.base)
+            result = self.hook(client, "PostToolUse", "owner", payload={
+                "turn_id": "working-turn", "tool_use_id": "synthetic-tool",
+                "tool_input": {"command": marker * 3000}, "tool_response": marker,
+                "prompt": marker, "last_assistant_message": marker,
+                "transcript_path": "/synthetic/never-read-transcript",
+            })
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertEqual("", result.stderr)
+            value = json.loads(result.stdout)
+            self.assertEqual({"hookSpecificOutput"}, set(value))
+            output = value["hookSpecificOutput"]
+            self.assertEqual({"hookEventName", "additionalContext"}, set(output))
+            self.assertEqual("PostToolUse", output["hookEventName"])
+            context = output["additionalContext"]
+            self.assertTrue(context.startswith("MULTITHREAD PENDING v1\n"))
+            self.assertIn(json.dumps({"agent": client, "session": "owner"}), context)
+            self.assertIn("pending=6 exact_session=1", context)
+            displayed = [int(seq) for seq in re.findall(r"^- seq=(\d+)\b", context, re.M)]
+            self.assertEqual(3, len(displayed))
+            self.assertEqual(own["seq"], displayed[0])
+            self.assertNotIn(foreign["seq"], displayed)
+            self.assertNotIn("OTHER_SESSION_MUST_NOT_APPEAR", context)
+            self.assertNotIn(marker, result.stdout + result.stderr)
+            self.assertNotIn("never-read-transcript", result.stdout + result.stderr)
+            self.assertNotIn("MULTITHREAD AGENT CONTRACT", context)
+            self.assertLessEqual(len(context.encode("utf-8")), 8192)
+            self.assertEqual(before_rows, self.rows())
+            self.assert_sql_readonly_snapshot(before_state)
+            pending = self.fixture.success("inbox", "--agent", client, "--session", "owner")
+            self.assertEqual(6, pending["pending_count"])
+
+    def test_post_tool_use_no_pending_or_only_other_session_returns_empty_object(self):
+        self.fixture.initialize()
+        self.fixture.success(
+            "signal", "work.handoff", "--agent", "sender", "--session", "author",
+            "--commit", "HEAD", "--target", "codex", "--target-session", "other", "--work-id", "other-session",
+            "--summary", "Not for this session")
+        before_rows, before_state = self.rows(), snapshot(self.fixture.base)
+        for client in ("codex", "claude"):
+            result = self.hook(client, "PostToolUse", "owner")
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertEqual("", result.stderr)
+            self.assertEqual({}, json.loads(result.stdout))
+        self.assertEqual(before_rows, self.rows())
+        self.assert_sql_readonly_snapshot(before_state)
+
+    def test_post_tool_use_explicit_ack_removes_pending_without_hook_consumption(self):
+        self.fixture.initialize()
+        event = self.fixture.success(
+            "signal", "work.handoff", "--agent", "sender", "--session", "author",
+            "--commit", "HEAD", "--target", "claude", "--target-session", "reader", "--work-id", "explicit-review",
+            "--summary", "Await the exact reader")["event"]
+        first = self.hook("claude", "PostToolUse", "reader")
+        self.assertIn("MULTITHREAD PENDING v1", first.stdout)
+        self.assertEqual(["work.handoff"], [row[1] for row in self.rows()])
+        self.fixture.success("acknowledge", str(event["seq"]), "--agent", "claude", "--session", "reader")
+        before = self.rows()
+        final = self.hook("claude", "PostToolUse", "reader")
+        self.assertEqual({}, json.loads(final.stdout))
+        self.assertEqual(before, self.rows())
+        self.assertEqual(["work.handoff", "delivery.acknowledged"], [row[1] for row in before])
+
     def test_strict_input_and_invalid_sessions_fail_open_without_mutation(self):
         self.fixture.initialize()
         payloads = ["{", "[]", "null", '{"hook_event_name":"SessionStart","session_id":"ok","session_id":"bad"}',
@@ -378,7 +462,7 @@ RelayStore.brief = checked_brief
                     '{"hook_event_name":"SessionStart"}',
                     json.dumps({"hook_event_name": "SessionStart", "session_id": "ok", "extra": "x" * (256 * 1024)})]
         payloads.extend(json.dumps({"hook_event_name": event, "session_id": value})
-                        for event in ("SessionStart", "UserPromptSubmit")
+                        for event in ("SessionStart", "UserPromptSubmit", "PostToolUse")
                         for value in (None, 7, [], "", "bad\nPRIVATE_INPUT_SENTINEL", "x" * 201))
         for raw in payloads:
             with self.subTest(length=len(raw), prefix=raw[:55]):
@@ -398,7 +482,7 @@ RelayStore.brief = checked_brief
 
     def test_unenrolled_and_unknown_events_do_not_create_state_or_config(self):
         before = snapshot(self.fixture.base)
-        for event in ("SessionStart", "UserPromptSubmit"):
+        for event in ("SessionStart", "UserPromptSubmit", "PostToolUse"):
             self.silent(self.hook("codex", event), degraded=True)
         self.silent(self.hook("claude", "UnknownFixtureEvent"))
         self.silent(self.hook("claude", "Interrupt", payload={"turn_id": "ignored"}))
@@ -473,7 +557,7 @@ RelayStore.brief = fail_brief
         self.assertLessEqual(len(brief.encode("utf-8")), 4096)
         headings = (
             "Active claims:", "Recent work intents (newest first):",
-            "Pending targeted/broadcast signals (oldest first; acknowledge after reading):",
+            "Pending signals (exact session newest first, then generic/broadcast oldest first; acknowledge after reading):",
             "Actionable ratchet items:",
         )
         for index, heading in enumerate(headings):
@@ -494,3 +578,96 @@ RelayStore.brief = fail_brief
         self.context(self.hook("claude", "UserPromptSubmit", "bounded-session"),
                      "claude", "UserPromptSubmit", "bounded-session")
         self.assertEqual(rows, self.rows())
+
+
+class PendingReminderCacheTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="relay-reminder-test-")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.args = SimpleNamespace(repo="/synthetic/project", client="codex",
+                                    provider_payload={"session_id": "exact-session"})
+        self.body = json.dumps({"hookSpecificOutput": {
+            "hookEventName": "PostToolUse",
+            "additionalContext": "MULTITHREAD PENDING v1\nSYNTHETIC_PENDING_CONTENT seq=1",
+        }})
+        self.directory = self.root / ("multithread-reminders-" + str(os.getuid()))
+
+    def remind(self, body=None, now=100):
+        return runtimecli._reminder_output(self.body if body is None else body, self.args,
+                                           cache_root=self.root, now=now)
+
+    def test_identical_notice_is_suppressed_briefly_but_changed_notice_and_session_bypass(self):
+        self.assertEqual(self.body, self.remind())
+        self.assertEqual("{}", self.remind(now=109.9))
+        self.assertEqual(self.body, self.remind(now=110))
+        changed = self.body.replace("seq=1", "seq=2")
+        self.assertEqual(changed, self.remind(changed, now=111))
+        self.assertEqual("{}", self.remind(changed, now=112))
+        self.args.provider_payload["session_id"] = "other-session"
+        self.assertEqual(changed, self.remind(changed, now=112))
+        self.assertEqual(changed, self.remind(changed, now=100), "clock reversal must not hide work")
+        entries = list(self.directory.glob("*.json"))
+        self.assertEqual(2, len(entries))
+        for entry in entries:
+            self.assertEqual(0o600, stat.S_IMODE(entry.stat().st_mode))
+            value = json.loads(entry.read_text())
+            self.assertEqual({"at", "fingerprint"}, set(value))
+            self.assertRegex(value["fingerprint"], r"^[a-f0-9]{64}$")
+            self.assertNotIn("SYNTHETIC_PENDING_CONTENT", entry.read_text())
+
+    def test_malformed_cache_allows_notice_and_non_pending_outputs_never_create_cache(self):
+        for body in ("{}", "null", "[]", "{broken", json.dumps({"hookSpecificOutput": {
+                "additionalContext": "MULTITHREAD WARNING: unknown"}})):
+            self.assertEqual(body, self.remind(body))
+        self.assertFalse(self.directory.exists())
+        self.assertEqual(self.body, self.remind())
+        cache = next(self.directory.glob("*.json"))
+        for malformed in ("null", "[]", "7", "false", "{broken"):
+            cache.write_text(malformed)
+            self.assertEqual(self.body, self.remind(now=101))
+            self.assertIsInstance(json.loads(cache.read_text()), dict)
+
+    def test_checkout_free_hooks_and_admitted_enrollments_have_distinct_cache_keys(self):
+        from unittest import mock
+        self.args.repo = None
+        with mock.patch.object(runtimecli.os, "getcwd", return_value="/synthetic/first"):
+            self.assertEqual(self.body, self.remind())
+        with mock.patch.object(runtimecli.os, "getcwd", return_value="/synthetic/second"):
+            self.assertEqual(self.body, self.remind(now=101))
+        for identity in ("enrollment-one", "enrollment-two"):
+            self.assertEqual(self.body, runtimecli._reminder_output(self.body, self.args,
+                             cache_root=self.root, now=101, repository_identity=identity))
+        self.assertEqual("{}", runtimecli._reminder_output(self.body, self.args,
+                         cache_root=self.root, now=102, repository_identity="enrollment-two"))
+
+    def test_unsafe_or_contended_cache_repeats_notice_without_following_links(self):
+        self.assertEqual(self.body, self.remind())
+        lock = self.directory / ".lock"
+        lock.chmod(0o644)
+        before = snapshot(self.directory)
+        self.assertEqual(self.body, self.remind(now=101))
+        self.assertEqual(before, snapshot(self.directory))
+        lock.chmod(0o600)
+        with lock.open("r+") as held:
+            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            before = snapshot(self.directory)
+            self.assertEqual(self.body, self.remind(now=101))
+            self.assertEqual(before, snapshot(self.directory))
+        cache = next(self.directory.glob("*.json"))
+        cache.unlink()
+        protected = self.root / "protected"
+        protected.write_text("PRIVATE_SYNTHETIC_VALUE")
+        cache.symlink_to(protected)
+        before = snapshot(self.root)
+        self.assertEqual(self.body, self.remind(now=101))
+        self.assertEqual(before, snapshot(self.root))
+
+    def test_cache_growth_bound_repeats_notice_without_deleting_existing_receipts(self):
+        self.directory.mkdir(mode=0o700)
+        for index in range(127):
+            (self.directory / (str(index) + ".json")).write_text("retained synthetic cache")
+        (self.directory / ".lock").touch(mode=0o600)
+        before = snapshot(self.directory)
+        self.assertEqual(self.body, self.remind())
+        self.assertEqual(before, snapshot(self.directory))
