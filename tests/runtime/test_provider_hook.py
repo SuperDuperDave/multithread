@@ -386,11 +386,11 @@ RelayStore.brief = checked_brief
                     "--summary", "Generic pending " + "\U0001f3cb" * 280)
             own = self.fixture.success(
                 "signal", "work.handoff", "--agent", "sender", "--session", "author",
-                "--commit", "HEAD", "--target", client + ":owner", "--work-id", "own-" + client,
+                "--commit", "HEAD", "--target", client, "--target-session", "owner", "--work-id", "own-" + client,
                 "--summary", "Exact session pending " + client)["event"]
             foreign = self.fixture.success(
                 "signal", "work.handoff", "--agent", "sender", "--session", "author",
-                "--commit", "HEAD", "--target", client + ":other", "--work-id", "other-" + client,
+                "--commit", "HEAD", "--target", client, "--target-session", "other", "--work-id", "other-" + client,
                 "--summary", "OTHER_SESSION_MUST_NOT_APPEAR")["event"]
             before_rows, before_state = self.rows(), snapshot(self.fixture.base)
             result = self.hook(client, "PostToolUse", "owner", payload={
@@ -428,7 +428,7 @@ RelayStore.brief = checked_brief
         self.fixture.initialize()
         self.fixture.success(
             "signal", "work.handoff", "--agent", "sender", "--session", "author",
-            "--commit", "HEAD", "--target", "codex:other", "--work-id", "other-session",
+            "--commit", "HEAD", "--target", "codex", "--target-session", "other", "--work-id", "other-session",
             "--summary", "Not for this session")
         before_rows, before_state = self.rows(), snapshot(self.fixture.base)
         for client in ("codex", "claude"):
@@ -443,7 +443,7 @@ RelayStore.brief = checked_brief
         self.fixture.initialize()
         event = self.fixture.success(
             "signal", "work.handoff", "--agent", "sender", "--session", "author",
-            "--commit", "HEAD", "--target", "claude:reader", "--work-id", "explicit-review",
+            "--commit", "HEAD", "--target", "claude", "--target-session", "reader", "--work-id", "explicit-review",
             "--summary", "Await the exact reader")["event"]
         first = self.hook("claude", "PostToolUse", "reader")
         self.assertIn("MULTITHREAD PENDING v1", first.stdout)
@@ -627,6 +627,19 @@ class PendingReminderCacheTests(unittest.TestCase):
             cache.write_text(malformed)
             self.assertEqual(self.body, self.remind(now=101))
             self.assertIsInstance(json.loads(cache.read_text()), dict)
+
+    def test_checkout_free_hooks_and_admitted_enrollments_have_distinct_cache_keys(self):
+        from unittest import mock
+        self.args.repo = None
+        with mock.patch.object(runtimecli.os, "getcwd", return_value="/synthetic/first"):
+            self.assertEqual(self.body, self.remind())
+        with mock.patch.object(runtimecli.os, "getcwd", return_value="/synthetic/second"):
+            self.assertEqual(self.body, self.remind(now=101))
+        for identity in ("enrollment-one", "enrollment-two"):
+            self.assertEqual(self.body, runtimecli._reminder_output(self.body, self.args,
+                             cache_root=self.root, now=101, repository_identity=identity))
+        self.assertEqual("{}", runtimecli._reminder_output(self.body, self.args,
+                         cache_root=self.root, now=102, repository_identity="enrollment-two"))
 
     def test_unsafe_or_contended_cache_repeats_notice_without_following_links(self):
         self.assertEqual(self.body, self.remind())

@@ -22,6 +22,7 @@ from .protocol import (
     RATCHET_OUTCOMES,
     RelayError,
     ValidationError,
+    session_target,
     WAKE_CONCLUSIONS,
     WAKE_PROVIDERS,
     WAKE_REQUESTS,
@@ -72,6 +73,7 @@ def build_parser() -> argparse.ArgumentParser:
     signal.add_argument("--summary", required=True)
     signal.add_argument("--work-id")
     signal.add_argument("--target")
+    signal.add_argument("--target-session", help="exact recipient session; requires --target agent")
     signal.add_argument("--scope")
     signal.add_argument("--artifact", help="required for work.handoff/review.requested unless --commit is used; "
                         "git:<full-oid>, sha256:<64-hex-digest> or receipt:<stable-id>")
@@ -380,6 +382,11 @@ def _dispatch(store: RelayStore, args: argparse.Namespace) -> Any:
         return store.emit(_read_json_object(sys.stdin.buffer))
     if args.command == "signal":
         agent, session = _actor(args)
+        target = args.target
+        if args.target_session is not None:
+            if target is None:
+                raise ValidationError("--target-session requires --target agent")
+            target = session_target(target, args.target_session)
         event_id = None
         if args.kind == "work.intent":
             if args.work_id is None:
@@ -416,7 +423,7 @@ def _dispatch(store: RelayStore, args: argparse.Namespace) -> Any:
                 session=session,
                 artifact=artifact,
                 work_id=args.work_id,
-                target=args.target,
+                target=target,
                 scope=args.scope,
             )
         return store.emit(
@@ -428,7 +435,7 @@ def _dispatch(store: RelayStore, args: argparse.Namespace) -> Any:
                     "agent": agent,
                     "session": session,
                     "work_id": args.work_id,
-                    "target": args.target,
+                    "target": target,
                     "scope": args.scope,
                     "summary": args.summary,
                     "artifact": artifact,

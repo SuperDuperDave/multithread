@@ -176,8 +176,11 @@ Use both `--agent` and `--session` for ledger mutations unless their exact
 values are already supplied by `RELAY_AGENT` and `RELAY_SESSION`. These identify
 the caller, not the peer's native resume session or a role name. Replace the
 example identity with your own; do not invent or borrow another session's ID.
-To address one reviewer session, use `--target claude:EXACT_REVIEWER_SESSION`;
+To address one reviewer session, use `--target claude --target-session EXACT_REVIEWER_SESSION`;
 `--target claude` addresses Claude generally. See [the session inbox](#inspect-pending-work-and-role-handovers).
+Exact recipients are stored as a compact JSON pair, such as `["claude","reviewer-session"]`.
+For direct event emission use a string containing that pair as `target`; bare labels containing
+colons retain their existing generic-agent meaning.
 The [first read-only collaboration](#first-collaboration) needs no handoff.
 
 Use the installed launcher's actual path, normally:
@@ -535,12 +538,13 @@ History preserves each attempt's original generation and recipient, transport
 outcome and consumption evidence. `wake --status` is read-only: it neither
 rereads the task file (which may have vanished), probes the recipient nor sends
 again. `QUEUED`, `STEERED` and `DELIVERED TO INBOX` record transport acceptance.
-File-pointer consumption remains `unknown`; a ledger-sequence wake can show
+File-pointer and non-delivery-event consumption remain `unknown`; a wake naming
+an acknowledgeable ledger signal can show
 `not_acknowledged`, `acknowledged` by its original recipient, or
 `acknowledged_elsewhere`. A later turn alone does not establish consumption.
 
 The binding owner or its Codex recipient can pause, resume or unbind its own
-role; a same-owner Claude resume can refresh its inbox. A different holder or
+role; a same-owner Claude binding can refresh its inbox. A different holder or
 recipient needs the holder's release, or actual user authorization for the
 handover. For that authorized replacement, add `--replace
 --expected-generation N --reason 'why this handover is authorized'

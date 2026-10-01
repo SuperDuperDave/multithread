@@ -28,6 +28,10 @@ The commands below use the current published `multithread` entry point. See
 [compatibility](docs/SETUP.md#compatibility) for older releases and the retained
 `relay` command from the former Agent Relay name.
 
+Main includes unreleased session inbox, role-handover and wake-status additions.
+Their documentation targets the next runtime release; installed v0.4.18 does
+not yet include them. Merging source changes does not update an installation.
+
 [MIT licensed](LICENSE), copyright (c) 2026 David Jones. Created by David Jones
 with AI assistance: Codex contributed implementation, testing and release work;
 Claude contributed native review.

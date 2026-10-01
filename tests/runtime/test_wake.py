@@ -29,6 +29,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
 from relay_core import cli as core_cli
 from relay_core.store import RelayStore
+from relay_core.protocol import session_target
 from relay_runtime import cli as runtime_cli, hooks, wake
 
 THREAD = "a0000000-0000-7000-8000-000000000001"
@@ -383,7 +384,7 @@ class WakeOutcomeTests(WakeCase):
         generation = self.bound()
         with self.store() as store:
             signal = store.emit({"kind": "work.handoff", "agent": "claude", "session": "sender",
-                                 "target": f"codex:{THREAD}", "summary": "synthetic scoped handoff",
+                                 "target": session_target("codex", THREAD), "summary": "synthetic scoped handoff",
                                  "artifact": "receipt:fixture-handoff"})
         ref = str(signal["event"]["seq"])
         sent = self.wake(ref=ref)

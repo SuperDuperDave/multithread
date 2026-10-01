@@ -39,6 +39,7 @@ _LABELS = {"SessionStart": "session_start", "UserPromptSubmit": "user_prompt_sub
 _LISTED = {"SessionStart": "sessionStart", "UserPromptSubmit": "userPromptSubmit",
            "PostToolUse": "postToolUse", "Stop": "stop", "SessionEnd": "sessionEnd", "Interrupt": "interrupt"}
 _TIMEOUT = 3
+_OPTIONAL_EVENTS = frozenset({"PostToolUse"})
 _MAX_FILE = 1024 * 1024
 _MAX_SESSIONS = 64
 WINDOW_HOURS = 24
@@ -144,6 +145,15 @@ def _read(path):
     if not isinstance(value, dict) or not isinstance(value.get("hooks", {}), dict):
         raise HooksError(f"{path} does not hold a JSON object whose hooks value is an object; inspect it "
                          "before changing hooks.")
+    for event in _OPTIONAL_EVENTS:
+        if event not in value.get("hooks", {}):
+            continue
+        groups = value["hooks"][event]
+        if not isinstance(groups, list) or any(
+                not isinstance(group, dict) or not isinstance(group.get("hooks"), list)
+                or any(not isinstance(item, dict) for item in group["hooks"])
+                for group in groups):
+            raise HooksError(f"{path} has malformed {event} hooks; inspect that event in the provider's settings. Nothing was changed.")
     return body, value
 
 
@@ -183,7 +193,9 @@ def _classify(client, value):
     states = {entry["state"] for entry in events.values()}
     if unexpected or states & {"duplicate", "mismatched"}:
         overall = "needs_repair"
-    elif states == {"installed"}:
+    elif all(entry["state"] == "installed" or
+             (event in _OPTIONAL_EVENTS and entry["state"] == "missing")
+             for event, entry in events.items()):
         overall = "installed"
     elif states == {"missing"}:
         overall = "absent"
@@ -222,6 +234,8 @@ def delivery(client, environ=None):
     state = inspect(client, environ)
     if state["state"] == "installed":
         return {"source": "user", "file": state["file"], "command": state["command"],
+                "optional_events_missing": [event for event in _OPTIONAL_EVENTS
+                                            if state["events"][event]["state"] == "missing"],
                 **({"effective": state["effective"], "note": _disabled_note(state)} if "effective" in state else {})}
     if state["state"] in ("absent", "provider_not_found"):
         return {"source": "session_flags", "file": None, "command": None}
@@ -505,6 +519,8 @@ def trust_estimate(environ=None):
         return "not_installed"
     state = _config_state(provider_home("codex", environ) / "config.toml")
     for event, entry in installed["events"].items():
+        if event in _OPTIONAL_EVENTS and entry["state"] == "missing":
+            continue
         g, h = entry["slots"][0]
         record = state.get(f"{installed['file']}:{_LABELS[event]}:{g}:{h}")
         if not isinstance(record, dict) or record.get("enabled") is False or record.get("trusted_hash") != codex_hash(event):
@@ -559,6 +575,12 @@ def _review(listing, cwd, installed):
     launcher = str(account_launcher())
     reviewed, problems = [], []
     for event, entry in installed["events"].items():
+        if event in _OPTIONAL_EVENTS and entry["state"] == "missing":
+            if any(hook.get("eventName") == _LISTED[event] and (
+                    codex_peer._multithread_hook(hook.get("command"), launcher)
+                    or hook.get("source") == "sessionFlags") for hook in listed):
+                problems.append(event + ": Codex lists a Multithread hook absent from the installed file")
+            continue
         g, h = entry["slots"][0]
         suffix = f":{_LABELS[event]}:{g}:{h}"
         mine = [hook for hook in listed if hook.get("eventName") == _LISTED[event]

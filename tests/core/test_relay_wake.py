@@ -27,6 +27,7 @@ from relay_core.protocol import (  # noqa: E402
     WAKE_ATTEMPT_KINDS,
     WAKE_BINDING_KINDS,
     normalize_event,
+    session_target,
 )
 from relay_core.store import RelayStore  # noqa: E402
 
@@ -234,7 +235,7 @@ class WakeBindingTests(WakeLedgerCase):
         moved = self.store.wake_bind("operator", **options, expected_generation=first["generation"],
                                     reason="Approved synthetic transfer", approval_ref="receipt:approval")
         notices = [event for event in self.store.events() if event["kind"] == "work.handoff"]
-        self.assertEqual({f"codex:{THREAD}", f"codex:{OTHER}"}, {event["target"] for event in notices})
+        self.assertEqual({session_target("codex", THREAD), session_target("codex", OTHER)}, {event["target"] for event in notices})
         self.assertEqual({f"receipt:binding:{moved['binding']['generation']}"},
                          {event["artifact"] for event in notices})
 
@@ -248,6 +249,21 @@ class WakeBindingTests(WakeLedgerCase):
         self.assertEqual(("paused", "Review coordination", "local"),
                          (updated["state"], updated["charter"], updated["role_scope"]))
         self.assertFalse(any(e["kind"] == "work.handoff" for e in self.store.events()))
+
+    def test_colon_colliding_owner_labels_cannot_refresh_or_control_another_tuple(self):
+        self.store.wake_bind("reviewer", provider="claude", endpoint="unix:///srv/first.sock",
+                             replace=False, agent="claude", session="one:two")
+        before = self.store.events()
+        with self.assertRaises(ConflictError):
+            self.store.wake_bind("reviewer", provider="claude", endpoint="unix:///srv/other.sock",
+                                 replace=True, agent="claude:one", session="two")
+        for action in ("pause", "resume", "unbind"):
+            with self.subTest(action=action), self.assertRaises(ConflictError):
+                self.store.wake_control(action, "reviewer", agent="claude:one", session="two")
+        self.assertEqual(before, self.store.events())
+        refreshed = self.store.wake_bind("reviewer", provider="claude", endpoint="unix:///srv/new.sock",
+                                         replace=True, agent="claude", session="one:two")["binding"]
+        self.assertEqual(("claude", "one:two"), (refreshed["bound_agent"], refreshed["bound_session"]))
 
     def test_foreign_control_and_stale_cas_are_write_free(self):
         first = self.bind()["binding"]
@@ -272,7 +288,7 @@ class WakeBindingTests(WakeLedgerCase):
         for session in (old, new):
             notices = self.store.inbox(agent, session=session)["pending_signals"]
             self.assertEqual(1, len(notices))
-            self.assertEqual(f"{agent}:{session}", notices[0]["target"])
+        self.assertEqual(session_target(agent, session), notices[0]["target"])
 
     def test_a_change_to_a_stale_generation_fails_closed(self):
         generation = self.bind()["binding"]["generation"]
@@ -299,7 +315,7 @@ class WakeAttemptTests(WakeLedgerCase):
     def test_history_keeps_original_recipient_and_requires_its_ack_for_consumption(self):
         generation = self.bind()["binding"]["generation"]
         signal = self.store.emit({"kind": "work.handoff", "agent": "claude", "session": "sender",
-                                  "target": f"codex:{THREAD}", "artifact": "receipt:synthetic-work",
+                                  "target": session_target("codex", THREAD), "artifact": "receipt:synthetic-work",
                                   "summary": "Read and review this synthetic contribution"})["event"]["seq"]
         attempt = self.begin(str(signal))["attempt_seq"]
         self.conclude(attempt)
@@ -327,6 +343,14 @@ class WakeAttemptTests(WakeLedgerCase):
         self.assertEqual([seqs[0]], [item["seq"] for item in rest["attempts"]])
         self.assertFalse(rest["has_more"])
         self.assertEqual("unknown", rest["attempts"][0]["consumption_state"])
+
+    def test_non_delivery_sequence_has_unknown_consumption(self):
+        generation = self.bind()["binding"]["generation"]
+        attempt = self.begin(ref=str(generation))
+        self.conclude(attempt["attempt_seq"])
+        observed = self.store.wake_history("operator", ref=str(generation))["attempts"][0]
+        self.assertEqual("unknown", observed["consumption_state"])
+        self.assertNotIn("acknowledgement_seq", observed)
 
     def test_default_message_id_names_the_role_generation_and_reference(self):
         generation = self.bind()["binding"]["generation"]

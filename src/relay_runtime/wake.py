@@ -856,7 +856,7 @@ def bind(args, ledger=launcher_ledger):
     target = _target(wanted)
     base = {"role": role, **wanted, "ledger": shown["ledger"]}
     if current["state"] != "unbound":
-        same_holder = current["bound_by"] == f"{agent}:{session}" or (
+        same_holder = (current.get("bound_agent"), current.get("bound_session")) == (agent, session) or (
             current["provider"] == "codex" and agent == "codex" and session == current["thread"])
         same_recipient = current["provider"] == provider and (provider == "claude" or current["thread"] == thread)
         unchanged = current["provider"] == provider and current["thread"] == thread and current["endpoint"] == endpoint

@@ -93,11 +93,13 @@ def hook_readiness(result, repo, expected_hook, user_file=None):
             events[name] = hook["trustStatus"]
         else:
             events[name] = "unrecognized"
-    unready = [name for name in _HOOK_EVENTS if events[name] != "trusted"]
+    unready = [name for name in _HOOK_EVENTS if events[name] != "trusted"
+               and not (user_file is not None and name == "postToolUse" and events[name] == "missing")]
     state = ("ready" if not unready else "needs_review"
              if all(events[name] in _REVIEWABLE for name in unready) else "needs_configuration")
     return {"state": state, "events": events, "unready_events": sorted(unready),
-            "ready_events": sorted(set(events) - set(unready))}
+            "ready_events": sorted(name for name in events if events[name] == "trusted"),
+            "optional_events_missing": ["postToolUse"] if events["postToolUse"] == "missing" else []}
 
 
 def _same_path(listed, expected):
@@ -124,7 +126,7 @@ def hook_remedy(readiness, repo, expected_hook, user_file=None):
         # User-level hooks: the person chose how trust is recorded at setup.
         if readiness["state"] == "needs_review":
             action = ("Codex skips these user-level hooks until they are trusted. Either the person opens /hooks in "
-                      "a Codex terminal and trusts the six Multithread hooks from " + str(user_file) + " running "
+                      "a Codex terminal and trusts the installed Multithread hooks from " + str(user_file) + " running "
                       + expected_hook + ", or, if the person chose agent-assisted trust, an agent runs "
                       + shlex.join([launcher, "hooks", "trust"]) + " and shows them its plan before recording it.")
         else:

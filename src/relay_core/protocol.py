@@ -355,6 +355,11 @@ def canonical_agent(value: Any) -> str:
     return _identifier("agent", value)
 
 
+def session_target(agent: Any, session: Any) -> str:
+    """An exact recipient outside the legacy agent-identifier namespace."""
+    return json.dumps([canonical_agent(agent), canonical_agent(session)], separators=(",", ":"))
+
+
 def canonical_work_id(value: Any) -> str:
     """Return one exact canonical work identifier for decision routing."""
 
@@ -567,7 +572,15 @@ def normalize_event(raw: Mapping[str, Any], *, internal: bool = False) -> Event:
         raise ValidationError("work.intent requires a stable work_id")
     # An exact recipient contains two individually bounded 200-character
     # identifiers and one separator. Keep that pair representable.
-    target = _optional_line("target", raw.get("target"), 401)
+    target = _optional_line("target", raw.get("target"), 407)
+    if target is not None and target.startswith("["):
+        try:
+            pair = json.loads(target)
+        except ValueError as exc:
+            raise ValidationError("exact target must be a JSON string containing an agent/session pair") from exc
+        if not isinstance(pair, list) or len(pair) != 2:
+            raise ValidationError("exact target must contain exactly an agent and session")
+        target = session_target(*pair)
     scope = _optional_line("scope", raw.get("scope"), 240)
     artifact = _optional_line("artifact", raw.get("artifact"), 200)
     if artifact is not None and not _ARTIFACT_RE.fullmatch(artifact):

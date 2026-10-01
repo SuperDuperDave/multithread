@@ -384,7 +384,7 @@ def _worker(access, args, argv):
     return core_cli.main(argv)
 
 
-def _reminder_output(body, args, *, cache_root="/tmp", now=None):
+def _reminder_output(body, args, *, cache_root="/tmp", now=None, repository_identity=None):
     """Suppress identical reminders briefly; ephemeral cache never represents delivery."""
     try:
         value = json.loads(body)
@@ -422,7 +422,8 @@ def _reminder_output(body, args, *, cache_root="/tmp", now=None):
                         if len(entries) >= 128:
                             return body
                         entries.append(entry.name)
-                identity = json.dumps([args.repo, args.client, args.provider_payload["session_id"]])
+                repository = repository_identity or os.path.realpath(args.repo or os.getcwd())
+                identity = json.dumps([repository, args.client, args.provider_payload["session_id"]])
                 key = hashlib.sha256(identity.encode()).hexdigest() + ".json"
                 # Bound cache growth without pruning ledger/evidence or following links.
                 if key not in entries and len(entries) >= 127:
@@ -524,7 +525,7 @@ def _run_worker(access, args, argv):
         for destination, body in receipts:
             if destination is sys.stdout and args.command == "provider-hook" \
                     and args.provider_payload["hook_event_name"] == "PostToolUse":
-                body = _reminder_output(body, args)
+                body = _reminder_output(body, args, repository_identity=access.enrollment.enrollment_id)
             destination.write(body)
         if args.command in {"hook", "provider-hook"}:
             return 0

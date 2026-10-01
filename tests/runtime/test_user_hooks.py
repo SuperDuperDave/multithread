@@ -393,6 +393,28 @@ class FileTests(HomeCase):
 
 
 class DeliveryTests(HomeCase):
+    def test_legacy_registration_remains_usable_and_optional_install_is_separate(self):
+        for client in ("codex", "claude"):
+            value = {"hooks": {event: [{"hooks": [hooks.handler(client)]}]
+                               for event in hooks.EVENTS[client] if event != "PostToolUse"}}
+            self.write(client, value)
+            state = hooks.inspect(client)
+            self.assertEqual("installed", state["state"])
+            self.assertEqual("missing", state["events"]["PostToolUse"]["state"])
+            delivery = hooks.delivery(client)
+            self.assertEqual(("user", ["PostToolUse"]),
+                             (delivery["source"], delivery["optional_events_missing"]))
+            plan = hooks.change_files("install", (client,))
+            self.assertTrue(plan["changes_provider_settings"])
+            for malformed in ({}, [None], [{"hooks": None}], [{"hooks": [None]}]):
+                self.write(client, {"hooks": {**value["hooks"], "PostToolUse": malformed}})
+                with self.assertRaises(hooks.HooksError):
+                    hooks.delivery(client)
+            self.write(client, {"hooks": {**value["hooks"], "PostToolUse": [
+                {"hooks": [{**hooks.handler(client), "timeout": 9}]}]}})
+            with self.assertRaises(hooks.HooksError):
+                hooks.delivery(client)
+
     """Launch and peer pass invocation hooks only when no user-level copy exists."""
 
     def prepare(self, client):
@@ -533,6 +555,31 @@ for line in sys.stdin:
 
 
 class TrustTests(HomeCase):
+    def test_legacy_optional_absence_has_no_trust_slot_and_keeps_required_checks(self):
+        value = json.loads(self.file("codex").read_text())
+        del value["hooks"]["PostToolUse"]
+        self.write("codex", value)
+        installed = hooks.inspect("codex")
+        listing = {"data": [{"cwd": str(self.base), "hooks": [
+            item for item in self.ours(**{event: {"status": "trusted"} for event in hooks.EVENTS["codex"]})
+            if item["eventName"] != "postToolUse"]}]}
+        reviewed, problems, _ = hooks._review(listing, str(self.base), installed)
+        self.assertEqual([], problems)
+        self.assertEqual(5, len(reviewed))
+        readiness = codex_peer.hook_readiness(listing, str(self.base), installed["command"], installed["file"])
+        self.assertEqual("ready", readiness["state"])
+        self.assertEqual(5, len(readiness["ready_events"]))
+        self.assertEqual(["postToolUse"], readiness["optional_events_missing"])
+        optional = self.ours()[-1].copy()
+        optional.update(eventName="postToolUse", timeoutSec=9)
+        broken = {"data": [{"cwd": str(self.base), "hooks": listing["data"][0]["hooks"] + [optional]}]}
+        self.assertEqual("needs_configuration", codex_peer.hook_readiness(
+            broken, str(self.base), installed["command"], installed["file"])["state"])
+        records = {self.keys[event]: {"trusted_hash": hooks.codex_hash(event)}
+                   for event in hooks.EVENTS["codex"] if event != "PostToolUse"}
+        with mock.patch.object(hooks, "_config_state", return_value=records):
+            self.assertEqual("trusted", hooks.trust_estimate())
+
     def setUp(self):
         super().setUp()
         self.write("codex", FOREIGN)

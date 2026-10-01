@@ -187,7 +187,7 @@ Select reviewed provider paths explicitly when necessary:
 |---|---|---|
 | Runtime verified | Healthy installed status and exact release/activation identity | Any installation refusal needs its specific inspection or recovery action. |
 | Repository verified | Enrollment, exact Git identity, healthy integrity check and matching ledger status | Preserve state on refusal or unavailable observation; do not delete or forge enrollment markers. |
-| Provider prepared | Executable path, where its hooks come from (`hook_source`: `user` for the installed user-level hooks, `session_flags` when only launch and peer pass them) and a matching plan; for Codex, all Multithread hooks listed as trusted for this checkout | Provider version, sign-in and tool capability are not checked. `needs_hook_review` names each event Codex lists as untrusted, modified or disabled; `needs_hook_configuration` names hooks that are missing, duplicated or not as installed. A missing provider can be installed or located through its normal interface. |
+| Provider prepared | Executable path, where its hooks come from (`hook_source`: `user` for the installed user-level hooks, `session_flags` when only launch and peer pass them) and a matching plan; for Codex, required lifecycle hooks and any registered PostToolUse hook listed as trusted for this checkout | Provider version, sign-in and tool capability are not checked. `needs_hook_review` names each event Codex lists as untrusted, modified or disabled; `needs_hook_configuration` names hooks that are missing, duplicated or not as installed. A missing provider can be installed or located through its normal interface. |
 | Coverage | `hook_coverage`: recent Codex and Claude sessions in this repository that left no ledger events, with the cause and fix | See [when a session cannot reach its ledger](#when-a-session-cannot-reach-its-ledger). |
 | Hook/context delivery | Not checked by setup | Observe the Multithread context in an authorized native session. A generated plan or zero hook exit does not prove delivery. |
 | Provider tools | Not checked by setup | Observe an authorized native tool action. Tool execution alone does not establish a completed collaboration workflow. |
@@ -304,7 +304,11 @@ The `PostToolUse` event adds a bounded, nonblocking pending-work reminder using
 the same installed hook command and a read-only ledger observation. A runtime
 update does not edit existing user hook settings or trust this new Codex event.
 If you choose to add it, review the exact
-hook plan and complete your normal Codex trust step. It never acknowledges work
+hook plan and complete your normal Codex trust step. Existing complete lifecycle
+registrations remain usable without `PostToolUse`; hook status shows that event
+as missing, and no invocation copy is added beside user hooks. If the optional
+event is registered, its definition and Codex trust must still pass the normal
+checks. It never acknowledges work
 automatically; use [the session inbox and role views](PEER.md#inspect-pending-work-and-role-handovers)
 for the reminder's ten-second suppression rules and to inspect and consume
 pending work explicitly. Native reminder delivery remains unverified until

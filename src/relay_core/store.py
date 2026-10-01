@@ -32,6 +32,7 @@ from .protocol import (
     WAKE_CONCLUSIONS,
     WAKE_REQUESTS,
     canonical_agent,
+    session_target,
     canonical_decision_id,
     canonical_decision_option,
     canonical_resource,
@@ -779,7 +780,7 @@ class RelayStore:
     ) -> dict[str, Any]:
         """Bounded pending delivery. Exact-session work leads a brief; pages use seq order."""
         agent = canonical_agent(agent)
-        exact = f"{agent}:{canonical_agent(session)}" if session is not None else None
+        exact = session_target(agent, session) if session is not None else None
         limit = _inbox_limit(limit)
         if after is not None and (not isinstance(after, int) or isinstance(after, bool) or after < 0):
             raise ValidationError("inbox --after must be a nonnegative sequence")
@@ -1178,7 +1179,7 @@ class RelayStore:
         agent = canonical_agent(agent)
         acknowledgement_scope = f"signal:{signal_seq}"
 
-        exact = f"{agent}:{canonical_agent(session)}"
+        exact = session_target(agent, session)
         if signal["target"] not in {None, agent, exact}:
             raise ConflictError(
                 f"signal {signal_seq} is targeted to {signal['target']}, not {exact}"
@@ -1285,7 +1286,7 @@ class RelayStore:
                         f"{role} is already bound {where} (binding "
                         f"{current['generation']}); pass --replace to move it"
                     )
-                same_owner = f"{agent}:{session}" == current["bound_by"] or (
+                same_owner = (canonical_agent(agent), canonical_agent(session)) == (current["bound_agent"], current["bound_session"]) or (
                     current["provider"] == "codex" and agent == "codex" and session == current["thread"]
                 )
                 same_recipient = provider == current["provider"] and (
@@ -1343,8 +1344,10 @@ class RelayStore:
                 }, internal=True))
             if current is not None and not (same_owner and same_recipient):
                 for recipient, detail in (
-                    (meta["previous_holder"], "Your role binding was explicitly handed over"),
-                    (f"codex:{thread}" if provider == "codex" else f"{agent}:{session}",
+                    (session_target("codex", current["thread"]) if current["provider"] == "codex"
+                     else session_target(current["bound_agent"], current["bound_session"]),
+                     "Your role binding was explicitly handed over"),
+                    (session_target("codex", thread) if provider == "codex" else session_target(agent, session),
                      "Review outstanding work from the previous binding before accepting a handover"),
                 ):
                     notice = normalize_event({
@@ -1384,7 +1387,7 @@ class RelayStore:
                 )
             if expected_generation is not None and expected_generation != current["generation"]:
                 raise ConflictError("role binding changed; inspect the current generation")
-            owner = f"{agent}:{session}" == current["bound_by"] or (
+            owner = (canonical_agent(agent), canonical_agent(session)) == (current["bound_agent"], current["bound_session"]) or (
                 current["provider"] == "codex" and agent == "codex" and session == current["thread"]
             )
             if not owner and (expected_generation is None or not reason or not approval_ref):
@@ -1656,6 +1659,8 @@ class RelayStore:
                     "cwd": meta.get("cwd"),
                     "bound_at": row["recorded_at"],
                     "bound_by": f"{row['agent']}:{row['session']}",
+                    "bound_agent": row["agent"],
+                    "bound_session": row["session"],
                     "charter": meta.get("charter"),
                     "role_scope": meta.get("role_scope"),
                     "paused_seq": None,
@@ -1737,19 +1742,21 @@ class RelayStore:
             raise StateError("wake attempt has no original binding")
         self._assert_canonical_event_row(bound)
         holder = json.loads(bound["meta_json"])
-        recipient = f"codex:{holder['thread']}" if holder["provider"] == "codex" else f"{bound['agent']}:{bound['session']}"
+        recipient_agent, recipient_session = ("codex", holder["thread"]) if holder["provider"] == "codex" else (bound["agent"], bound["session"])
+        recipient = f"{recipient_agent}:{recipient_session}"
         attempt.update(recipient=recipient, consumption_state="unknown")
-        if meta["ref"].isdigit():
+        signal = self._execute("SELECT kind FROM events WHERE seq = ?", (int(meta["ref"]),)).fetchone() if meta["ref"].isdigit() else None
+        if signal is not None and signal["kind"] in DELIVERY_SIGNAL_KINDS:
             acknowledgement = self._execute(
                 "SELECT * FROM events WHERE kind = 'delivery.acknowledged' AND scope = ? "
-                "ORDER BY CASE WHEN agent || ':' || session = ? THEN 0 ELSE 1 END, seq LIMIT 1",
-                (f"signal:{meta['ref']}", recipient)
+                "ORDER BY CASE WHEN agent = ? AND session = ? THEN 0 ELSE 1 END, seq LIMIT 1",
+                (f"signal:{meta['ref']}", recipient_agent, recipient_session)
             ).fetchone()
             attempt["consumption_state"] = "not_acknowledged"
             if acknowledgement is not None:
                 self._assert_canonical_event_row(acknowledgement)
                 consumed_by = f"{acknowledgement['agent']}:{acknowledgement['session']}"
-                attempt.update(consumption_state="acknowledged" if consumed_by == recipient else "acknowledged_elsewhere",
+                attempt.update(consumption_state="acknowledged" if (acknowledgement['agent'], acknowledgement['session']) == (recipient_agent, recipient_session) else "acknowledged_elsewhere",
                                acknowledgement_seq=int(acknowledgement["seq"]), consumed_by=consumed_by)
         conclusion = self._execute(
             "SELECT * FROM events WHERE event_id = ?",

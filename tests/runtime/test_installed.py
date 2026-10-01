@@ -22,6 +22,9 @@ class InstalledTests(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory(prefix="relay-installed-test-")
         self.addCleanup(temporary.cleanup)
         self.base = Path(temporary.name)
+        reminder_cache = tempfile.TemporaryDirectory(prefix="relay-installed-reminders-")
+        self.addCleanup(reminder_cache.cleanup)
+        self.reminder_cache = Path(reminder_cache.name)
         self.repo = self.base / "project"
         self.repo.mkdir()
         subprocess.run(["/usr/bin/git", "init", "-q", str(self.repo)], check=True)
@@ -50,6 +53,8 @@ runtime.install_importer()
 from relay_runtime import cli
 from relay_runtime.enrollment import Registry
 registry = Registry(pathlib.Path({str(self.registry)!r}))
+original_reminder = cli._reminder_output
+cli._reminder_output = lambda body, args, **kwargs: original_reminder(body, args, cache_root={str(self.reminder_cache)!r}, **kwargs)
 """
         script += textwrap.dedent(before)
         script += f"\nraise SystemExit(cli.main({argv!r}, registry=registry))\n"
