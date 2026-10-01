@@ -19,13 +19,16 @@ installation, enrollment, readiness, or native trust review, follow the current
 Codex lists the Multithread hooks as trusted, not provider authentication, hook
 delivery, tool capability, or a completed collaboration.
 
-Launch and hook trust are the person's steps. Never run `multithread launch`,
-and never review, grant or edit native hook trust or provider hook
-configuration, including Codex's `/hooks` review and its `config.toml`. Leave
-`--multithread` and `--relay` unset: Codex trusts one exact hook command, the
-account launcher setup prints. When a peer call or setup check says hooks are
-not ready, stop and report its refusal and the remedy it prints to the person;
-do not relaunch, retry or work around it.
+Launch is the person's step. Never run `multithread launch`. Change provider
+hook settings or Codex hook trust only through `multithread hooks install`,
+`trust` or `remove`, only when the person chose that route, and show them the
+`--json` plan before applying it with `--yes --expected-plan`. Never edit hook
+files or Codex's `config.toml` directly, and never run Codex's `/hooks` review
+for them. Leave `--multithread` unset: Codex trusts one exact hook command, the
+account launcher setup prints. When a peer call or setup check says
+hooks are not ready, stop and report its refusal and the remedy it prints to the
+person; do not relaunch, retry or work around it. If your context begins with a
+`MULTITHREAD WARNING`, tell the person and give them the fix it names.
 
 Choose the interaction that fits the task:
 
@@ -34,13 +37,23 @@ Choose the interaction that fits the task:
   Give the peer the goal, relevant evidence or revision, scope, acceptance
   criteria, and the contribution sought. Challenge an assumption or inspect a
   concrete question; avoid sending whole project histories by default. A peer
-  dry run inspects the invocation; `peer ... --json` executes it.
+  dry run inspects the invocation without checking readiness (`setup --check`
+  does); `peer ... --json` executes it.
 - For durable coordination between separate sessions and worktrees, use the
   installed `status`, `brief`, and command help with the
   [provider walkthrough](https://github.com/SuperDuperDave/multithread/blob/main/docs/PROVIDERS.md).
   Hooks provide this session's coordination identity and bounded pending state.
   Respect exact claim ownership, immutable commit handoffs, explicit ACKs,
   documented manual wakes, and the operator's Git responsibilities.
+- To point an already-open Codex conversation or Claude Code session at new
+  work, bind it to a role once and send it a pointer with `multithread wake`, as
+  the [peer guide](https://github.com/SuperDuperDave/multithread/blob/main/docs/PEER.md#wake-an-existing-conversation)
+  describes. A wake names a task file or ledger sequence, never its content, and
+  its result says whether it was sent and what to do next. Inside Codex's
+  sandbox the installed launcher refuses by design ("unsafe launcher ancestry"),
+  and the sandbox may also block a Claude Code inbox socket: run `multithread
+  wake` through Codex's approved escalation outside the sandbox, and never work
+  around the launcher check.
 - If the user has a configured Muse agent, identify it by nickname and use the
   optional [Muse agent skill](../muse-agent/SKILL.md). Its bridge has an
   asynchronous custody and reply lifecycle; it is separate from native

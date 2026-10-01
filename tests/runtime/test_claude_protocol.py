@@ -305,6 +305,30 @@ class ClaudeProtocolTests(unittest.TestCase):
         driver.initialization(init(model=None, cwd=str(self.repo)))
         self.assertEqual("prior_init_only", envelope["model_observation"]["relation"])
         self.assertEqual("opus", envelope["model_observation"]["reported_model"])
+        # A later init without a model says nothing new; a usage report stays the latest.
+        by_usage = {"source": "claude_model_usage", "reported_model": "claude-opus-5-5",
+                    "relation": "different_name_unverified"}
+        envelope["model_usage"] = {"claude-opus-5-5": {"outputTokens": 1}}
+        claude_peer.observe_usage_model(envelope)
+        self.assertEqual(by_usage, envelope["model_observation"])
+        driver.initialization(init(model=None, cwd=str(self.repo)))
+        self.assertEqual(by_usage, envelope["model_observation"])
+
+    def test_usage_naming_one_model_is_the_latest_model_report(self):
+        usage = {"outputTokens": 4}
+        by_init = {"source": "claude_system_init", "reported_model": "fixture-effective-model",
+                   "relation": "not_requested"}
+        by_usage = {"source": "claude_model_usage", "reported_model": "fixture-usage-model",
+                    "relation": "not_requested"}
+        # Several names do not say which model answered, so the init's report stands.
+        for models, observation in (({"fixture-usage-model": usage}, by_usage),
+                                    ({"fixture-usage-model": usage, "fixture-helper-model": usage}, by_init),
+                                    ({}, by_init)):
+            with self.subTest(models=list(models)):
+                envelope, _, _ = self.run_native([{"read": 1}, {"emit": init()},
+                                                  {"emit": result(modelUsage=models)}])
+                self.assertEqual("returned", envelope["state"])
+                self.assertEqual(observation, envelope["model_observation"])
 
     def test_subagent_frame_advances_content_free_progress_without_attributing_answer(self):
         envelope, _, _ = self.run_native([

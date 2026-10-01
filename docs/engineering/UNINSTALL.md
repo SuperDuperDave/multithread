@@ -9,6 +9,9 @@ actually unlinks the verified code files and removes their empty directories.
 
 Stop Multithread work and separately configured invocations first. This command does
 not remove hooks, edit provider settings, stop receivers, or terminate commands.
+If you installed user-level hooks, take them out while the command still works:
+`multithread hooks trust --revoke`, then `multithread hooks remove`. Otherwise
+every Codex and Claude session would keep running a hook whose launcher is gone.
 Keep a separately reviewed source bootstrap and an approved release bundle
 outside the installation: after removing its own command, Multithread needs that
 bootstrap for inspection, retry or reinstall.
@@ -127,10 +130,10 @@ inode-conditional operation: an uncooperative process can substitute an entry in
 the final check-to-delete gap. Do not run competing manual filesystem changes
 during uninstall. The result is not a hostile-same-account deletion guarantee.
 
-Automatic provider opt-in/hook ownership and corresponding hook removal are not
-implemented. Before those features exist, this command cannot promise a complete
-provider uninstall; the operator must separately stop/remove any configured
-invocation. Repository rebind, repairing damaged release files, recovery without
+Uninstall does not remove user-level hooks itself: `multithread hooks remove`
+and `hooks trust --revoke` do that as their own approved steps, before code
+removal. This command cannot promise a complete provider uninstall; the
+operator must separately stop/remove any configured invocation. Repository rebind, repairing damaged release files, recovery without
 a separately verified release/bootstrap, and full metadata purge remain separate
 follow-ons.
 

@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 import pwd
 import re
+import shlex
 import stat
 import subprocess
 from typing import Any
@@ -23,6 +24,50 @@ import uuid
 
 class EnrollmentError(RuntimeError):
     """Enrollment is unavailable or ambiguous; do not access a ledger."""
+
+
+_REQUIREMENTS = {False: "group/other write access is not allowed",
+                 True: "group/other access is not allowed for a private directory"}
+
+
+class UnsafeDirectory(EnrollmentError):
+    """A directory enrollment relies on, whose mode would let other users change it."""
+
+    def __init__(self, path: Path, mode: int, private: bool):
+        super().__init__("enrollment directory permissions are unsafe at "
+                         f"{json.dumps(str(path), ensure_ascii=True)} "
+                         f"(observed mode {mode:04o}); {_REQUIREMENTS[private]}")
+        self.path, self.mode, self.private = path, mode, private
+
+
+class NotEnrolled(EnrollmentError):
+    """Positive absence: no account enrollment for this checkout, and no Multithread state in it."""
+
+    # sysexits EX_CONFIG. Setup reads this status as a checkout not yet enrolled.
+    exit_code = 78
+
+    def __init__(self, root: Path):
+        super().__init__("this checkout is not enrolled: " + json.dumps(str(root), ensure_ascii=True))
+        self.root = root
+
+
+class NotACheckout(EnrollmentError):
+    """Git itself says the folder is outside any repository."""
+
+    # sysexits EX_NOINPUT. Setup reads this status as a folder outside Git.
+    exit_code = 66
+
+    def __init__(self, path: Path):
+        super().__init__(json.dumps(str(path), ensure_ascii=True)
+                         + " is not a Git checkout: run from an enrolled checkout or pass --repo <checkout>")
+        self.path = path
+
+
+def command_text(argv: list[str]) -> str:
+    """A command to paste, or JSON when an argument could disturb the terminal."""
+    if all(argument.isprintable() for argument in argv):
+        return shlex.join(argv)
+    return json.dumps(argv, ensure_ascii=True) + " (JSON argument list)"
 
 
 _GIT = "/usr/bin/git"
@@ -96,6 +141,161 @@ def _absolute(path: str | os.PathLike[str]) -> Path:
     return Path(os.path.abspath(result))
 
 
+def _unsafe_mode(path: Path, info: os.stat_result, private: bool) -> bool:
+    """The one mode rule: no group/other write, and no group/other access when private.
+
+    Root's sticky /tmp and /var/tmp are allowed as ancestors of a shared directory.
+    """
+    system_temporary = (path in (Path("/tmp"), Path("/var/tmp"))
+                        and info.st_uid == 0 and info.st_mode & stat.S_ISVTX)
+    return (bool(stat.S_IMODE(info.st_mode) & (0o077 if private else 0o022))
+            and not (system_temporary and not private))
+
+
+def _open_chain(path: Path, opened: dict[Path, int]) -> list[Path]:
+    """Open path's directories from /, each through its opened parent without following a symlink.
+
+    Returns the directories reached; it ends early at a missing path, a symlink
+    or a file. Descriptors stay in opened, shared by every chain, so each
+    directory is judged once through the parent it was reached from.
+    """
+    if Path("/") not in opened:
+        opened[Path("/")] = os.open("/", _DIRECTORY_FLAGS)
+    chain = [Path("/")]
+    for part in path.parts[1:]:
+        child = chain[-1] / part
+        if child not in opened:
+            try:
+                opened[child] = os.open(part, _DIRECTORY_FLAGS, dir_fd=opened[chain[-1]])
+            except OSError:
+                break
+        chain.append(child)
+    return chain
+
+
+def _has_entry(directory: int, name: str) -> bool:
+    try:
+        os.stat(name, dir_fd=directory, follow_symlinks=False)
+        return True
+    except FileNotFoundError:
+        return False
+
+
+def _read_entry(directory: int, name: str) -> str | None:
+    """A small regular file in an opened directory, read without following a symlink."""
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=directory)
+    except OSError:
+        return None
+    try:
+        body = os.read(fd, _MAX_JSON + 1) if stat.S_ISREG(os.fstat(fd).st_mode) else b""
+    finally:
+        os.close(fd)
+    return os.fsdecode(body).rstrip("\n") if 0 < len(body) <= _MAX_JSON else None
+
+
+def _git_chain(root: Path, opened: dict[Path, int]) -> tuple[list[Path], Path | None]:
+    """The Git directories enrollment checks for this checkout, and its state if present.
+
+    A linked worktree counts only when its .git pointer and Git's backlink name
+    each other, as enrollment requires; both are read from opened directories.
+    """
+    try:
+        marker = os.stat(".git", dir_fd=opened[root], follow_symlinks=False)
+    except OSError:
+        return [], None
+    if stat.S_ISDIR(marker.st_mode):
+        git_dir = common = root / ".git"
+    else:
+        pointer = _read_entry(opened[root], ".git") if stat.S_ISREG(marker.st_mode) else None
+        if pointer is None or not pointer.startswith("gitdir: "):
+            return [], None
+        target = Path(pointer[len("gitdir: "):])
+        git_dir = Path(os.path.normpath(target if target.is_absolute() else root / target))
+        common = git_dir.parent.parent
+        if git_dir.parent.name != "worktrees" or common.name != ".git":
+            return [], None
+    chain = _open_chain(git_dir, opened)
+    if chain[-1] != git_dir or (git_dir != common and _read_entry(opened[git_dir], "gitdir") != str(root / ".git")):
+        return [], None
+    state = common.parent / ".relay"
+    return chain, state if _open_chain(state, opened)[-1] == state else None
+
+
+def unsafe_directories(repo: str | os.PathLike[str], registry_root: Path) -> list[tuple[Path, int, bool]]:
+    """Every existing directory enrollment would refuse for its mode, in checking order.
+
+    A diagnostic, so one refusal can name every fix. It writes, runs and
+    decides nothing: enrollment still validates each directory it holds. Each
+    directory is opened through its opened parent without following a symlink,
+    and judged by that descriptor. The requested path must open whole before any
+    Git metadata inside it is read; otherwise the diagnostic adds nothing.
+    """
+    requested = Path(os.path.abspath(Path.cwd() / repo))
+    opened: dict[Path, int] = {}
+    try:
+        chain = _open_chain(requested, opened)
+        if chain[-1] != requested:
+            return []
+        root = next((path for path in reversed(chain) if _has_entry(opened[path], ".git")), None)
+        git, state = _git_chain(root, opened) if root is not None else ([], None)
+        # The registry path comes from the account, not the checkout; a missing tail is normal.
+        private = {registry_root, state}
+        found, seen = [], set()
+        for path in (*chain, *git, *([state] if state else []), *_open_chain(registry_root, opened)):
+            if path in seen:
+                continue
+            seen.add(path)
+            info = os.fstat(opened[path])
+            if info.st_uid in (0, os.getuid()) and _unsafe_mode(path, info, path in private):
+                found.append((path, stat.S_IMODE(info.st_mode), path in private))
+        return found
+    finally:
+        for fd in opened.values():
+            os.close(fd)
+
+
+def permission_refusal(repo: str | os.PathLike[str], registry_root: Path,
+                       refused: UnsafeDirectory) -> EnrollmentError:
+    """One refusal naming every unsafe directory with its exact fix; the rule itself is unchanged."""
+    try:
+        found = unsafe_directories(repo, registry_root)
+    except (OSError, ValueError):
+        found = []
+    if all(path != refused.path for path, _, _ in found):
+        found.insert(0, (refused.path, refused.mode, refused.private))
+    lines = ["enrollment directory permissions are unsafe: other users could change "
+             + ("1 directory" if len(found) == 1 else f"{len(found)} directories")
+             + " this checkout's enrollment relies on, so Multithread refuses it. Run each command "
+             "below (it changes only the directory it names), then check again:"]
+    for path, mode, private in found:
+        fix = command_text(["chmod", "g-rwx,o-rwx" if private else "g-w,o-w", str(path)])
+        lines.append(f"  {fix}   (observed mode {mode:04o}; {_REQUIREMENTS[private]})")
+    if any(not private and mode & 0o020 for _, mode, private in found):
+        lines.append("A umask of 002 creates directories with group write, so a fresh clone can start this way.")
+    return EnrollmentError("\n".join(lines))
+
+
+def _held_unless_absent(path: Path, custody: _Custody, *, private: bool = False) -> _Directory | None:
+    """Hold path through controlled ancestry, or None where a component is positively absent."""
+    directory = custody.get(Path("/"))
+    for part in path.parts[1:]:
+        if not directory.exists(part):
+            return None
+        directory = custody.get(directory.path / part)
+    return custody.get(path, private=private)
+
+
+def _unenrolled(workspace: Workspace, custody: _Custody) -> None:
+    """Refuse an absent record by what the checkout holds; absence never means empty state."""
+    if (custody.get(workspace.state.parent).exists(workspace.state.name)
+            or custody.get(workspace.common).exists("relay-enrollment.json")):
+        raise EnrollmentError("this checkout holds Multithread state, but this account has no enrollment "
+                              "for its path; preserve that state and inspect it before enrolling (a checkout "
+                              "moved on the same filesystem can use rebind-plan)")
+    raise NotEnrolled(workspace.root)
+
+
 def _fingerprint(info: os.stat_result) -> tuple[int, int]:
     return info.st_dev, info.st_ino
 
@@ -137,16 +337,8 @@ class _Directory:
                 or info.st_uid not in (0, os.getuid())
                 or (self.account and info.st_uid != os.getuid())):
             raise EnrollmentError("directory ancestry is not controlled by this account or root")
-        system_temporary = (self.path in (Path("/tmp"), Path("/var/tmp"))
-                            and info.st_uid == 0 and info.st_mode & stat.S_ISVTX)
-        if (stat.S_IMODE(info.st_mode) & (0o077 if self.private else 0o022)
-                and not (system_temporary and not self.private)):
-            requirement = ("group/other access is not allowed for a private directory"
-                           if self.private else "group/other write access is not allowed")
-            raise EnrollmentError(
-                "enrollment directory permissions are unsafe at "
-                f"{json.dumps(str(self.path), ensure_ascii=True)} "
-                f"(observed mode {stat.S_IMODE(info.st_mode):04o}); {requirement}")
+        if _unsafe_mode(self.path, info, self.private):
+            raise UnsafeDirectory(self.path, stat.S_IMODE(info.st_mode), self.private)
 
     def exists(self, name: str) -> bool:
         self.custody.verify()
@@ -309,8 +501,15 @@ def _git_identity(directory: _Directory) -> tuple[Path, Path, Path]:
             env=_GIT_ENV, input="", capture_output=True,
             pass_fds=(directory.fd,), text=True, timeout=10, check=True,
         )
+    except subprocess.CalledProcessError as exc:
+        if "not a git repository" in (exc.stderr or "").lower():
+            raise NotACheckout(directory.path) from exc
+        raise EnrollmentError(f"Git could not inspect {json.dumps(str(directory.path), ensure_ascii=True)} as a "
+                              "checkout: run from an enrolled checkout or pass --repo <checkout>") from exc
     except (OSError, subprocess.SubprocessError) as exc:
-        raise EnrollmentError("cannot resolve a supported Git workspace") from exc
+        raise EnrollmentError("cannot resolve a supported Git workspace at "
+                              f"{json.dumps(str(directory.path), ensure_ascii=True)} "
+                              f"({exc.__class__.__name__})") from exc
     directory.custody.verify()
     lines = result.stdout.splitlines()
     if len(lines) != 4 or lines[3] != "false":
@@ -661,8 +860,11 @@ class Registry:
 
     def _lookup(self, repo: str | os.PathLike[str], workspace: Workspace,
                 custody: _Custody) -> Enrollment:
-        registry = custody.get(self.root, private=True)
-        record, _ = self._route(registry, self._record_path(workspace).name)
+        name = self._record_path(workspace).name
+        registry = _held_unless_absent(self.root, custody, private=True)
+        if registry is None or not registry.exists(name):
+            _unenrolled(workspace, custody)
+        record, _ = self._route(registry, name)
         if (record["common"] != str(workspace.common)
                 or record["common_device"] != workspace.common_device
                 or record["common_inode"] != workspace.common_inode

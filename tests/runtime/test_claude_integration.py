@@ -53,7 +53,7 @@ class ClaudeIntegrationTests(unittest.TestCase):
                     files.release()
 
         arguments = ['claude', '--stream-progress' if progress_only else '--live-input',
-                     '--repo', str(self.repo), '--relay', str(self.relay),
+                     '--repo', str(self.repo), '--multithread', str(self.relay),
                      '--provider', str(self.provider), '--task-file', str(self.task),
                      '--output-dir', str(directory), '--timeout', '2', '--json']
         output, errors = io.StringIO(), io.StringIO()

@@ -154,6 +154,44 @@ class PeerTests(unittest.TestCase):
         self.assertEqual("opus", prefix[prefix.index("--model") + 1])
         self.assertEqual("high", prefix[prefix.index("--effort") + 1])
 
+    def test_final_json_records_the_one_model_its_usage_names(self):
+        usage = {"inputTokens": 3, "outputTokens": 4, "costUSD": 0.01}
+        unobserved = {"source": "unavailable", "reported_model": None, "relation": "unknown"}
+
+        def observed(relation):
+            return {"source": "claude_model_usage", "reported_model": "claude-opus-5-5", "relation": relation}
+        cases = ((("--model", "opus"), {"claude-opus-5-5": usage}, observed("different_name_unverified")),
+                 (("--model", "claude-opus-5-5"), {"claude-opus-5-5": usage}, observed("same_literal")),
+                 ((), {"claude-opus-5-5": usage}, observed("not_requested")),
+                 # Several names do not say which model answered; nothing is inferred.
+                 (("--model", "opus"), {"claude-opus-5-5": usage, "claude-haiku-4-5": usage}, unobserved),
+                 (("--model", "opus"), {}, unobserved),
+                 (("--model", "opus"), {"claude-opus-5-5\n": usage}, unobserved))
+        for extra, models, observation in cases:
+            with self.subTest(extra=extra, models=list(models)):
+                self.configure(native={"modelUsage": models})
+                code, result, _ = self.invoke(*extra)
+                self.assertEqual((0, "returned"), (code, result["state"]))
+                self.assertEqual(observation, result["model_observation"])
+                self.assertEqual("unknown", result["effective_effort"])
+                # The sanitized report keeps the relation alone, never a model name.
+                call = peer._report_projection(result)
+                self.assertEqual(observation["relation"], call["model_relation"])
+                self.assertNotIn("claude-", json.dumps(call))
+
+    def test_claude_effort_choices_are_unchanged(self):
+        for effort in ("low", "medium", "high", "xhigh", "max"):
+            with self.subTest(effort=effort):
+                code, dry, _ = self.invoke("--effort", effort, "--dry-run")
+                self.assertEqual(0, code)
+                self.assertEqual(["--effort", effort], dry["argv"][-4:-2])
+        for effort in ("ultra", "HIGH", "--permission-mode"):
+            with self.subTest(effort=effort), redirect_stderr(io.StringIO()), \
+                    self.assertRaises(SystemExit) as raised:
+                peer.peer_main(["claude", "--task-file", str(self.task), "--effort=" + effort])
+            self.assertEqual(2, raised.exception.code)
+        self.assertFalse(self.calls.exists())
+
     def test_model_name_cannot_become_a_native_option(self):
         with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as raised:
             peer.peer_main(["claude", "--task-file", str(self.task), "--model=--permission-mode"])
@@ -405,7 +443,7 @@ class PeerTests(unittest.TestCase):
 
     def test_dry_run_has_no_provider_or_evidence_writes(self):
         evidence = self.base / "dry-evidence"
-        code, result, _ = self.invoke("--dry-run", output=evidence)
+        code, result, errors = self.invoke("--dry-run", output=evidence)
         self.assertEqual(0, code)
         self.assertEqual("call_prepared", result["state"])
         self.assertFalse(result["provider_started"])
@@ -413,11 +451,23 @@ class PeerTests(unittest.TestCase):
         self.assertNotIn("stdout_observation_error", result)
         self.assertFalse(self.calls.exists())
         self.assertFalse(evidence.exists())
+        # A prepared call is not a green light: it says readiness went unchecked, and how to check it.
+        check = [str(self.relay), "setup", "--repo", str(self.repo), "--check"]
+        self.assertEqual(("not_checked", check), (result["readiness"], result["readiness_check"]))
+        self.assertEqual("multithread peer: dry run only: the task and invocation are valid, but readiness was "
+                         "not checked. Check it with: " + shlex.join(check) + "\n", errors)
+        code, result, _ = self.invoke(output=self.base / "real-evidence")
+        self.assertEqual((0, "returned"), (code, result["state"]))
+        self.assertNotIn("readiness", result)
+        self.assertNotIn("readiness_check", result)
 
-    def test_legacy_launcher_flag_still_prepares_without_provider_or_evidence_writes(self):
+    def test_retired_launcher_flag_still_prepares_without_provider_or_evidence_writes(self):
         evidence = self.base / "legacy-dry-evidence"
-        code, result, _ = self.invoke("--dry-run", output=evidence, launcher_flag="--relay")
+        code, result, errors = self.invoke("--dry-run", output=evidence, launcher_flag="--relay")
         self.assertEqual(0, code)
+        self.assertTrue(errors.startswith("multithread peer: warning: --relay is deprecated; use --multithread. "
+                                          "--relay still works in this release and will be removed in a later "
+                                          "one.\n"), errors)
         self.assertEqual("call_prepared", result["state"])
         self.assertFalse(result["provider_started"])
         self.assertFalse(self.calls.exists())

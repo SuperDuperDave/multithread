@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import sqlite3
 import stat
 import subprocess
@@ -26,6 +27,24 @@ def snapshot(root):
         result[str(path.relative_to(root))] = (
             info.st_dev, info.st_ino, info.st_mode, info.st_size, info.st_mtime_ns, body)
     return result
+
+
+def strict_event(raw):
+    """The event name the hook's strict reader would see, if any."""
+    def unique(pairs):
+        if len({key for key, _ in pairs}) != len(pairs):
+            raise ValueError("repeated key")
+        return dict(pairs)
+
+    def constant(name):
+        raise ValueError(name)
+    if len(raw.encode("utf-8")) > 256 * 1024:
+        return None
+    try:
+        value = json.loads(raw, object_pairs_hook=unique, parse_constant=constant)
+    except ValueError:
+        return None
+    return value.get("hook_event_name") if isinstance(value, dict) else None
 
 
 class ProviderHookTests(unittest.TestCase):
@@ -64,6 +83,34 @@ class ProviderHookTests(unittest.TestCase):
         self.assertIn(session, context)
         self.assertLessEqual(len(context.encode("utf-8")), 8192)
         return context
+
+    def warned(self, result, event, because, repo=None):
+        """An enrolled checkout's missed ledger is visible, with its reason and fix."""
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn("unavailable", result.stderr)
+        value = json.loads(result.stdout)
+        self.assertEqual({"systemMessage", "hookSpecificOutput"}, set(value))
+        output = value["hookSpecificOutput"]
+        self.assertEqual({"hookEventName", "additionalContext"}, set(output))
+        self.assertEqual(event, output["hookEventName"])
+        context = output["additionalContext"]
+        self.assertTrue(context.startswith(
+            "MULTITHREAD WARNING: this checkout is enrolled, but Multithread's " + event + " hook could not deliver "
+            "verified ledger context this time (" + because + "). This session's Multithread record may be "
+            "incomplete, and this step shows no brief. Tell the person; the fix starts with: "), context)
+        # One failed step never claims the whole session went unrecorded.
+        self.assertNotIn("not being recorded", result.stdout)
+        self.assertTrue(value["systemMessage"].startswith(
+            "Multithread could not deliver verified ledger context for this step (" + because
+            + "); this session's record may be incomplete. Run: "), value["systemMessage"])
+        self.assertNotIn("MULTITHREAD BRIEF", context)
+        self.assertNotIn("\n", context)
+        fix = " setup --repo " + shlex.quote(str(repo or self.fixture.repo)) + " --check"
+        self.assertTrue(context.endswith(fix), context)
+        self.assertIn(because, value["systemMessage"])
+        self.assertTrue(value["systemMessage"].endswith(fix))
+        self.assertLess(len(result.stdout), 1024)
+        return value
 
     def silent(self, result, *, degraded=False):
         self.assertEqual(0, result.returncode, result.stderr)
@@ -147,7 +194,8 @@ class ProviderHookTests(unittest.TestCase):
         before = snapshot(self.fixture.base)
         for stated in (beta, self.fixture.base / "absent", "\0"):
             with self.subTest(stated=stated):
-                self.silent(run(alpha, "SessionStart", stated=stated), degraded=True)
+                self.warned(run(alpha, "SessionStart", stated=stated), "SessionStart",
+                            "the provider's hook input could not be used", repo=alpha)
         self.assertEqual(before, snapshot(self.fixture.base))
         alias = self.fixture.base / "alpha-alias"
         alias.symlink_to(alpha)
@@ -215,7 +263,7 @@ class ProviderHookTests(unittest.TestCase):
                                         "rev-parse", "HEAD^{tree}"], text=True).strip()
         (self.fixture.repo / ".git" / "HEAD").write_text(tree + "\n")
         result = self.hook("claude", "SessionStart", "noncommit-head")
-        self.silent(result, degraded=True)
+        self.warned(result, "SessionStart", "the ledger refused or could not complete this step")
         self.assertEqual([], self.rows())
 
     def test_legacy_resume_after_commit_and_modern_startup_retry(self):
@@ -336,8 +384,14 @@ RelayStore.brief = checked_brief
             with self.subTest(length=len(raw), prefix=raw[:55]):
                 before = snapshot(self.fixture.base)
                 result = self.hook("claude", raw=raw)
-                self.silent(result, degraded=True)
-                self.assertNotIn("PRIVATE_INPUT_SENTINEL", result.stderr)
+                # A context event named by strictly readable input carries the
+                # warning; input the hook cannot read names no event to answer.
+                event = strict_event(raw)
+                if event in ("SessionStart", "UserPromptSubmit"):
+                    self.warned(result, event, "the provider's hook input could not be used")
+                else:
+                    self.silent(result, degraded=True)
+                self.assertNotIn("PRIVATE_INPUT_SENTINEL", result.stdout + result.stderr)
                 self.assertLess(len(result.stderr), 512)
                 self.assertEqual(before, snapshot(self.fixture.base))
         self.assertEqual([], self.rows())
@@ -359,7 +413,11 @@ RelayStore.brief = checked_brief
         original.rename(held)
         before = snapshot(self.fixture.base)
         for event in ("SessionStart", "UserPromptSubmit", "Stop"):
-            self.silent(self.hook("claude", event), degraded=True)
+            result = self.hook("claude", event)
+            if event == "Stop":
+                self.silent(result, degraded=True)
+            else:
+                self.warned(result, event, "the ledger refused or could not complete this step")
             self.assertFalse(original.exists())
             self.assertEqual(before, snapshot(self.fixture.base))
 
@@ -374,7 +432,8 @@ def replace(stage):
         state.mkdir(mode=0o700)
 cli._checkpoint = replace
 """)
-        self.silent(result, degraded=True)
+        # The withheld context never appears; the warning replaces it.
+        self.warned(result, "SessionStart", "the ledger refused or could not complete this step")
         self.assertEqual([], list(self.fixture.state.iterdir()))
         self.assertEqual([(1, "session.started", "codex", "custody-session")], self.rows(held))
 
@@ -387,8 +446,8 @@ def fail_brief(*args, **kwargs):
     raise StateError("PRIVATE_FAILURE_SENTINEL")
 RelayStore.brief = fail_brief
 """)
-        self.silent(result, degraded=True)
-        self.assertNotIn("PRIVATE_FAILURE_SENTINEL", result.stderr)
+        self.warned(result, "SessionStart", "the ledger refused or could not complete this step")
+        self.assertNotIn("PRIVATE_FAILURE_SENTINEL", result.stdout + result.stderr)
         self.assertEqual([(1, "session.started", "claude", "brief-failed-session")], self.rows())
 
     def test_full_context_including_contract_is_utf8_byte_bounded(self):

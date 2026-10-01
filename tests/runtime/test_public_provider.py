@@ -46,7 +46,14 @@ call(base + ["init"])
 generated = call(base + ["provider-config", "--client", "codex", "--launcher-name", "multithread"])
 before_veto = snapshot(project)
 vetoed = hook("codex", "SessionStart", cwd=str(foreign))
-assert vetoed.stdout == "" and vetoed.stderr and snapshot(project) == before_veto
+# Enrolled: the refusal is visible to the agent and the person, and still writes nothing.
+warning = json.loads(vetoed.stdout)
+assert set(warning) == {"systemMessage", "hookSpecificOutput"}, warning
+assert warning["hookSpecificOutput"]["hookEventName"] == "SessionStart"
+assert warning["hookSpecificOutput"]["additionalContext"].startswith("MULTITHREAD WARNING: this checkout is enrolled")
+assert "hook input could not be used" in warning["systemMessage"]
+assert str(launcher) + " setup --repo " in warning["systemMessage"]
+assert vetoed.stderr and snapshot(project) == before_veto
 import shlex
 assert shlex.split(generated["hook_command"]) == codex_hook, generated
 handoff = call(base + ["signal", "work.handoff", "--agent", "codex", "--session", "author-fixture",

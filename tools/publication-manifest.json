@@ -54,14 +54,17 @@
     "src/relay_runtime/provider.py",
     "src/relay_runtime/codex_peer.py",
     "src/relay_runtime/claude_peer.py",
+    "src/relay_runtime/hooks.py",
     "src/relay_runtime/native_io.py",
     "src/relay_runtime/peer_control.py",
     "src/relay_runtime/review_packet.py",
     "src/relay_runtime/setup.py",
     "src/relay_runtime/update.py",
+    "src/relay_runtime/wake.py",
     "tests/core/test_relay.py",
     "tests/core/test_relay_channel_pending.py",
     "tests/core/test_relay_decisions.py",
+    "tests/core/test_relay_wake.py",
     "tests/providers/claude_startup_probe.py",
     "tests/providers/codex_discovery_probe.py",
     "tests/run_tests.py",
@@ -90,6 +93,8 @@
     "tests/runtime/test_peer_control_integration.py",
     "tests/runtime/test_provider_config.py",
     "tests/runtime/test_provider_hook.py",
+    "tests/runtime/test_user_hooks.py",
+    "tests/runtime/test_wake.py",
     "tests/runtime/test_public_external_recovery.py",
     "tests/runtime/test_public_peer.py",
     "tests/runtime/test_public_profile.py",
@@ -150,6 +155,24 @@
       "path": "docs/PROVIDERS.md",
       "rule": "personal-home-path",
       "line_sha256": "f0c1f8370d6bc1fd75b0bb1a4efc06c4b9334b41add258d7efb88d60bfd21af3",
+      "reason": "public-example"
+    },
+    {
+      "path": "docs/PROVIDERS.md",
+      "rule": "personal-home-path",
+      "line_sha256": "35b629dc1a63da80212dca2f25c980184bc14b30a2ec17a32b761c6f39d4688b",
+      "reason": "public-example"
+    },
+    {
+      "path": "docs/PROVIDERS.md",
+      "rule": "personal-home-path",
+      "line_sha256": "b304ccfe54b8be1522ef4da77c828f5a6f9f88a4dcd47b574e0c216005e699d6",
+      "reason": "public-example"
+    },
+    {
+      "path": "docs/PROVIDERS.md",
+      "rule": "personal-home-path",
+      "line_sha256": "45ad12a5ecade9b8690e1284fa941cb75bb3e8e7a8a23696c97b364ddc986042",
       "reason": "public-example"
     },
     {
@@ -288,6 +311,12 @@
       "path": "tests/runtime/test_public_peer.py",
       "rule": "email-address",
       "line_sha256": "5f2dacbb7f784f0cb2a5cc51aae1e6fbbc97e5be7f49cb36ccaac41011a08bf0",
+      "reason": "synthetic-test-fixture"
+    },
+    {
+      "path": "tests/runtime/test_user_hooks.py",
+      "rule": "email-address",
+      "line_sha256": "0457bbb85667d58642421bfff0d63fb261b8f49658eaf61732fc68b2aa96e254",
       "reason": "synthetic-test-fixture"
     }
   ]

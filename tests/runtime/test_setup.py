@@ -70,7 +70,8 @@ class SetupTests(unittest.TestCase):
     def codex_plan(self, path):
         hook = shlex.join([self.launcher, "provider-hook", "--client", "codex"])
         return {"argv": [str(path), "-c", "hooks.fixture=[]"], "repo": str(self.repo),
-                "relay_plan": {"hook_command": hook}, "provider_started": False}
+                "relay_plan": {"hook_command": hook}, "provider_started": False,
+                "hooks": {"source": "session_flags", "file": None, "command": hook}}
 
     def list_hooks(self, argv, repo, *, on_start=None, timeout=15):
         self.listings.append((argv, repo))
@@ -163,6 +164,58 @@ class SetupTests(unittest.TestCase):
         self.assertEqual(1, code)
         self.assertEqual("unavailable", result["repository"]["doctor"]["state"])
 
+    def test_a_folder_outside_git_is_never_told_to_enroll(self):
+        refusal = b'multithread: "/fixture" is not a Git checkout: run from an enrolled checkout or pass --repo <checkout>\n'
+        step = [{"stage": "repository", "action": "This folder is not inside a Git checkout, so Multithread can't "
+                 "use it here. Run setup from your repository's checkout, or pass --repo <checkout>."}]
+        self.responses["doctor"] = self.responses["init"] = (66, b"", refusal)
+        for extra in ((), ("--apply",)):
+            with self.subTest(extra=extra), mock.patch.object(setup.provider, "prepare") as prepare:
+                code, result = self.invoke(*extra)
+                self.assertEqual(1, code)
+                self.assertEqual("not_ready", result["state"])
+                self.assertEqual("not_a_checkout", result["repository"]["state"])
+                self.assertEqual("not_a_checkout", result["repository"]["doctor"]["state"])
+                self.assertEqual("not_a_checkout" if extra else "not_requested",
+                                 result["repository"]["enrollment"]["state"])
+                self.assertNotIn("message", result["repository"]["enrollment"])
+                self.assertEqual(step, result["next_actions"])
+                prepare.assert_not_called()
+                lines = self.display(result).splitlines()
+                self.assertEqual("Multithread is installed; this folder is not a Git checkout.", lines[0])
+                self.assertIn("Repository: not_a_checkout", lines)
+                self.assertFalse([line for line in lines if line.startswith("Diagnostic: ")])
+                self.assertNotIn("--apply", "\n".join(lines))
+        # Only the installed command's own status means outside Git; the same text alone does not.
+        self.responses["doctor"] = (1, b"", refusal)
+        code, result = self.invoke()
+        self.assertEqual("failed", result["repository"]["state"])
+
+    def test_unenrolled_checkout_gets_one_plain_next_step(self):
+        refusal = b"multithread: this checkout is not enrolled: \"/fixture\". If this ...\n"
+        self.responses["doctor"] = (78, b"", refusal)
+        with mock.patch.object(setup.provider, "prepare") as prepare:
+            code, result = self.invoke()
+        self.assertEqual(1, code)
+        self.assertEqual("not_ready", result["state"])
+        self.assertEqual("not_enrolled", result["repository"]["state"])
+        self.assertEqual("not_enrolled", result["repository"]["doctor"]["state"])
+        self.assertEqual(refusal.decode(), result["repository"]["doctor"]["stderr"])
+        self.assertEqual([{"stage": "repository", "action": "This checkout is not enrolled with Multithread yet. "
+                           "If it is the repository you want Multithread in, enroll it; setup then checks it again.",
+                           "command": [self.launcher, "setup", "--repo", str(self.repo), "--apply"]}],
+                         result["next_actions"])
+        prepare.assert_not_called()
+        lines = self.display(result).splitlines()
+        self.assertEqual("Multithread is installed; this checkout is not enrolled yet.", lines[0])
+        self.assertIn("Repository: not_enrolled", lines)
+        self.assertFalse([line for line in lines if line.startswith("Diagnostic: ")])
+        # Only the installed command's own status means not enrolled; the same text alone does not.
+        self.responses["doctor"] = (1, b"", refusal)
+        code, result = self.invoke()
+        self.assertEqual("failed", result["repository"]["state"])
+        self.assertEqual(2, len(result["next_actions"]))
+
     def test_apply_failed_command_retains_verified_runtime_and_independent_healthy_reads(self):
         self.responses["init"] = (1, b"", b"synthetic refused enrollment\n")
         code, result = self.invoke("--apply")
@@ -173,6 +226,17 @@ class SetupTests(unittest.TestCase):
         self.assertEqual("verified", result["repository"]["status"]["state"])
         self.assertEqual(1, sum(command[-1] == "init" for command in self.commands))
         self.assertIn("--check", result["next_actions"][-1]["command"])
+
+    def test_identical_refusals_from_enrollment_and_its_check_are_shown_once(self):
+        refusal = b"multithread: enrollment directory permissions are unsafe: ...\n  chmod g-w,o-w /fixture\n"
+        self.responses["init"] = self.responses["doctor"] = (1, b"", refusal)
+        code, result = self.invoke("--apply")
+        self.assertEqual(1, code)
+        self.assertEqual(refusal.decode(), result["repository"]["enrollment"]["stderr"])
+        self.assertEqual(refusal.decode(), result["repository"]["doctor"]["stderr"])
+        diagnostics = [line for line in self.display(result).splitlines() if line.startswith("Diagnostic: ")]
+        self.assertEqual(["Diagnostic: multithread: enrollment directory permissions are unsafe: ...",
+                          "Diagnostic:   chmod g-w,o-w /fixture"], diagnostics)
 
     def test_nonzero_exit_does_not_claim_a_specific_refusal_cause(self):
         for exit_code, diagnostic in ((1, b"synthetic partial initialization\n"),
@@ -269,7 +333,8 @@ class SetupTests(unittest.TestCase):
             self.assertEqual(self.repo, repo)
             self.assertEqual(Path(self.launcher), launcher)
             self.assertEqual(selected, path)
-            return {"argv": [str(selected), "--settings", "{}"], "provider_started": False}
+            return {"argv": [str(selected), "--settings", "{}"], "provider_started": False,
+                    "hooks": {"source": "session_flags", "file": None, "command": "fixture"}}
         with mock.patch.object(setup.provider, "prepare", side_effect=prepare) as prepare_call:
             code, result = self.invoke("--claude", str(selected))
         self.assertEqual(0, code)

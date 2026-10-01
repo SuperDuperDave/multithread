@@ -14,6 +14,7 @@ import math
 import os
 from pathlib import Path
 import platform
+import re
 import selectors
 import shlex
 import shutil
@@ -25,9 +26,11 @@ import tempfile
 import time
 import tomllib
 import uuid
-from . import account_launcher, hook_argv
+from . import account_launcher, hook_argv, hooks as user_hooks
+from .enrollment import NotEnrolled
 from .native_io import (USAGE_SCOPES, MODEL_USAGE_SCOPES, COST_SCOPES,
-                        claude_measurements, measurement_scope, canonical_provider_version)
+                        claude_measurements, measurement_scope, canonical_provider_version,
+                        identity as _identity, observe_usage_model, setting_relation)
 
 
 class LaunchError(Exception):
@@ -136,6 +139,10 @@ def prepare(client, repo, relay, provider):
         raise LaunchError("Multithread configuration timed out; observation is unavailable. Inspect installed status before retrying.") from None
     except UnicodeError:
         raise LaunchError("Multithread returned unreadable configuration output; observation is unavailable.") from None
+    if result.returncode == NotEnrolled.exit_code:
+        raise LaunchError("This checkout is not enrolled with Multithread, so no provider was started. If it is "
+                          "the repository you want Multithread in, enroll it with: "
+                          + shlex.join([launcher, "setup", "--repo", str(checkout), "--apply"]))
     if result.returncode != 0:
         # Give the exact native command for diagnosis without copying arbitrary
         # diagnostics into the structured launch plan.
@@ -166,9 +173,22 @@ def prepare(client, repo, relay, provider):
             or any(not isinstance(arg, str) or "\0" in arg for arg in arguments)):
         raise LaunchError("The configuration plan has invalid native arguments.")
     check_native_arguments(client, hook_command, arguments)
+    # Each event runs once: installed user-level hooks replace the invocation
+    # copies, which then stay off the command line.
+    try:
+        delivery = user_hooks.delivery(client)
+    except user_hooks.HooksError as exc:
+        raise LaunchError(str(exc)) from None
+    if delivery["source"] == "user":
+        if client == "codex" and delivery["command"] != hook_command:
+            raise LaunchError("The user-level Codex hook command differs from this launcher's; run "
+                              + shlex.join([str(account_launcher()), "hooks", "status"]) + " and follow its next step.")
+        arguments = []
+    else:
+        delivery["command"] = hook_command
     return {"schema": 1, "state": "launch_prepared", "provider": client,
             "repo": str(checkout), "argv": [provider_path, *arguments],
-            "relay_plan": plan, "provider_started": False,
+            "relay_plan": plan, "hooks": delivery, "provider_started": False,
             "hook_delivery": "unknown", "provider_tools": "unknown"}
 
 
@@ -193,11 +213,19 @@ def _display_launch(plan):
     print("Provider: " + _display_text(plan["provider"]))
     print("Executable: " + _display_text(plan["argv"][0]))
     print("Checkout: " + _display_text(plan["repo"]))
-    # prepare validated these exact hooks in the native arguments; display
-    # their enforced shape, not optional descriptive fields in the plan.
-    print("Invocation hooks: " + ", ".join(_hook_events(plan["provider"])))
+    # prepare validated these exact hooks in the native arguments or the user
+    # hook file; display their enforced shape, not descriptive plan fields.
+    if plan["hooks"]["source"] == "user":
+        print("Hooks: your user-level hooks in " + _display_text(plan["hooks"]["file"])
+              + ", so this launch adds no copies: " + ", ".join(_hook_events(plan["provider"])))
+        if plan["provider"] == "codex":
+            print("Codex runs them once trusted; if it asks, review them in /hooks.")
+        if plan["hooks"].get("note"):
+            print(_display_text(plan["hooks"]["note"]))
+    else:
+        print("Invocation hooks: " + ", ".join(_hook_events(plan["provider"])))
     print("Each hook runs the following command with a 3-second timeout:")
-    hook_command = plan["relay_plan"]["hook_command"]
+    hook_command = plan["hooks"]["command"]
     # Native trust may identify literal hook text. Do not normalize accepted
     # whitespace or quoting when presenting the command to be reviewed.
     if hook_command.isprintable():
@@ -209,11 +237,32 @@ def _display_launch(plan):
     print("Use launch --json with the same options to inspect the complete invocation plan without starting a provider.")
 
 
+class _RetiredSpelling(argparse.Action):
+    """Accept an old option spelling for one more release, and name its replacement."""
+
+    def __init__(self, *args, replacement, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.replacement = replacement
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        print(f"{parser.prog}: warning: {option_string} is deprecated; use {self.replacement}. "
+              f"{option_string} still works in this release and will be removed in a later one.",
+              file=sys.stderr)
+        setattr(namespace, self.dest, values)
+
+
+def _launcher_option(parser):
+    parser.add_argument("--multithread", dest="relay", type=Path,
+                        help="reviewed absolute installed launcher; default: the account launcher setup prints")
+    parser.add_argument("--relay", dest="relay", type=Path, action=_RetiredSpelling,
+                        replacement="--multithread", help=argparse.SUPPRESS)
+
+
 def launch_main(argv=None):
     parser = argparse.ArgumentParser(prog="multithread launch", description="Review invocation-only Multithread hooks and start an interactive provider.")
     parser.add_argument("client", choices=("codex", "claude"))
     parser.add_argument("--repo", type=Path, default=Path.cwd(), help="enrolled checkout; default: current directory")
-    parser.add_argument("--multithread", "--relay", dest="relay", type=Path, help="reviewed absolute installed launcher; --relay is a compatibility spelling")
+    _launcher_option(parser)
     parser.add_argument("--provider", type=Path, help="reviewed absolute provider entry point; default: PATH lookup")
     parser.add_argument("--json", action="store_true", help="print a plan without starting a provider or asking for input")
     args = parser.parse_args(argv)
@@ -264,11 +313,25 @@ def _native_identity(value):
     return value
 
 
-def _model_selection(value):
+_CLAUDE_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+# Report only a short lowercase effort word; Codex models advertise their own.
+_REPORTED_EFFORT = re.compile(r"[a-z]{1,16}")
+_SETTINGS_CHECKS = ("verified", "refused", "model_unlisted", "inherited_unknown", "unavailable")
+
+
+def _setting(value, kind):
     if (not isinstance(value, str) or not 0 < len(value) <= 128 or value.startswith("-") or any(
             ord(character) < 33 or ord(character) > 126 for character in value)):
-        raise argparse.ArgumentTypeError("use a nonempty printable model name without spaces (at most 128 characters)")
+        raise argparse.ArgumentTypeError(f"use a nonempty printable {kind} without spaces (at most 128 characters)")
     return value
+
+
+def _model_selection(value):
+    return _setting(value, "model name")
+
+
+def _effort_selection(value):
+    return _setting(value, "effort name")
 
 
 def _positive(value):
@@ -621,6 +684,7 @@ def _interpret(directory, envelope):
         "actual_billed_cost": "unknown",
     })
     envelope.update(claude_measurements(native, envelope))
+    observe_usage_model(envelope)
     measurement_scope(envelope, "usage_scope", "native_main_loop", USAGE_SCOPES)
     measurement_scope(envelope, "model_usage_scope", "native_query_cumulative", MODEL_USAGE_SCOPES)
     measurement_scope(envelope, "cost_scope", "cumulative_through_latest_native_result", COST_SCOPES)
@@ -664,26 +728,27 @@ def peer_main(argv=None, *, report_entry=None):
                                      epilog="For an existing call: peer report --call-dir PATH [--json] gives a read-only summary; peer packet --help freezes a scoped review diff; peer control --help covers live input.")
     parser.add_argument("client", choices=("claude", "codex"))
     parser.add_argument("--repo", type=Path, default=Path.cwd(), help="enrolled peer checkout")
-    parser.add_argument("--multithread", "--relay", dest="relay", type=Path, help="reviewed absolute installed launcher; --relay is a compatibility spelling")
+    _launcher_option(parser)
     parser.add_argument("--provider", type=Path, help="reviewed absolute provider entry point; default: PATH")
     parser.add_argument("--task-file", required=True, help="UTF-8 task packet; - reads stdin, at most 64 KiB")
     parser.add_argument("--resume", type=_native_identity, help="exact peer session identity from a previous result; no latest-session lookup")
     parser.add_argument("--output-dir", type=Path, help="new private evidence directory; default: retained temporary directory")
     parser.add_argument("--timeout", type=_positive, default=600, help="call wall-time limit in seconds, 1 through 3600 (default: 600)")
     parser.add_argument("--max-turns", type=_positive, help="optional Claude agentic-turn cap, 1 through 3600; tool/source work can consume it before the final answer; no cap by default")
-    parser.add_argument("--model", type=_model_selection, help="request this Claude model for this call; the provider decides what it actually uses")
-    parser.add_argument("--effort", choices=("low", "medium", "high", "xhigh", "max"),
-                        help="request this Claude effort level for this call; effective effort is not verified")
+    parser.add_argument("--model", type=_model_selection, help="request this model for this call; the provider decides what it actually uses")
+    parser.add_argument("--effort", type=_effort_selection,
+                        help="request this effort for this call: Claude accepts " + ", ".join(_CLAUDE_EFFORTS)
+                        + "; Codex accepts an effort its model advertises. The provider decides what it actually uses")
     parser.add_argument("--live-input", action="store_true", help="enable Claude session input while this call runs; queued input may start later turns within the call timeout. Codex always exposes exact-turn input")
     parser.add_argument("--stream-progress", action="store_true", help="use Claude's native event stream for content-free progress observations, without enabling live input; the default remains final JSON")
-    parser.add_argument("--dry-run", action="store_true", help="validate task/configuration and print a plan; no provider or evidence writes")
+    parser.add_argument("--dry-run", action="store_true", help="validate task/configuration and print a plan; no provider or evidence writes, and no readiness check (setup --check does that)")
     parser.add_argument("--json", action="store_true", help="return a structured result; this DOES launch unless --dry-run is used; exit 0 means a returned turn, so also check needs_attention and task evidence")
     args = parser.parse_args(raw)
     args.report_entry = report_entry
     if args.client == "codex" and args.max_turns is not None:
         parser.error("--max-turns is a Claude option; Codex returns one native turn with its normal tool loop")
-    if args.client == "codex" and (args.model is not None or args.effort is not None):
-        parser.error("--model and --effort are Claude options in this peer release")
+    if args.client == "claude" and args.effort is not None and args.effort not in _CLAUDE_EFFORTS:
+        parser.error("argument --effort: Claude accepts " + ", ".join(_CLAUDE_EFFORTS))
     if args.client == "codex" and args.stream_progress:
         parser.error("Codex already uses native streaming; --stream-progress is a Claude option")
     if args.client == "claude" and args.resume is not None:
@@ -786,7 +851,14 @@ def _run_peer(args, interruption):
             native = [*plan["argv"], "app-server", "--listen", "stdio://"]
         envelope["repo"] = plan["repo"]
         if args.dry_run:
+            # Readiness starts a provider (Codex's hook listing), which a dry run never
+            # does; a real Codex call checks it before any task. Say so, not green.
+            check = [str(args.relay or account_launcher()), "setup", "--repo", plan["repo"], "--check"]
+            print("multithread peer: dry run only: the task and invocation are valid, but readiness was not "
+                  "checked" + (", including Codex's hook trust" if args.client == "codex" else "")
+                  + ". Check it with: " + _display_text(shlex.join(check)), file=sys.stderr)
             print(json.dumps({**envelope, "state": "call_prepared", "argv": native,
+                              "readiness": "not_checked", "readiness_check": check,
                               "task_sha256": hashlib.sha256(task).hexdigest(),
                               "timeout_seconds": args.timeout}, sort_keys=True))
             return 0
@@ -865,7 +937,8 @@ def _run_peer(args, interruption):
                                directory, envelope, args.timeout,
                                control=ObservedControl(control, envelope) if control is not None else None, observer=observer,
                                feedback=feedback,
-                               **({"expected_hook": plan["relay_plan"]["hook_command"]} if args.client == "codex" else {}))
+                               **({"expected_hook": plan["relay_plan"]["hook_command"],
+                                   "hook_file": plan["hooks"]["file"]} if args.client == "codex" else {}))
                     # EOF is the ordinary end of this owned stdio server.
                     # Retain a valid returned turn even if server shutdown
                     # needs cleanup; shutdown is not a second provider turn.
@@ -1042,14 +1115,22 @@ def _report_projection(record):
         raise ValueError()
     call = {key: record[key] for key in ("provider", "state", "provider_started", "needs_attention")}
     call["provider_version"] = _report_provider_version(record)
-    requested_effort = record.get("requested_effort")
-    call["requested_effort"] = (requested_effort if requested_effort in
-                                ("low", "medium", "high", "xhigh", "max") else None)
+    requested_effort, effective_effort = record.get("requested_effort"), record.get("effective_effort")
+    call["requested_effort"] = (requested_effort if isinstance(requested_effort, str)
+                                and _REPORTED_EFFORT.fullmatch(requested_effort) else None)
+    # Compare the provider-reported effort with the request without disclosing it.
+    call["effort_relation"] = (setting_relation(requested_effort, effective_effort)
+                               if _identity(effective_effort) and effective_effort != "unknown"
+                               and (requested_effort is None or _identity(requested_effort)) else "unknown")
     model_observation = record.get("model_observation")
     call["model_relation"] = (model_observation.get("relation") if isinstance(model_observation, dict)
                               and model_observation.get("relation") in
                               ("same_literal", "different_name_unverified", "prior_init_only",
                                "not_requested", "unknown") else "unknown")
+    # The pre-turn Codex check's outcome only; its model and effort names stay private.
+    check = record.get("settings_check")
+    call["settings_check"] = ("not_recorded" if "settings_check" not in record else check["status"]
+                              if isinstance(check, dict) and check.get("status") in _SETTINGS_CHECKS else "invalid")
     call["caller_stop_reason"] = _caller_stop_reason(record)
     call["elapsed_seconds"] = _report_number(record, "elapsed_seconds")
     call["process_exit_code"] = _report_number(record, "process_exit_code", integer=True, minimum=-(2**31))
@@ -1298,12 +1379,17 @@ def report_main(argv=None):
             print("Recorded provider version: " + (
                 version["version"] + " (provider-reported; " + version["source"] + ")"
                 if version["status"] == "reported" else "unknown (" + version["status"] + ")"))
-            if call["provider"] == "claude" and call["requested_effort"] is not None:
+            if call["requested_effort"] is not None:
                 print("Requested effort: " + call["requested_effort"]
-                      + "; effective effort unknown.")
-            if call["provider"] == "claude" and call["model_relation"] != "unknown":
+                      + ("; effective effort unknown." if call["effort_relation"] == "unknown" else ""))
+            if call["effort_relation"] != "unknown":
+                print("Effort observation: " + call["effort_relation"]
+                      + " (provider-reported; name comparison only).")
+            if call["model_relation"] != "unknown":
                 print("Model observation: " + call["model_relation"]
                       + " (name comparison only; aliases may resolve to another name).")
+            if call["settings_check"] != "not_recorded":
+                print("Settings check before the turn: " + call["settings_check"] + " (names omitted).")
             print("Recorded task submission: " + call["task_submission"])
             print("Recorded producer runtime identity: " + call["producer_runtime_identity"] + " (digest omitted)")
             print("Needs attention: " + ("yes" if call["needs_attention"] else "no"))
