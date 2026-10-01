@@ -94,6 +94,20 @@ class PeerTests(unittest.TestCase):
     def configure(self, **spec):
         self.response.write_text(json.dumps(spec))
 
+    def assert_argument_rejected(self, *extra):
+        # A failed argument guard must stop the test, never discover an account's
+        # provider or run launch preparation. Keep disposable paths and dry-run
+        # as independent boundaries if validation regresses.
+        with (mock.patch.object(peer, "prepare", side_effect=AssertionError(
+                "rejected argument reached launch preparation")) as preparation,
+              mock.patch.object(peer.subprocess, "Popen", side_effect=AssertionError(
+                "rejected argument attempted a subprocess")) as native,
+              self.assertRaises(SystemExit) as raised):
+            self.invoke(*extra, "--dry-run")
+        self.assertEqual(2, raised.exception.code)
+        preparation.assert_not_called()
+        native.assert_not_called()
+
     def test_literal_task_environment_hooks_and_private_evidence(self):
         task = "Inspect 雪 and café.\n`touch injected` $(touch injected) ' \\\n".encode()
         code, result, _ = self.invoke(stdin=task)
@@ -186,17 +200,28 @@ class PeerTests(unittest.TestCase):
                 self.assertEqual(0, code)
                 self.assertEqual(["--effort", effort], dry["argv"][-4:-2])
         for effort in ("ultra", "HIGH", "--permission-mode"):
-            with self.subTest(effort=effort), redirect_stderr(io.StringIO()), \
-                    self.assertRaises(SystemExit) as raised:
-                peer.peer_main(["claude", "--task-file", str(self.task), "--effort=" + effort])
-            self.assertEqual(2, raised.exception.code)
+            with self.subTest(effort=effort):
+                self.assert_argument_rejected("--effort=" + effort)
         self.assertFalse(self.calls.exists())
 
     def test_model_name_cannot_become_a_native_option(self):
-        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as raised:
-            peer.peer_main(["claude", "--task-file", str(self.task), "--model=--permission-mode"])
-        self.assertEqual(2, raised.exception.code)
+        self.assert_argument_rejected("--model=--permission-mode")
         self.assertFalse(self.calls.exists())
+
+    def test_rejected_argument_tests_fail_before_execution_when_guards_regress(self):
+        cases = (("_CLAUDE_EFFORTS", (*peer._CLAUDE_EFFORTS, "ultra"), "--effort=ultra"),
+                 ("_model_selection", lambda value: value, "--model=--permission-mode"))
+        for guard, replacement, argument in cases:
+            with (self.subTest(guard=guard), mock.patch.object(peer, guard, replacement),
+                  mock.patch.object(peer.subprocess, "Popen") as native,
+                  self.assertRaisesRegex(AssertionError,
+                                         "rejected argument reached launch preparation")):
+                self.assert_argument_rejected(argument)
+            native.assert_not_called()
+            self.assertFalse(self.calls.exists())
+            self.assertFalse(self.receipt.exists())
+            self.assertFalse((self.base / "relay-argv.json").exists())
+            self.assertFalse(list(self.base.glob("evidence-*")))
 
     def test_wait_slices_deliver_partial_stdin_once_and_keep_default_final_json(self):
         task = ("ARTIFICIAL-PRIVATE-TASK 雪 `touch injected`\n" * 1200).encode()
