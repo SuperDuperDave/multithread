@@ -23,6 +23,7 @@ from .protocol import (
     RelayError,
     ValidationError,
     session_target,
+    canonical_target,
     WAKE_CONCLUSIONS,
     WAKE_PROVIDERS,
     WAKE_REQUESTS,
@@ -382,7 +383,7 @@ def _dispatch(store: RelayStore, args: argparse.Namespace) -> Any:
         return store.emit(_read_json_object(sys.stdin.buffer))
     if args.command == "signal":
         agent, session = _actor(args)
-        target = args.target
+        target = canonical_target(args.target)
         if args.target_session is not None:
             if target is None:
                 raise ValidationError("--target-session requires --target agent")
@@ -841,7 +842,7 @@ def _handoff_event_id(
         "session": session.strip(),
         "artifact": artifact.strip(),
         "work_id": work_id.strip() if work_id is not None else None,
-        "target": target.strip() if target is not None else None,
+        "target": canonical_target(target),
         "scope": scope.strip() if scope is not None else None,
     }
     digest = hashlib.sha256(

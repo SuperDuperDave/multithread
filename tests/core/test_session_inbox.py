@@ -121,6 +121,21 @@ class SessionInboxTests(fixtures.RelayTestCase):
                     self.handoff(store, 2, target)
             self.assertEqual(before, store.events())
 
+    def test_exact_handoff_retries_share_identity_across_target_spellings(self):
+        arguments = ("signal", "work.handoff", "--agent", "sender", "--session", "author",
+                     "--artifact", "sha256:" + "a" * 64, "--summary", "Same exact handoff")
+        results = []
+        for recipient in (("--target", json.dumps(["codex", "one"])),
+                          ("--target", session_target("codex", "one")),
+                          ("--target", "codex", "--target-session", "one")):
+            result = self.run_cli(*arguments, *recipient)
+            self.assertEqual(0, result.returncode, result.stderr)
+            results.append(json.loads(result.stdout))
+        self.assertEqual([False, True, True], [result["duplicate"] for result in results])
+        self.assertEqual(1, len({result["event"]["seq"] for result in results}))
+        changed = self.run_cli(*arguments[:-1], "Changed handoff", "--target", json.dumps(["codex", "one"]))
+        self.assertNotEqual(0, changed.returncode, "summary drift must conflict with the same handoff identity")
+
     def test_long_valid_session_keeps_generic_inbox_and_ack_compatible(self):
         session = "s" * 200
         with self.open_store() as store:

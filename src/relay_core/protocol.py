@@ -360,6 +360,20 @@ def session_target(agent: Any, session: Any) -> str:
     return json.dumps([canonical_agent(agent), canonical_agent(session)], separators=(",", ":"))
 
 
+def canonical_target(value: Any) -> str | None:
+    """Normalize exact recipients before deriving events or retry identities."""
+    target = _optional_line("target", value, 4096)
+    if target is not None and target.startswith("["):
+        try:
+            pair = json.loads(target)
+        except ValueError as exc:
+            raise ValidationError("exact target must be a JSON string containing an agent/session pair") from exc
+        if not isinstance(pair, list) or len(pair) != 2:
+            raise ValidationError("exact target must contain exactly an agent and session")
+        return session_target(*pair)
+    return _optional_line("target", target, 407)
+
+
 def canonical_work_id(value: Any) -> str:
     """Return one exact canonical work identifier for decision routing."""
 
@@ -570,17 +584,8 @@ def normalize_event(raw: Mapping[str, Any], *, internal: bool = False) -> Event:
     work_id = _optional_identifier("work_id", raw.get("work_id"))
     if kind == "work.intent" and work_id is None:
         raise ValidationError("work.intent requires a stable work_id")
-    # An exact recipient contains two individually bounded 200-character
-    # identifiers and one separator. Keep that pair representable.
-    target = _optional_line("target", raw.get("target"), 407)
-    if target is not None and target.startswith("["):
-        try:
-            pair = json.loads(target)
-        except ValueError as exc:
-            raise ValidationError("exact target must be a JSON string containing an agent/session pair") from exc
-        if not isinstance(pair, list) or len(pair) != 2:
-            raise ValidationError("exact target must contain exactly an agent and session")
-        target = session_target(*pair)
+    # Two 200-character identifiers plus compact JSON delimiters: at most 407.
+    target = canonical_target(raw.get("target"))
     scope = _optional_line("scope", raw.get("scope"), 240)
     artifact = _optional_line("artifact", raw.get("artifact"), 200)
     if artifact is not None and not _ARTIFACT_RE.fullmatch(artifact):
