@@ -38,7 +38,7 @@ class LaunchError(Exception):
 
 
 def _hook_events(client):
-    return ["SessionStart", "UserPromptSubmit", "Stop", "SessionEnd"] + (
+    return ["SessionStart", "UserPromptSubmit", "PostToolUse", "Stop", "SessionEnd"] + (
         ["Interrupt"] if client == "codex" else [])
 
 
@@ -144,6 +144,17 @@ def prepare(client, repo, relay, provider):
                           "the repository you want Multithread in, enroll it with: "
                           + shlex.join([launcher, "setup", "--repo", str(checkout), "--apply"]))
     if result.returncode != 0:
+        # The checkout supplied by this caller is safe to name. Keep arbitrary
+        # launcher diagnostics out of plans while exposing this common refusal.
+        info = checkout.lstat()
+        mode = stat.S_IMODE(info.st_mode)
+        if stat.S_ISDIR(info.st_mode) and mode & 0o022:
+            raise LaunchError(
+                f"Multithread refused launch preparation; checkout {str(checkout)!r} has mode {mode:04o} "
+                "(group/world writable). No provider was started. Tighten only this directory with: "
+                + shlex.join(["chmod", "g-w,o-w", str(checkout)])
+                + "; then inspect readiness with: "
+                + shlex.join([launcher, "setup", "--repo", str(checkout), "--check"]))
         # Give the exact native command for diagnosis without copying arbitrary
         # diagnostics into the structured launch plan.
         raise LaunchError(

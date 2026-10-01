@@ -24,7 +24,7 @@ class ClaudeIntegrationTests(unittest.TestCase):
     def invoke(self, steps, *, update=False, closure_fault=False, progress_only=False):
         hook = shlex.join([str(self.relay), '--repo', str(self.repo), 'provider-hook', '--client', 'claude'])
         hooks = {event: [{'hooks': [{'type': 'command', 'command': hook, 'timeout': 3}]}]
-                 for event in ('SessionStart', 'UserPromptSubmit', 'Stop', 'SessionEnd')}
+                 for event in ('SessionStart', 'UserPromptSubmit', 'PostToolUse', 'Stop', 'SessionEnd')}
         plan = {'schema': 1, 'provider': 'claude', 'repo': str(self.repo), 'hook_command': hook,
                 'native_arguments': ['--settings', json.dumps({'hooks': hooks})],
                 'launches_provider': False, 'changes_provider_settings': False, 'changes_permissions': False}

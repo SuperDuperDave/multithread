@@ -28,7 +28,7 @@ with pathlib.Path("/tmp/fake-native-calls.txt").open("a") as calls:
     calls.write("called\n")
 settings = json.loads(args.settings)
 assert set(settings) == {"hooks"}
-names = ("SessionStart", "UserPromptSubmit", "Stop", "SessionEnd")
+names = ("SessionStart", "UserPromptSubmit", "PostToolUse", "Stop", "SessionEnd")
 assert set(settings["hooks"]) == set(names)
 contexts = {}
 for name in names:
@@ -50,6 +50,12 @@ for name in names:
         assert context["hookEventName"] == name
         assert "MULTITHREAD AGENT CONTRACT v1" in context["additionalContext"]
         assert args.session_id in context["additionalContext"]
+        assert "Preserve this pending handoff" in context["additionalContext"]
+        contexts[name] = context["additionalContext"]
+    elif name == "PostToolUse":
+        context = json.loads(completed.stdout)["hookSpecificOutput"]
+        assert context["hookEventName"] == name
+        assert "MULTITHREAD PENDING v1" in context["additionalContext"]
         assert "Preserve this pending handoff" in context["additionalContext"]
         contexts[name] = context["additionalContext"]
     else:
@@ -212,8 +218,8 @@ assert pathlib.Path("/tmp/fake-native-calls.txt").read_text() == "called\n"
 assert not pathlib.Path("/tmp/peer-shell-canary").exists()
 receipt = json.loads(pathlib.Path("/tmp/fake-native-receipt.json").read_text())
 assert receipt["session_id"] == peer["session_id"] and receipt["inherited_environment"] is True
-assert receipt["hooks_executed"] == ["SessionStart", "UserPromptSubmit", "Stop", "SessionEnd"]
-assert set(receipt["contexts"]) == {"SessionStart", "UserPromptSubmit"}
+assert receipt["hooks_executed"] == ["SessionStart", "UserPromptSubmit", "PostToolUse", "Stop", "SessionEnd"]
+assert set(receipt["contexts"]) == {"SessionStart", "UserPromptSubmit", "PostToolUse"}
 assert all(len(context.encode("utf-8")) <= 8192 for context in receipt["contexts"].values())
 events = call(base + ["events"])
 assert events[:2] == before_events and len(events) == 5, events

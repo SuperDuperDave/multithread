@@ -66,7 +66,7 @@ class ProviderConfigTests(unittest.TestCase):
             [launcher, *([] if client == "codex" else ["--repo", str(self.fixture.repo)]),
              "provider-hook", "--client", client],
             shlex.split(value["hook_command"]))
-        events = ["SessionStart", "UserPromptSubmit", "Stop", "SessionEnd"]
+        events = ["SessionStart", "UserPromptSubmit", "PostToolUse", "Stop", "SessionEnd"]
         if client == "codex":
             events.append("Interrupt")
         self.assertEqual(events, value["events"])

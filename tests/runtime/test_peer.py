@@ -40,7 +40,7 @@ class PeerTests(unittest.TestCase):
                             "RELAY_TEST_NATIVE_ENVIRONMENT": "ordinary inherited fixture"}
         hook = shlex.join([str(self.relay), "--repo", str(self.repo), "provider-hook", "--client", "claude"])
         hooks = {event: [{"hooks": [{"type": "command", "command": hook, "timeout": 3}]}]
-                 for event in ("SessionStart", "UserPromptSubmit", "Stop", "SessionEnd")}
+                 for event in ("SessionStart", "UserPromptSubmit", "PostToolUse", "Stop", "SessionEnd")}
         self.native_arguments = ["--settings", json.dumps({"hooks": hooks})]
         plan = {"schema": 1, "provider": "claude", "repo": str(self.repo), "hook_command": hook,
                 "native_arguments": self.native_arguments, "launches_provider": False,

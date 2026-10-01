@@ -30,7 +30,7 @@ _MODEL_LIST_SECONDS = 10
 # Where a setting the call does not request comes from: Codex keeps a thread's settings.
 _KEPT = {"new_thread": "the new thread's configured", "resumed_thread": "this thread's current"}
 _CLIENT_INFO = {"name": "multithread", "title": "Multithread", "version": "0.4.1"}
-_HOOK_EVENTS = ("sessionStart", "userPromptSubmit", "stop", "sessionEnd", "interrupt")
+_HOOK_EVENTS = ("sessionStart", "userPromptSubmit", "postToolUse", "stop", "sessionEnd", "interrupt")
 # Statuses a person resolves in Codex's /hooks review; any other is configuration.
 _REVIEWABLE = frozenset({"untrusted", "modified", "disabled"})
 
@@ -124,7 +124,7 @@ def hook_remedy(readiness, repo, expected_hook, user_file=None):
         # User-level hooks: the person chose how trust is recorded at setup.
         if readiness["state"] == "needs_review":
             action = ("Codex skips these user-level hooks until they are trusted. Either the person opens /hooks in "
-                      "a Codex terminal and trusts the five Multithread hooks from " + str(user_file) + " running "
+                      "a Codex terminal and trusts the six Multithread hooks from " + str(user_file) + " running "
                       + expected_hook + ", or, if the person chose agent-assisted trust, an agent runs "
                       + shlex.join([launcher, "hooks", "trust"]) + " and shows them its plan before recording it.")
         else:
@@ -133,7 +133,7 @@ def hook_remedy(readiness, repo, expected_hook, user_file=None):
         return "Codex hooks are not ready (" + detail + ")", action
     if readiness["state"] == "needs_review":
         action = ("In their own terminal, the person reviews once in Codex: run " + shlex.join(launch) + ", type launch, open /hooks "
-                  "and trust the five Multithread hooks running " + expected_hook
+                  "and trust the six Multithread hooks running " + expected_hook
                   + ". That review covers every enrolled checkout and worktree.")
         if "modified" in statuses:
             action += (" Modified means Codex last trusted a different command in that slot, such as an"

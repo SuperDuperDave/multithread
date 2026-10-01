@@ -31,13 +31,13 @@ from . import account_launcher, codex_peer
 from .native_io import ProtocolError
 
 
-EVENTS = {"codex": ("SessionStart", "UserPromptSubmit", "Stop", "SessionEnd", "Interrupt"),
-          "claude": ("SessionStart", "UserPromptSubmit", "Stop", "SessionEnd")}
+EVENTS = {"codex": ("SessionStart", "UserPromptSubmit", "PostToolUse", "Stop", "SessionEnd", "Interrupt"),
+          "claude": ("SessionStart", "UserPromptSubmit", "PostToolUse", "Stop", "SessionEnd")}
 _NAMES = {"codex": "Codex", "claude": "Claude Code"}
 _LABELS = {"SessionStart": "session_start", "UserPromptSubmit": "user_prompt_submit",
-           "Stop": "stop", "SessionEnd": "session_end", "Interrupt": "interrupt"}
+           "PostToolUse": "post_tool_use", "Stop": "stop", "SessionEnd": "session_end", "Interrupt": "interrupt"}
 _LISTED = {"SessionStart": "sessionStart", "UserPromptSubmit": "userPromptSubmit",
-           "Stop": "stop", "SessionEnd": "sessionEnd", "Interrupt": "interrupt"}
+           "PostToolUse": "postToolUse", "Stop": "stop", "SessionEnd": "sessionEnd", "Interrupt": "interrupt"}
 _TIMEOUT = 3
 _MAX_FILE = 1024 * 1024
 _MAX_SESSIONS = 64
@@ -761,7 +761,7 @@ def manual_steps(installed=None):
         "Open a terminal. Codex's terminal /hooks review records trust; the desktop app's hook screen may not "
         "(openai/codex#47283).",
         "Run codex in your home directory; no task is needed.",
-        "Type /hooks. For SessionStart, UserPromptSubmit, Stop, SessionEnd and Interrupt, trust the hook from "
+        "Type /hooks. For SessionStart, UserPromptSubmit, PostToolUse, Stop, SessionEnd and Interrupt, trust the hook from "
         + installed["file"] + " whose command is exactly: " + installed["command"],
         "Leave other hooks as you choose; Multithread did not install them.",
         "Quit Codex, then run: " + shlex.join(_launcher_command("hooks", "status")),
