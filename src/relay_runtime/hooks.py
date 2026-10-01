@@ -233,9 +233,9 @@ def delivery(client, environ=None):
     """
     state = inspect(client, environ)
     if state["state"] == "installed":
+        missing = [event for event in _OPTIONAL_EVENTS if state["events"][event]["state"] == "missing"]
         return {"source": "user", "file": state["file"], "command": state["command"],
-                "optional_events_missing": [event for event in _OPTIONAL_EVENTS
-                                            if state["events"][event]["state"] == "missing"],
+                **({"optional_events_missing": missing} if missing else {}),
                 **({"effective": state["effective"], "note": _disabled_note(state)} if "effective" in state else {})}
     if state["state"] in ("absent", "provider_not_found"):
         return {"source": "session_flags", "file": None, "command": None}
