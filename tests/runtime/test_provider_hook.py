@@ -671,3 +671,154 @@ class PendingReminderCacheTests(unittest.TestCase):
         before = snapshot(self.directory)
         self.assertEqual(self.body, self.remind())
         self.assertEqual(before, snapshot(self.directory))
+
+    def cache_receipt(self, index, at=90, **extra):
+        self.directory.mkdir(mode=0o700, exist_ok=True)
+        (self.directory / ".lock").touch(mode=0o600, exist_ok=True)
+        path = self.directory / (format(index, "064x") + ".json")
+        path.touch(mode=0o600)
+        path.write_text(json.dumps({"at": at, "fingerprint": "a" * 64, **extra}))
+        return path
+
+    def test_full_expired_cache_recovers_capacity_and_suppresses_new_session(self):
+        original = {self.cache_receipt(index) for index in range(127)}
+        self.assertEqual(self.body, self.remind())
+        retained = set(self.directory.glob("*.json"))
+        self.assertEqual(127, len(retained))
+        self.assertEqual(126, len(original & retained), "retire only one receipt per new identity")
+        self.assertEqual("{}", self.remind(now=101))
+        self.assertEqual(retained, set(self.directory.glob("*.json")))
+
+    def test_full_active_or_future_cache_repeats_notice_without_writes(self):
+        for index in range(127):
+            self.cache_receipt(index, at=101 if index % 2 else 110)
+        before = snapshot(self.directory)
+        self.assertEqual(self.body, self.remind(now=109))
+        self.assertEqual(before, snapshot(self.directory))
+        self.assertEqual(self.body, self.remind(now=100), "clock reversal must preserve receipts")
+        self.assertEqual(before, snapshot(self.directory))
+
+    def test_expiry_preserves_unrecognized_malformed_active_and_unsafe_entries(self):
+        index = 0
+        for stamp in (True, False, float("nan"), float("inf"), float("-inf"), 10 ** 400, 101, 111):
+            self.cache_receipt(index, at=stamp)
+            index += 1
+        self.cache_receipt(index, retained="SYNTHETIC_EXTRA_CONTENT")
+        index += 1
+        for malformed in ("{broken", "null", "[]", '{"at":90,"fingerprint":"invalid"}',
+                          '{"at":90,"at":90,"fingerprint":"' + "a" * 64 + '"}'):
+            self.cache_receipt(index).write_text(malformed)
+            index += 1
+        oversized = self.cache_receipt(index)
+        oversized.write_text(oversized.read_text() + " " * 512)
+        index += 1
+        self.cache_receipt(index).chmod(0o644)
+        index += 1
+        protected = self.root / "protected"
+        protected.touch(mode=0o600)
+        protected.write_text(json.dumps({"at": 90, "fingerprint": "a" * 64}))
+        for kind in ("symlink", "hardlink", "directory", "fifo"):
+            path = self.directory / (format(index, "064x") + ".json")
+            if kind == "symlink":
+                path.symlink_to(protected)
+            elif kind == "hardlink":
+                os.link(protected, path)
+            elif kind == "directory":
+                path.mkdir(mode=0o700)
+            else:
+                os.mkfifo(path, 0o600)
+            index += 1
+        uppercase = self.directory / ("B" * 64 + ".json")
+        uppercase.touch(mode=0o600)
+        uppercase.write_text(json.dumps({"at": 90, "fingerprint": "a" * 64}))
+        index += 1
+        while index < 126:
+            (self.directory / ("unrelated-" + str(index))).write_text("retained synthetic file")
+            index += 1
+        victim = self.cache_receipt(index)
+        before = snapshot(self.root)
+        self.assertEqual(self.body, self.remind())
+        self.assertFalse(victim.exists())
+        after = snapshot(self.root)
+        for name, value in before.items():
+            if name not in (".", str(self.directory.relative_to(self.root)), str(victim.relative_to(self.root))):
+                self.assertEqual(value, after[name], name)
+        self.assertEqual(128, len(list(self.directory.iterdir())), "127 receipts plus lock")
+        self.assertEqual("{}", self.remind(now=101))
+
+    def test_capacity_recovery_respects_lock_and_directory_protections(self):
+        for index in range(127):
+            self.cache_receipt(index)
+        lock = self.directory / ".lock"
+        for path, mode in ((self.directory, 0o700), (lock, 0o600)):
+            path.chmod(0o755 if path == self.directory else 0o644)
+            before = snapshot(self.directory)
+            self.assertEqual(self.body, self.remind())
+            self.assertEqual(before, snapshot(self.directory))
+            path.chmod(mode)
+        with lock.open("r+") as held:
+            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            before = snapshot(self.directory)
+            self.assertEqual(self.body, self.remind())
+            self.assertEqual(before, snapshot(self.directory))
+
+    def test_capacity_recovery_rejects_other_owner_and_changed_receipt(self):
+        from unittest import mock
+        victim = self.cache_receipt(0)
+        for index in range(1, 127):
+            self.cache_receipt(index, at=101)
+        original_fstat = os.fstat
+        victim_inode = victim.stat().st_ino
+
+        def wrong_owner(fd):
+            info = original_fstat(fd)
+            if info.st_ino == victim_inode:
+                fields = list(info)
+                fields[4] = os.getuid() + 1
+                return os.stat_result(fields)
+            return info
+
+        before = snapshot(self.directory)
+        with mock.patch.object(runtimecli.os, "fstat", side_effect=wrong_owner):
+            self.assertEqual(self.body, self.remind())
+        self.assertEqual(before, snapshot(self.directory))
+        original_receipt = runtimecli._reminder_receipt
+
+        def changed_after_read(fd):
+            prior = original_receipt(fd)
+            if original_fstat(fd).st_ino == victim_inode:
+                victim.chmod(0o644)
+            return prior
+
+        with mock.patch.object(runtimecli, "_reminder_receipt", side_effect=changed_after_read):
+            self.assertEqual(self.body, self.remind())
+        self.assertTrue(victim.exists(), "a changed receipt must not be unlinked")
+
+    def test_capacity_scan_and_reads_are_bounded_and_oversized_cache_is_preserved(self):
+        from unittest import mock
+        for index in range(127):
+            self.cache_receipt(index, at=101)
+        before = snapshot(self.directory)
+        with mock.patch.object(runtimecli.os, "read", wraps=os.read) as reads:
+            self.assertEqual(self.body, self.remind())
+            self.assertEqual(127, reads.call_count)
+            self.assertTrue(all(call.args[1] == 512 for call in reads.call_args_list))
+        self.assertEqual(before, snapshot(self.directory))
+        for index in (127, 128):
+            self.cache_receipt(index)
+            before = snapshot(self.directory)
+            with mock.patch.object(runtimecli.os, "read", wraps=os.read) as reads:
+                self.assertEqual(self.body, self.remind())
+                reads.assert_not_called()
+            self.assertEqual(before, snapshot(self.directory))
+
+    def test_nonfinite_or_boolean_receipt_times_never_suppress_notice(self):
+        self.assertEqual(self.body, self.remind(now=1))
+        cache = next(self.directory.glob("*.json"))
+        value = json.loads(cache.read_text())
+        for stamp in (True, float("nan"), float("inf"), float("-inf"), 10 ** 400):
+            cache.write_text(json.dumps({**value, "at": stamp}))
+            self.assertEqual(self.body, self.remind(now=2))
+            before = snapshot(self.directory)
+            self.assertEqual(self.body, self.remind(now=stamp))
+            self.assertEqual(before, snapshot(self.directory), "invalid clocks must not write receipts")

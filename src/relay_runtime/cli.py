@@ -10,6 +10,7 @@ import fcntl
 from contextlib import contextmanager
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import pwd
@@ -384,6 +385,31 @@ def _worker(access, args, argv):
     return core_cli.main(argv)
 
 
+def _reminder_receipt(cache):
+    """Read only the bounded, private format owned by the ephemeral cache."""
+    def unique(pairs):
+        if len({key for key, _ in pairs}) != len(pairs):
+            raise ValueError("repeated receipt field")
+        return dict(pairs)
+
+    held = os.fstat(cache)
+    if not stat.S_ISREG(held.st_mode) or held.st_uid != os.getuid() \
+            or stat.S_IMODE(held.st_mode) != 0o600 or held.st_nlink != 1 or held.st_size > 512:
+        return None
+    try:
+        prior = json.loads(os.read(cache, 512), object_pairs_hook=unique)
+        if not isinstance(prior, dict) or set(prior) != {"at", "fingerprint"}:
+            return None
+        stamp, fingerprint = prior["at"], prior["fingerprint"]
+        if type(stamp) not in (int, float) or not math.isfinite(stamp) \
+                or not isinstance(fingerprint, str) or len(fingerprint) != 64 \
+                or any(character not in "0123456789abcdef" for character in fingerprint):
+            return None
+    except (ValueError, UnicodeError, OverflowError):
+        return None
+    return prior
+
+
 def _reminder_output(body, args, *, cache_root="/tmp", now=None, repository_identity=None):
     """Suppress identical reminders briefly; ephemeral cache never represents delivery."""
     try:
@@ -414,6 +440,8 @@ def _reminder_output(body, args, *, cache_root="/tmp", now=None, repository_iden
                     return body
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 moment = time.time() if now is None else now
+                if type(moment) not in (int, float) or not math.isfinite(moment):
+                    return body
                 entries = []
                 with os.scandir(directory) as listing:
                     for entry in listing:
@@ -425,9 +453,35 @@ def _reminder_output(body, args, *, cache_root="/tmp", now=None, repository_iden
                 repository = repository_identity or os.path.realpath(args.repo or os.getcwd())
                 identity = json.dumps([repository, args.client, args.provider_payload["session_id"]])
                 key = hashlib.sha256(identity.encode()).hexdigest() + ".json"
-                # Bound cache growth without pruning ledger/evidence or following links.
-                if key not in entries and len(entries) >= 127:
+                # Retire at most one validated expired receipt, never arbitrary files.
+                # The bounded listing also bounds reads; the lock never blocks hooks.
+                if key not in entries and len(entries) > 127:
                     return body
+                if key not in entries and len(entries) >= 127:
+                    for candidate in entries:
+                        if len(candidate) != 69 or not candidate.endswith(".json") \
+                                or any(character not in "0123456789abcdef" for character in candidate[:-5]):
+                            continue
+                        try:
+                            expired = os.open(candidate, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                                              dir_fd=directory)
+                            try:
+                                held = os.fstat(expired)
+                                prior = _reminder_receipt(expired)
+                                if prior is None or moment - prior["at"] < 10:
+                                    continue
+                                current = os.stat(candidate, dir_fd=directory, follow_symlinks=False)
+                                if held[:7] != current[:7] or held.st_mtime_ns != current.st_mtime_ns \
+                                        or held.st_ctime_ns != current.st_ctime_ns:
+                                    continue
+                                os.unlink(candidate, dir_fd=directory)
+                                break
+                            finally:
+                                os.close(expired)
+                        except OSError:
+                            continue
+                    else:
+                        return body
                 cache = os.open(key, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
                                 0o600, dir_fd=directory)
                 try:
@@ -436,13 +490,8 @@ def _reminder_output(body, args, *, cache_root="/tmp", now=None, repository_iden
                             or stat.S_IMODE(held.st_mode) != 0o600 or held.st_nlink != 1:
                         return body
                     fingerprint = hashlib.sha256(context.encode()).hexdigest()
-                    try:
-                        prior = json.loads(os.read(cache, 512))
-                    except (ValueError, UnicodeError):
-                        prior = {}
-                    if not isinstance(prior, dict):
-                        prior = {}
-                    if prior.get("fingerprint") == fingerprint and isinstance(prior.get("at"), (int, float)) \
+                    prior = _reminder_receipt(cache) or {}
+                    if prior.get("fingerprint") == fingerprint \
                             and 0 <= moment - prior["at"] < 10:
                         return "{}"
                     payload = json.dumps({"at": moment, "fingerprint": fingerprint}).encode()
@@ -455,7 +504,7 @@ def _reminder_output(body, args, *, cache_root="/tmp", now=None, repository_iden
                 os.close(lock)
         finally:
             os.close(directory)
-    except (OSError, ValueError, KeyError, TypeError):
+    except (OSError, ValueError, KeyError, TypeError, OverflowError):
         # Failure permits repeated context. This is never an ACK or an empty-ledger claim.
         return body
     return body

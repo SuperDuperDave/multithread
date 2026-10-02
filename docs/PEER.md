@@ -204,6 +204,11 @@ interactive confirmation prompt. Provider usage must already be authorized.
 Task text goes through stdin as data, never shell evaluation or command-line
 prompt interpolation. Use `--task-file -` to supply it from stdin directly.
 
+A fresh Claude dry run generates an illustrative session UUID for its plan;
+it does not reserve that session. Executing the command generates a new UUID.
+Use the actual call's verified `session_id` for any follow-up, rather than the
+dry-run UUID. A dry run with `--resume` keeps the exact identity you supplied.
+
 The task limit is 64 KiB. Larger artifacts belong in the repository and can be
 referenced by the task. The default timeout is 600 seconds; use `--timeout`
 with an integer from 1 through 3600 seconds to adjust it for the work.
