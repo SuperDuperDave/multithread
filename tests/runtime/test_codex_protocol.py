@@ -1099,7 +1099,10 @@ class CodexProtocolTests(unittest.TestCase):
 
     def test_unterminated_oversized_jsonl_is_bounded_and_uncertain(self):
         self.configure(oversized_line=17 * 1024 * 1024)
-        result = self.assert_attention(self.invoke())
+        # Allow the bulk witness to reach the byte cap under load; an earlier
+        # wall-time refusal is legitimate but does not exercise this boundary.
+        result = self.assert_attention(self.invoke("--timeout", "15"))
+        self.assertIn("Native output exceeded its bound", result["message"])
         self.assertIsNotNone(result.get("stdout_observation"))
         self.assertLessEqual(result["stdout_observation"]["bytes"], 16 * 1024 * 1024 + 1)
         self.assertTrue(result["stdout_observation"]["truncated"])
