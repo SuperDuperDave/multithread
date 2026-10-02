@@ -323,13 +323,25 @@ admission._GuardedConnection.execute = crash
         before = len(self.success("events"))
         self.assertEqual(generation, self.success("wake-ledger", "show", "operator")["bindings"][0]["generation"])
         self.assertEqual("ready", self.success(*plan)["status"])
+        expected = ("--expect-generation", str(generation), "--expect-provider", "codex", "--expect-thread", thread)
+        self.assertEqual("ready", self.success(*plan, *expected)["status"])
+        partial = self.command(*plan, "--expect-generation", str(generation))
+        self.assertEqual(64, partial.returncode)
+        self.assertIn("expected binding", partial.stderr)
+        wrong = (*expected[:-1], "b0000000-0000-7000-8000-000000000002")
+        for action in ("plan", "begin"):
+            refused = self.command("wake-ledger", action, *plan[2:], *wrong,
+                                   *(actor if action == "begin" else ()))
+            self.assertEqual(73, refused.returncode)
+            self.assertIn("wake recipient binding changed", refused.stderr)
         self.assertFalse(self.success("wake-ledger", "observed", thread)["observed"])
         self.assertEqual(before, len(self.success("events")), "reads run in the read-only worker")
-        begun = self.success("wake-ledger", "begin", *plan[2:], *actor)
+        begun = self.success("wake-ledger", "begin", *plan[2:], *actor, *expected)
         self.assertEqual("begun", begun["status"])
         self.success("wake-ledger", "conclude", str(begun["attempt_seq"]), *actor, "--outcome", "uncertain",
                      "--reason", "no_answer", "--transport", "steer")
         self.assertEqual("already_sent", self.success(*plan)["status"])
+        self.assertEqual("already_sent", self.success(*plan, *expected)["status"])
         self.success("pause", "operator", *actor)
         self.assertEqual("paused", self.success("wake-ledger", "show")["bindings"][0]["state"])
         forged = self.command("emit", stdin=json.dumps({
@@ -338,10 +350,12 @@ admission._GuardedConnection.execute = crash
         self.assertNotEqual(0, forged.returncode)
         self.assertIn("emitted only by a dedicated Multithread transaction", forged.stderr)
         self.assertEqual("paused", self.success("wake-ledger", "show")["bindings"][0]["state"])
-        self.success("wake-ledger", "bind", "reviewer", *actor, "--provider", "claude", "--endpoint",
-                     "unix:///run/user/1000/cc-socks/7739.sock")
+        claude = self.success("wake-ledger", "bind", "reviewer", *actor, "--provider", "claude", "--endpoint",
+                              "unix:///run/user/1000/cc-socks/7739.sock")
+        owner = ("--expect-generation", str(claude["binding"]["generation"]), "--expect-provider", "claude",
+                 "--expect-bound-agent", "claude", "--expect-bound-session", "binder")
         inbox = self.success("wake-ledger", "begin", "reviewer", "--ref", str(generation), "--requested",
-                             "queue", *actor)
+                             "queue", *actor, *owner)
         concluded = self.success("wake-ledger", "conclude", str(inbox["attempt_seq"]), *actor, "--outcome",
                                  "delivered", "--reason", "inbox_accepted", "--transport", "inbox")
         self.assertEqual("delivered", concluded["event"]["meta"]["outcome"])

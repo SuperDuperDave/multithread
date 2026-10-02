@@ -25,8 +25,9 @@ import struct
 import subprocess
 import sys
 
-from relay_core.protocol import (ValidationError, canonical_agent, canonical_wake_message_id,
-                                 canonical_wake_ref, canonical_wake_role, canonical_wake_thread)
+from relay_core.protocol import (ValidationError, canonical_agent, canonical_wake_expectation,
+                                 canonical_wake_message_id, canonical_wake_ref,
+                                 canonical_wake_role, canonical_wake_thread)
 from . import account_launcher, hooks
 from .enrollment import NotEnrolled
 
@@ -439,6 +440,11 @@ def wake(args, ledger=launcher_ledger):
         ref = canonical_wake_ref(args.ref)
         if args.message_id is not None:
             canonical_wake_message_id(args.message_id)
+        fields = ("generation", "provider", "thread", "bound_agent", "bound_session")
+        expected_binding = canonical_wake_expectation({
+            field: getattr(args, "expect_" + field, None)
+            for field in fields if getattr(args, "expect_" + field, None) is not None
+        } or None)
     except ValidationError as exc:
         return _outcome("NOT SENT", f"The wake wasn't sent: {exc}.", "Correct that and run this again.")
     content = []
@@ -455,11 +461,17 @@ def wake(args, ledger=launcher_ledger):
         content = ["--ref-sha256", sha256, "--ref-size", str(size)]
 
     step = ["plan", role] if args.dry_run else ["begin", role, "--agent", agent, "--session", session]
+    expectation = [argument for field, value in (expected_binding or {}).items()
+                   for argument in ("--expect-" + field.replace("_", "-"), str(value))]
     code, decision, problem = ledger(repo, "wake-ledger", *step, "--ref", ref, "--requested", requested, *content,
-                                     *(["--id", args.message_id] if args.message_id else []))
+                                     *(["--id", args.message_id] if args.message_id else []), *expectation)
     if code != 0:
+        next_step = ("Read the role's binding again and reconcile the expected recipient deliberately; "
+                     "do not retry automatically."
+                     if code == 73 and expected_binding is not None
+                     else _ledger_next(code, repo, "run this again"))
         return _outcome("NOT SENT", f"The ledger at {repo} couldn't {'plan' if args.dry_run else 'record'} "
-                        f"this wake: {problem}. Nothing was sent.", _ledger_next(code, repo, "run this again"))
+                        f"this wake: {problem}. Nothing was sent.", next_step)
     status, binding, message_id = decision["status"], decision["binding"], decision["message_id"]
     base = {"role": role, "ref": ref, "requested": requested, "ledger": decision["ledger"],
             "message_id": message_id,
@@ -718,6 +730,11 @@ def wake_main(argv=None, *, ledger=launcher_ledger):
     parser.add_argument("--id", dest="message_id",
                         help="message id; default: derived from this ledger, the role, its binding and the ref")
     parser.add_argument("--dry-run", action="store_true", help="decide and report; send and record nothing")
+    parser.add_argument("--expect-generation", type=int, help="require this binding generation before recording or sending")
+    parser.add_argument("--expect-provider", choices=("codex", "claude"), help="expected recipient provider; requires generation and recipient")
+    parser.add_argument("--expect-thread", help="expected Codex conversation; requires generation and provider")
+    parser.add_argument("--expect-bound-agent", help="expected Claude binding's recorded owner agent; requires generation, provider and owner session")
+    parser.add_argument("--expect-bound-session", help="expected Claude binding's recorded owner session")
     parser.add_argument("--agent", help="sender named in the wake; default RELAY_AGENT")
     parser.add_argument("--session", help="sender's session for the ledger record; default RELAY_SESSION")
     parser.add_argument("--codex", help="absolute Codex executable for codex queue; default: PATH")
@@ -726,8 +743,10 @@ def wake_main(argv=None, *, ledger=launcher_ledger):
     args = parser.parse_args(argv)
     if not args.status and args.ref is None:
         parser.error("--ref is required unless --status is used")
-    if args.status and (args.steer or args.dry_run or args.message_id is not None):
-        parser.error("--status cannot be combined with --steer, --dry-run or --id")
+    if args.status and (args.steer or args.dry_run or args.message_id is not None
+                        or any(getattr(args, "expect_" + field) is not None for field in
+                               ("generation", "provider", "thread", "bound_agent", "bound_session"))):
+        parser.error("--status cannot be combined with --steer, --dry-run, --id or --expect-* flags")
     return _emit(wake_status(args, ledger) if args.status else wake(args, ledger), args.json)
 
 

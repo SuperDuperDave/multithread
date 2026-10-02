@@ -461,6 +461,35 @@ run them in, or of `--repo`.
   already sent under the old binding can be sent again. `--dry-run` decides and
   sends nothing.
 
+On unreleased main, callers can require the binding they inspected before a
+wake is admitted. Supply the complete provider-specific expectation:
+
+```sh
+multithread wake reviewer --ref /absolute/path/task.md \
+  --expect-generation <binding sequence> --expect-provider codex \
+  --expect-thread <conversation uuid> --agent claude --session <sender session>
+multithread wake reviewer --ref /absolute/path/task.md \
+  --expect-generation <binding sequence> --expect-provider claude \
+  --expect-bound-agent <recorded owner agent> --expect-bound-session <recorded owner session> \
+  --agent codex --session <sender session>
+```
+
+Codex requires generation, provider and exact thread UUID. Claude requires
+generation, provider and the recorded binding-owner pair; that pair does not
+independently verify who receives the inbox message. A partial or mixed
+expectation refuses before the task file is read or the ledger is opened.
+A missing or different binding returns `NOT SENT` before recording an attempt,
+deduplicating its id or contacting a provider. Read the binding again and
+reconcile deliberately; do not retry automatically. Omitting all expectation
+flags preserves existing wake behavior. A matching paused binding still refuses.
+
+The comparison and attempt record share one ledger write transaction.
+`--dry-run` checks the expectation without recording or reserving a later send;
+the real send checks again. Provider transport runs after the transaction and
+uses the admitted snapshot. A subsequent pause or rebind cannot cancel that
+transport or retarget the attempt. Admission and delivery confer no authority
+and do not establish consumption. `--status` cannot take expectation flags.
+
 | Status | Exit | Meaning |
 |---|---|---|
 | `STEERED` | 0 | Joined the running turn |
@@ -469,7 +498,7 @@ run them in, or of `--repo`.
 | `DRY RUN` | 0 | Decided; nothing sent or recorded |
 | `STATUS` | 0 | Read original-binding attempts and recorded consumption evidence; nothing sent, and recipient reachability/current turn state were not probed |
 | `ALREADY SENT` | 3 | This message id went out, or its earlier outcome is unknown; nothing sent |
-| `NOT SENT` | 4 | Nothing reached the conversation: the daemon was unreachable, refused to list the conversation's turns, or answered the turn list unreadably; the conversation is unknown; Codex couldn't be found or run, or `codex queue` refused before sending; the inbox is gone, failed its checks or refused the connection; the role is paused or unbound; or the arguments, the reference or the ledger couldn't be used. The same id is safe to retry |
+| `NOT SENT` | 4 | Nothing reached the conversation: the daemon was unreachable, refused to list the conversation's turns, or answered the turn list unreadably; the conversation is unknown; Codex couldn't be found or run, or `codex queue` refused before sending; the inbox is gone, failed its checks or refused the connection; the role is paused or unbound; or the arguments, expected binding, reference or ledger couldn't be used. Follow the stated remedy before deliberately retrying |
 | `UNCERTAIN` | 5 | Sent, with no receipt that it arrived: the daemon didn't answer the steer, or `codex queue` didn't finish; the steer drew an unreadable reply, an error that doesn't show it was refused before acceptance, or no receipt for the expected turn; `codex queue` printed no receipt for the bound conversation, or failed after starting; or the inbox connection dropped while sending. The id stays blocked; check with the recipient before sending again |
 
 Every result names the next step, as text or with `--json`.
