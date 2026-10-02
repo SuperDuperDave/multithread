@@ -94,6 +94,134 @@ class PeerTests(unittest.TestCase):
     def configure(self, **spec):
         self.response.write_text(json.dumps(spec))
 
+    def configure_hook(self, hook):
+        hooks = {event: [{"hooks": [{"type": "command", "command": hook, "timeout": 3}]}]
+                 for event in peer._hook_events("claude")}
+        self.native_arguments = ["--settings", json.dumps({"hooks": hooks})]
+        plan = {"schema": 1, "provider": "claude", "repo": str(self.repo), "hook_command": hook,
+                "native_arguments": self.native_arguments, "launches_provider": False,
+                "changes_provider_settings": False, "changes_permissions": False}
+        self.executable(self.relay, f"print({json.dumps(plan)!r})\n")
+
+    def test_shell_evaluation_and_ambiguous_syntax_refuse_before_native_or_evidence(self):
+        cases = (("semicolon", "checkout;touch${IFS}canary;#", False),
+                 ("command-substitution", "checkout-$(touch${IFS}canary)", True),
+                 ("parameter", "checkout-${SYNTHETIC}", True),
+                 ("backtick", "checkout-`touch${IFS}canary`", True),
+                 ("glob-star", "checkout*", False),
+                 ("glob-question", "checkout?", False),
+                 ("glob-bracket", "checkout[ab]", False),
+                 ("brace", "checkout{a,b}", False),
+                 ("tilde", "checkout~name", False),
+                 ("comment-marker", "checkout#name", False),
+                 ("double-quote-escape-mismatch", "checkout-\\$SYNTHETIC", True))
+        for label, name, double in cases:
+            self.repo = self.base / name
+            self.repo.mkdir()
+            argument = '"' + str(self.repo) + '"' if double else str(self.repo)
+            hook = f"{self.relay} --repo {argument} provider-hook --client claude"
+            # These examples passed the former token-only admission check.
+            self.assertEqual(peer.hook_argv(self.relay, "claude", self.repo), shlex.split(hook))
+            self.configure_hook(hook)
+            for dry in (True, False):
+                evidence = self.base / f"refused-{label}-{dry}"
+                with (self.subTest(case=label, dry=dry),
+                      mock.patch.object(peer, "check_native_arguments", side_effect=AssertionError(
+                          "unsafe hook reached native argument inspection")) as native,
+                      mock.patch.object(peer.user_hooks, "delivery", side_effect=AssertionError(
+                          "unsafe hook reached account hook inspection")) as delivery):
+                    code, result, _ = self.invoke(*(["--dry-run"] if dry else []), output=evidence)
+                self.assertEqual((1, "unavailable", "relay_configuration"),
+                                 (code, result["state"], result["unavailable_stage"]))
+                self.assertFalse(result["provider_started"])
+                self.assertIsNone(result["evidence_directory"])
+                self.assertIn("hook command", result["message"])
+                native.assert_not_called()
+                delivery.assert_not_called()
+                self.assertFalse(evidence.exists())
+                self.assertFalse(self.calls.exists())
+                self.assertFalse(self.receipt.exists())
+                self.assertFalse((self.base / "canary").exists())
+
+    def test_unsafe_hook_refuses_interactive_launch_before_prompt_or_provider(self):
+        hook = f'{self.relay} --repo "{self.repo}" provider-hook --client claude'
+        self.configure_hook(hook)
+        shown, errors = io.StringIO(), io.StringIO()
+        with (redirect_stdout(shown), redirect_stderr(errors),
+              mock.patch.dict(os.environ, self.environment, clear=True),
+              mock.patch.object(peer.sys, "stdin", mock.Mock(isatty=lambda: True)),
+              mock.patch("builtins.input", side_effect=AssertionError("unsafe hook prompted")) as prompt,
+              mock.patch.object(peer.subprocess, "call", side_effect=AssertionError(
+                  "unsafe hook started a provider")) as native,
+              mock.patch.object(peer.user_hooks, "delivery", side_effect=AssertionError(
+                  "unsafe hook inspected account settings")) as delivery):
+            code = peer.launch_main(["claude", "--repo", str(self.repo), "--multithread",
+                                     str(self.relay), "--provider", str(self.provider)])
+        self.assertEqual(1, code)
+        self.assertEqual("", shown.getvalue())
+        self.assertIn("quote shell metacharacters", errors.getvalue())
+        prompt.assert_not_called()
+        native.assert_not_called()
+        delivery.assert_not_called()
+        self.assertFalse(self.calls.exists())
+
+    def test_literal_hook_formats_match_shell_and_preserve_exact_native_text(self):
+        self.repo = self.base / "checkout ' 雪 ;$`*?[]{}~#\\\n\x1b\u202e"
+        self.repo.mkdir()
+        argv = peer.hook_argv(self.relay, "claude", self.repo)
+        canonical = shlex.join(argv)
+        double = lambda word: '"' + "".join("\\" + char if char in '$`"\\' else char
+                                           for char in word) + '"'
+        escaped = lambda word: "".join(char if char.isalnum() or char in "_./-" else "\\" + char
+                                        for char in word)
+        # The argv recorder witnesses shell semantics independently of the decoder.
+        recorder = self.base / "argv-recorder"
+        self.executable(recorder, "import json, sys\nprint(json.dumps(sys.argv[1:]))\n")
+        forms = (canonical,
+                 " \t" + "\t  ".join(shlex.quote(word) for word in argv) + "\t ",
+                 " ".join(double(word) for word in argv),
+                 shlex.quote(str(self.relay)) + " --repo " + shlex.quote(str(self.repo))
+                 + " pro'vider'\"-hook\" --cli\\ent claude")
+        for hook in forms:
+            with self.subTest(hook=hook):
+                self.assertEqual(argv, peer._literal_hook_argv(hook))
+                words = hook.replace(str(self.relay), str(recorder), 1)
+                shell = subprocess.run(["/bin/sh", "-c", words], cwd=self.base,
+                                       env=self.environment, capture_output=True, text=True, check=True)
+                self.assertEqual(argv[1:], json.loads(shell.stdout))
+                self.configure_hook(hook)
+                code, result, _ = self.invoke("--dry-run")
+                self.assertEqual((0, "call_prepared"), (code, result["state"]))
+                self.assertEqual(self.native_arguments, result["argv"][1:3])
+                self.assertFalse(self.calls.exists())
+        # Backslash quoting is safe outside quotes, except line continuation.
+        plain = self.base / "escaped ;$`*?[]{}~#雪"
+        plain.mkdir()
+        self.repo = plain
+        argv = peer.hook_argv(self.relay, "claude", self.repo)
+        hook = " ".join(escaped(word) for word in argv)
+        self.configure_hook(hook)
+        code, result, _ = self.invoke()
+        self.assertEqual((0, "returned"), (code, result["state"]))
+        self.assertEqual(self.native_arguments, json.loads(self.receipt.read_text())["argv"][1:3])
+
+    def test_literal_hook_rejects_separators_continuations_and_nul(self):
+        for command in ("a\nb", "a\rb", "a\vb", "a\\\nb", '"a\\\nb"',
+                        "a\0b", "'a\0b'", '"a\0b"', "'unfinished", '"unfinished', "a\\"):
+            with self.subTest(command=command), self.assertRaises(ValueError):
+                peer._literal_hook_argv(command)
+
+    def test_followup_retains_safely_escaped_launcher_entry(self):
+        self.relay = self.base / "multithread-$literal`entry`"
+        hook = '"' + str(self.relay).replace("$", "\\$").replace("`", "\\`") + '"'
+        hook += " --repo " + shlex.quote(str(self.repo)) + " provider-hook --client claude"
+        self.configure_hook(hook)
+        code, result, _ = self.invoke()
+        self.assertEqual((0, "returned"), (code, result["state"]))
+        prefix = result["follow_up_preparation"]["argv_prefix"]
+        self.assertEqual(str(self.relay), prefix[0])
+        self.assertEqual(str(self.relay), prefix[prefix.index("--multithread") + 1])
+
     def assert_argument_rejected(self, *extra):
         # A failed argument guard must stop the test, never discover an account's
         # provider or run launch preparation. Keep disposable paths and dry-run

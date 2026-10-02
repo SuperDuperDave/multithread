@@ -115,6 +115,65 @@ def configuration_command(launcher, checkout, client):
     return command
 
 
+def _literal_hook_argv(command):
+    """Decode literal shell words, refusing evaluation rather than emulating it.
+
+    Provider hooks execute shell text. shlex alone leaves expansions/operators
+    untouched and differs from the shell for some double-quoted escapes. Keep
+    ordinary quoting and spacing, but admit no shell program or line continuation.
+    """
+    if "\0" in command:
+        raise ValueError()
+    arguments, word = [], []
+    quote = None
+    started = False
+    index = 0
+    while index < len(command):
+        character = command[index]
+        if quote == "'":
+            if character == "'":
+                quote = None
+            else:
+                word.append(character)
+        elif character == "\\":
+            index += 1
+            if index == len(command) or command[index] == "\n":
+                raise ValueError()
+            escaped = command[index]
+            # Inside double quotes the shell retains a backslash unless it
+            # escapes dollar, backtick, quote or backslash (newline is refused).
+            if quote == '"' and escaped not in '$`"\\':
+                word.append("\\")
+            word.append(escaped)
+            started = True
+        elif quote == '"':
+            if character == '"':
+                quote = None
+            elif character in "$`":
+                raise ValueError()
+            else:
+                word.append(character)
+        elif character in " \t":
+            if started:
+                arguments.append("".join(word))
+                word = []
+                started = False
+        elif character in "'\"":
+            quote = character
+            started = True
+        elif character.isspace() or character in "$`;|&<>()*?[]{}~#!":
+            raise ValueError()
+        else:
+            word.append(character)
+            started = True
+        index += 1
+    if quote is not None:
+        raise ValueError()
+    if started:
+        arguments.append("".join(word))
+    return arguments
+
+
 def prepare(client, repo, relay, provider):
     if platform.system() != "Linux" or platform.machine() != "x86_64":
         raise LaunchError("This Multithread release requires a supported x86-64 Linux environment; see docs/SUPPORT.md.")
@@ -174,9 +233,11 @@ def prepare(client, repo, relay, provider):
     if not isinstance(hook_command, str):
         raise LaunchError("The configuration plan has an invalid hook command.")
     try:
-        hook = shlex.split(hook_command)
+        hook = _literal_hook_argv(hook_command)
     except ValueError:
-        raise LaunchError("The configuration plan has an invalid hook command.") from None
+        raise LaunchError("The configuration plan must use a literal hook command: quote shell "
+                          "metacharacters and separate arguments with spaces or tabs; no provider "
+                          "was started.") from None
     if hook != hook_argv(launcher, client, checkout):
         raise LaunchError("The hook command does not match the selected Multithread and checkout.")
     arguments = plan.get("native_arguments")
@@ -795,7 +856,7 @@ def _follow_up_preparation(args, plan, envelope):
     # prepare checked this exact hook against the selected launcher. Retain its
     # entry path, as well as the provider's entry, without resolving symlinks.
     # The account launcher is the default selection, so it needs no --multithread.
-    launcher = shlex.split(plan["relay_plan"]["hook_command"])[0]
+    launcher = _literal_hook_argv(plan["relay_plan"]["hook_command"])[0]
     entry = args.report_entry if args.report_entry is not None else [launcher, "peer"]
     selection = [] if launcher == str(account_launcher()) else ["--multithread", launcher]
     prefix = [*entry, args.client, "--repo", plan["repo"], *selection,
