@@ -416,7 +416,10 @@ class WakeOutcomeTests(WakeCase):
         self.assertIn("Nothing was sent", out)
 
     def test_status_refuses_send_options_and_send_still_requires_ref(self):
-        for extra in (("--status", "--steer"), ("--status", "--dry-run"), ("--status", "--id", "another"), ()):
+        for extra in (("--status", "--steer"), ("--status", "--dry-run"), ("--status", "--id", "another"),
+                      ("--status", "--expect-generation", "1"), ("--status", "--expect-provider", "codex"),
+                      ("--status", "--expect-thread", THREAD), ("--status", "--expect-bound-agent", "claude"),
+                      ("--status", "--expect-bound-session", "self"), ()):
             with self.subTest(extra=extra), redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as raised:
                 self.run_helper(wake.wake_main, "operator", *extra)
             self.assertEqual(2, raised.exception.code)
@@ -755,6 +758,112 @@ class WakeOutcomeTests(WakeCase):
                                     "--codex", str(self.codex), "--dry-run")
         self.assertEqual(0, code, out)
         self.assertTrue(out.startswith("DRY RUN: Would queue for operator"))
+
+
+class WakeAdmissionTests(WakeCase):
+    @staticmethod
+    def expected(generation, thread=THREAD):
+        return ("--expect-generation", str(generation), "--expect-provider", "codex", "--expect-thread", thread)
+
+    def test_complete_expectation_sends_once_and_keeps_existing_deduplication(self):
+        generation = self.bound()
+        result = self.wake(*self.expected(generation), "--id", "admitted-once")
+        self.assertEqual("QUEUED", result["status"])
+        begin = next(call[1] for call in self.ledger_calls if call[1][:2] == ("wake-ledger", "begin"))
+        for flag, value in zip(self.expected(generation)[::2], self.expected(generation)[1::2]):
+            self.assertEqual(value, begin[begin.index(flag) + 1])
+        attempt = self.events("wake.attempted")[0]
+        self.assertEqual((generation, "codex", THREAD),
+                         tuple(attempt["meta"][key] for key in ("generation", "provider", "thread")))
+        self.assertNotIn("expected_binding", attempt["meta"])
+        before = len(self.events()), self.daemon.connections, len(self.codex_calls())
+        self.assertEqual("ALREADY SENT", self.wake(*self.expected(generation), "--id", "admitted-once")["status"])
+        self.assertEqual(before, (len(self.events()), self.daemon.connections, len(self.codex_calls())))
+
+    def test_stale_generation_refuses_before_attempt_or_transport_even_for_a_sent_id(self):
+        generation = self.bound()
+        self.wake(*self.expected(generation), "--id", "previous-id")
+        self.daemon.threads[OTHER] = {"cwd": str(self.repo), "status": "idle", "turns": []}
+        self.assertEqual(0, self.handover()[0])
+        before = len(self.events()), self.daemon.connections, len(self.codex_calls())
+        refused = self.wake(*self.expected(generation), "--id", "previous-id", "--steer")
+        self.assertEqual((4, "NOT SENT"), (refused["exit_code"], refused["status"]))
+        self.assertIn("do not retry automatically", refused["next"])
+        self.assertNotIn("prior", refused)
+        self.assertEqual(before, (len(self.events()), self.daemon.connections, len(self.codex_calls())))
+
+    def test_changed_thread_or_provider_refuses_before_attempt_and_transport(self):
+        generation = self.bound()
+        before = len(self.events()), self.daemon.connections, len(self.codex_calls())
+        for expectation in (self.expected(generation, OTHER),
+                            ("--expect-generation", str(generation), "--expect-provider", "claude",
+                             "--expect-bound-agent", "claude", "--expect-bound-session", "binder")):
+            with self.subTest(expectation=expectation):
+                refused = self.wake(*expectation, "--steer")
+                self.assertEqual("NOT SENT", refused["status"])
+                self.assertIn("reconcile the expected recipient deliberately", refused["next"])
+                self.assertEqual(before, (len(self.events()), self.daemon.connections, len(self.codex_calls())))
+
+    def test_missing_binding_is_a_conflict_when_an_expectation_is_supplied(self):
+        refused = self.wake(*self.expected(1))
+        self.assertEqual("NOT SENT", refused["status"])
+        self.assertIn("do not retry automatically", refused["next"])
+        self.assertEqual([], self.events())
+        self.assertEqual(0, self.daemon.connections)
+        self.assertEqual([], self.codex_calls())
+
+    def test_dry_run_asserts_without_writes_but_does_not_reserve_a_later_admission(self):
+        generation = self.bound()
+        before = len(self.events())
+        self.assertEqual("DRY RUN", self.wake(*self.expected(generation), "--dry-run")["status"])
+        self.assertEqual(before, len(self.events()))
+        self.assertEqual([], self.codex_calls())
+        self.daemon.threads[OTHER] = {"cwd": str(self.repo), "status": "idle", "turns": []}
+        self.assertEqual(0, self.handover()[0])
+        before = len(self.events()), self.daemon.connections
+        self.assertEqual("NOT SENT", self.wake(*self.expected(generation))["status"])
+        self.assertEqual(before, (len(self.events()), self.daemon.connections))
+        self.assertEqual([], self.events("wake.attempted"))
+        self.assertEqual([], self.codex_calls())
+
+    def test_incomplete_or_mixed_expectations_refuse_before_ref_read_or_ledger(self):
+        invalid = (("--expect-generation", "1"), ("--expect-provider", "codex"),
+                   ("--expect-thread", THREAD), ("--expect-bound-agent", "claude"),
+                   ("--expect-bound-session", "self"),
+                   ("--expect-generation", "1", "--expect-provider", "claude", "--expect-thread", THREAD),
+                   (*self.expected(1), "--expect-bound-agent", "claude"), self.expected(0),
+                   self.expected(1, "malformed-thread"))
+        with mock.patch.object(wake, "fingerprint", side_effect=AssertionError("invalid expectation read ref")):
+            for expectation in invalid:
+                with self.subTest(expectation=expectation):
+                    self.assertEqual("NOT SENT", self.wake(*expectation)["status"])
+        self.assertEqual([], self.ledger_calls)
+        self.assertEqual([], self.events())
+        self.assertEqual(0, self.daemon.connections)
+        self.assertEqual([], self.codex_calls())
+
+    def test_rebind_after_admission_does_not_retarget_the_admitted_attempt(self):
+        generation = self.bound()
+        original_ledger = self.ledger
+
+        def rebind_after_begin(repo, *arguments):
+            result = original_ledger(repo, *arguments)
+            if arguments[:2] == ("wake-ledger", "begin") and result[0] == 0:
+                with self.store() as store:
+                    store.wake_bind("operator", provider="codex", thread=OTHER, endpoint=f"unix://{self.socket}",
+                                    cwd=str(self.repo), replace=True, agent="claude", session="binder",
+                                    expected_generation=generation, reason="synthetic concurrent handover",
+                                    approval_ref="receipt:fixture-handover")
+            return result
+
+        self.ledger = rebind_after_begin
+        result = self.wake(*self.expected(generation))
+        self.assertEqual("QUEUED", result["status"])
+        self.assertEqual(THREAD, self.codex_calls()[0][self.codex_calls()[0].index("--thread") + 1])
+        self.assertEqual(generation, self.events("wake.attempted")[0]["meta"]["generation"])
+        self.assertEqual(generation, self.conclusion()["generation"])
+        with self.store() as store:
+            self.assertEqual(OTHER, store.wake_bindings("operator")["bindings"][0]["thread"])
 
 
 class WakeLedgerTests(WakeCase):
@@ -1153,6 +1262,25 @@ class ClaudeTests(WakeCase):
         again = self.wake_inbox()
         self.assertEqual("ALREADY SENT", again["status"])
         self.assertIn("(delivered, ledger seq", again["happened"])
+
+    def test_expected_claude_owner_is_checked_without_claiming_verified_recipient_identity(self):
+        self.bind_inbox()
+        generation = self.events("wake.bound")[0]["seq"]
+        expected = ("--expect-generation", str(generation), "--expect-provider", "claude",
+                    "--expect-bound-agent", "claude", "--expect-bound-session", "self")
+        for changed in (expected[:-1] + ("other-session",),
+                        expected[:5] + ("codex",) + expected[6:]):
+            with self.subTest(changed=changed):
+                self.assertEqual("NOT SENT", self.wake_inbox(*changed)["status"])
+                self.assertEqual([], self.events("wake.attempted"))
+                self.assertEqual([], self.inbox.lines)
+        delivered = self.wake_inbox(*expected)
+        self.assertEqual("DELIVERED TO INBOX", delivered["status"])
+        self.assertEqual("unknown", delivered["consumption_state"])
+        self.assertEqual(1, len(self.received()))
+        self.assertNotIn("thread", self.events("wake.attempted")[0]["meta"])
+        self.assertEqual(0, self.daemon.connections)
+        self.assertEqual([], self.codex_calls())
         self.assertEqual(1, len(self.received()))
 
     def test_steer_has_no_separate_meaning_for_an_inbox(self):
@@ -1507,6 +1635,34 @@ class GuideTests(unittest.TestCase):
 
 
 class RoutingTests(unittest.TestCase):
+    def test_readonly_worker_validates_and_forwards_parsed_plan_expectations(self):
+        access = mock.Mock()
+        access.caps = {}
+        access.custody.directories = {}
+        access.custody.files = []
+        flags = ("--expect-generation", "7", "--expect-provider", "codex", "--expect-thread", THREAD)
+        parser = core_cli.build_parser()
+
+        def parsed(extra):
+            return parser.parse_args(["--repo", "/srv/checkout", "--json", "wake-ledger", "plan", "reviewer",
+                                      "--ref", "/srv/task.md", "--requested", "queue", *extra])
+
+        with mock.patch.object(runtime_cli.os, "listdir", return_value=[]), \
+             mock.patch.object(runtime_cli, "_bind_installed_access"), \
+             mock.patch.object(runtime_cli.RelayStore, "open_readonly") as opener, redirect_stdout(io.StringIO()):
+            store = opener.return_value.__enter__.return_value
+            store.wake_plan.return_value = {"status": "ready"}
+            for extra, expected in (((), None), (flags, {"generation": 7, "provider": "codex", "thread": THREAD})):
+                with self.subTest(extra=extra):
+                    self.assertEqual(0, runtime_cli._worker(access, parsed(extra), []))
+                    self.assertEqual(expected, store.wake_plan.call_args.kwargs["expected_binding"])
+            opener.reset_mock()
+            store.wake_plan.reset_mock()
+            with self.assertRaises(wake.ValidationError):
+                runtime_cli._worker(access, parsed(("--expect-generation", "7")), [])
+            opener.assert_not_called()
+            store.wake_plan.assert_not_called()
+
     def test_installed_dispatcher_hands_bind_and_wake_their_arguments(self):
         for command, target in (("bind", "bind_main"), ("wake", "wake_main")):
             for argv in (["operator", "--steer"], ["--steer", "operator"], []):

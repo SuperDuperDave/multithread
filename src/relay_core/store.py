@@ -37,6 +37,7 @@ from .protocol import (
     canonical_decision_option,
     canonical_resource,
     canonical_wake_content,
+    canonical_wake_expectation,
     canonical_wake_message_id,
     canonical_wake_ref,
     canonical_wake_role,
@@ -1432,12 +1433,14 @@ class RelayStore:
         message_id: str | None = None,
         ref_sha256: str | None = None,
         ref_size: int | None = None,
+        expected_binding: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """What wake_begin would decide, without recording anything."""
 
         return self._wake_decide(
             role, ref=ref, requested=requested, message_id=message_id,
             ref_sha256=ref_sha256, ref_size=ref_size,
+            expected_binding=expected_binding,
         )
 
     def wake_begin(
@@ -1451,13 +1454,18 @@ class RelayStore:
         message_id: str | None = None,
         ref_sha256: str | None = None,
         ref_size: int | None = None,
+        expected_binding: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Atomically check the binding and the id, then record the attempt."""
 
+        # Reject malformed assertions before acquiring a write transaction.
+        # Recipient comparison itself remains inside the atomic decision below.
+        expected_binding = canonical_wake_expectation(expected_binding)
         with self._transaction():
             decision = self._wake_decide(
                 role, ref=ref, requested=requested, message_id=message_id,
                 ref_sha256=ref_sha256, ref_size=ref_size,
+                expected_binding=expected_binding,
             )
             if decision["status"] != "ready":
                 return decision
@@ -1586,7 +1594,9 @@ class RelayStore:
         message_id: str | None,
         ref_sha256: str | None,
         ref_size: int | None,
+        expected_binding: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
+        expected_binding = canonical_wake_expectation(expected_binding)
         role = canonical_wake_role(role)
         ref = canonical_wake_ref(ref)
         canonical_wake_content(ref, ref_sha256, ref_size)
@@ -1602,6 +1612,13 @@ class RelayStore:
                 f"ledger sequence {ref} doesn't exist here (the latest is {latest})"
             )
         binding = self._wake_binding(role)
+        if expected_binding is not None and (
+            binding is None
+            or any(binding.get(field) != expected for field, expected in expected_binding.items())
+        ):
+            raise ConflictError(
+                "wake recipient binding changed; inspect the current role binding before sending"
+            )
         decision: dict[str, Any] = {
             "ledger": str(self.paths.repo_root),
             "role": role,

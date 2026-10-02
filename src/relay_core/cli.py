@@ -22,6 +22,7 @@ from .protocol import (
     RATCHET_OUTCOMES,
     RelayError,
     ValidationError,
+    canonical_wake_expectation,
     session_target,
     canonical_target,
     WAKE_CONCLUSIONS,
@@ -326,6 +327,11 @@ def build_parser() -> argparse.ArgumentParser:
         attempt.add_argument("--id", dest="message_id")
         attempt.add_argument("--ref-sha256", help="a file reference's sha256")
         attempt.add_argument("--ref-size", type=int, help="a file reference's size in bytes")
+        attempt.add_argument("--expect-generation", type=int, help="require this binding generation")
+        attempt.add_argument("--expect-provider", choices=sorted(WAKE_PROVIDERS))
+        attempt.add_argument("--expect-thread", help="require this Codex conversation; requires generation and provider")
+        attempt.add_argument("--expect-bound-agent", help="require this Claude binding's recorded owner agent")
+        attempt.add_argument("--expect-bound-session", help="require this Claude binding's recorded owner session")
     conclude = wake_actions.add_parser("conclude", help="record an attempt's one outcome")
     conclude.add_argument("attempt_seq", type=int)
     _add_actor(conclude)
@@ -359,6 +365,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_hook(args)
 
     try:
+        if args.command == "wake-ledger" and args.wake_action in ("plan", "begin"):
+            _wake_expectation(args)
         if args.command == "channel-pending":
             with RelayStore.open_readonly(
                 repo=args.repo,
@@ -598,6 +606,15 @@ def _dispatch(store: RelayStore, args: argparse.Namespace) -> Any:
     raise AssertionError(f"unhandled command: {args.command}")
 
 
+def _wake_expectation(args: argparse.Namespace) -> dict[str, Any] | None:
+    """Validate parsed expectations for both source and installed dispatch."""
+    fields = ("generation", "provider", "thread", "bound_agent", "bound_session")
+    return canonical_wake_expectation({
+        field: getattr(args, "expect_" + field)
+        for field in fields if getattr(args, "expect_" + field) is not None
+    } or None)
+
+
 def _dispatch_wake(store: RelayStore, args: argparse.Namespace) -> Any:
     action = args.wake_action
     if action == "show":
@@ -615,6 +632,7 @@ def _dispatch_wake(store: RelayStore, args: argparse.Namespace) -> Any:
         return store.wake_plan(
             args.role, ref=args.ref, requested=args.requested, message_id=args.message_id,
             ref_sha256=args.ref_sha256, ref_size=args.ref_size,
+            expected_binding=_wake_expectation(args),
         )
     agent, session = _actor(args)
     if action == "bind":
@@ -629,6 +647,7 @@ def _dispatch_wake(store: RelayStore, args: argparse.Namespace) -> Any:
             args.role, ref=args.ref, requested=args.requested,
             message_id=args.message_id, agent=agent, session=session,
             ref_sha256=args.ref_sha256, ref_size=args.ref_size,
+            expected_binding=_wake_expectation(args),
         )
     return store.wake_conclude(
         args.attempt_seq, outcome=args.outcome, reason=args.reason,

@@ -11,6 +11,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+from types import MappingProxyType
 import unittest
 from unittest import mock
 
@@ -26,6 +27,7 @@ from relay_core.protocol import (  # noqa: E402
     ValidationError,
     WAKE_ATTEMPT_KINDS,
     WAKE_BINDING_KINDS,
+    canonical_wake_expectation,
     normalize_event,
     session_target,
 )
@@ -176,6 +178,318 @@ class WakeLedgerCase(unittest.TestCase):
         with redirect_stdout(out), redirect_stderr(err):
             code = core_cli.main(["--repo", str(self.repo), "--home", str(self.home), *args])
         return code, out.getvalue(), err.getvalue()
+
+
+class WakeExpectationProtocolTests(unittest.TestCase):
+    def test_omission_is_legacy_and_complete_assertions_return_fresh_dicts(self):
+        self.assertIsNone(canonical_wake_expectation(None))
+        for source in (
+            {"generation": 7, "provider": "codex", "thread": THREAD},
+            {"generation": 8, "provider": "claude", "bound_agent": "claude:owner", "bound_session": "session:one"},
+        ):
+            with self.subTest(provider=source["provider"]):
+                expected = canonical_wake_expectation(MappingProxyType(source))
+                self.assertEqual(source, expected)
+                self.assertIs(type(expected), dict)
+                source["generation"] += 1
+                self.assertNotEqual(source["generation"], expected["generation"])
+
+    def test_partial_mixed_unknown_and_nonmapping_assertions_refuse(self):
+        codex = {"generation": 1, "provider": "codex", "thread": THREAD}
+        claude = {"generation": 1, "provider": "claude", "bound_agent": "claude", "bound_session": "owner"}
+        malformed = [False, True, [], "codex", {}, {"generation": 1},
+                     {**codex, "provider": "other"}, {**codex, "provider": ["codex"]},
+                     {**codex, "bound_agent": "claude"}, {**claude, "thread": THREAD},
+                     {**codex, "endpoint": ENDPOINT}, {**claude, "unknown": "field"}]
+        malformed.extend({key: value for key, value in codex.items() if key != field} for field in codex)
+        malformed.extend({key: value for key, value in claude.items() if key != field} for field in claude)
+        for value in malformed:
+            with self.subTest(value=value), self.assertRaises(ValidationError):
+                canonical_wake_expectation(value)
+
+    def test_null_boolean_generation_and_noncanonical_identities_refuse(self):
+        codex = {"generation": 1, "provider": "codex", "thread": THREAD}
+        claude = {"generation": 1, "provider": "claude", "bound_agent": "claude", "bound_session": "owner"}
+        malformed = [{**codex, "generation": value} for value in (None, True, False, 0, -1, "1", 1.0)]
+        malformed.extend({**codex, field: None} for field in codex)
+        malformed.extend({**claude, field: None} for field in claude)
+        malformed.extend({**codex, "thread": value} for value in (THREAD.upper(), " " + THREAD, "title"))
+        for field in ("bound_agent", "bound_session"):
+            malformed.extend({**claude, field: value} for value in ("", " owner", "owner ", "two words", False))
+        for value in malformed:
+            with self.subTest(value=value), self.assertRaises(ValidationError):
+                canonical_wake_expectation(value)
+
+
+class WakeExpectedBindingTests(WakeLedgerCase):
+    def expectation(self, binding=None):
+        binding = binding or self.store.wake_bindings("operator")["bindings"][0]
+        fields = ("generation", "provider", "thread") if binding["provider"] == "codex" else (
+            "generation", "provider", "bound_agent", "bound_session")
+        return {field: binding[field] for field in fields}
+
+    def guarded_plan(self, expected, message_id=None):
+        return self.store.wake_plan("operator", ref="/srv/task.md", requested="queue",
+                                    message_id=message_id, expected_binding=expected, **TASK)
+
+    def guarded_begin(self, expected, message_id=None):
+        return self.store.wake_begin("operator", ref="/srv/task.md", requested="queue",
+                                     agent="claude", session="sender", message_id=message_id,
+                                     expected_binding=expected, **TASK)
+
+    def test_matching_codex_plan_is_read_only_and_attempt_conclusion_shape_is_unchanged(self):
+        binding = self.bind()["binding"]
+        expected = self.expectation(binding)
+        before = self.store.events()
+        plan = self.guarded_plan(expected)
+        self.assertEqual("ready", plan["status"])
+        self.assertEqual(self.plan()["message_id"], plan["message_id"])
+        self.assertEqual(before, self.store.events())
+        begun = self.guarded_begin(expected)
+        event = self.store.events(after=begun["attempt_seq"] - 1, limit=1)[0]
+        self.assertEqual("begun", begun["status"])
+        self.assertEqual(plan["message_id"], begun["message_id"])
+        self.assertEqual(binding["generation"], event["meta"]["generation"])
+        self.assertEqual(THREAD, event["meta"]["thread"])
+        self.assertEqual({"role", "generation", "provider", "thread", "message_id", "ref",
+                          "ref_sha256", "ref_size", "requested"}, set(event["meta"]))
+        receipt = self.conclude(begun["attempt_seq"])
+        self.assertEqual("queued", receipt["event"]["meta"]["outcome"])
+        self.assertEqual("already_sent", self.guarded_begin(expected)["status"])
+
+    def test_matching_claude_assertion_names_recorded_owner_not_verified_receiver(self):
+        binding = self.store.wake_bind("operator", provider="claude", endpoint="unix:///srv/inbox.sock",
+                                       replace=False, agent="claude:owner", session="session:one")["binding"]
+        expected = self.expectation(binding)
+        self.assertEqual({"generation": binding["generation"], "provider": "claude",
+                          "bound_agent": "claude:owner", "bound_session": "session:one"}, expected)
+        before = self.store.events()
+        self.assertEqual("ready", self.guarded_plan(expected)["status"])
+        self.assertEqual(before, self.store.events())
+        begun = self.guarded_begin(expected)
+        self.assertEqual("begun", begun["status"])
+        receipt = self.conclude(begun["attempt_seq"], outcome="delivered", reason="inbox_accepted", transport="inbox")
+        self.assertEqual("delivered", receipt["event"]["meta"]["outcome"])
+        self.assertNotIn("thread", self.store.events(after=begun["attempt_seq"] - 1, limit=1)[0]["meta"])
+
+    def test_codex_generation_provider_and_thread_mismatches_are_write_free(self):
+        expected = self.expectation(self.bind()["binding"])
+        wrong = [{**expected, "generation": expected["generation"] + 1}, {**expected, "thread": OTHER},
+                 {"generation": expected["generation"], "provider": "claude",
+                  "bound_agent": "claude", "bound_session": "binder"}]
+        before = self.store.events()
+        for assertion in wrong:
+            for operation in (self.guarded_plan, self.guarded_begin):
+                with self.subTest(assertion=assertion, operation=operation.__name__), self.assertRaisesRegex(
+                        ConflictError, "wake recipient binding changed"):
+                    operation(assertion)
+                self.assertEqual(before, self.store.events())
+
+    def test_claude_owner_tuple_and_provider_mismatches_are_write_free(self):
+        binding = self.store.wake_bind("operator", provider="claude", endpoint="unix:///srv/inbox.sock",
+                                       replace=False, agent="claude:owner", session="session:one")["binding"]
+        expected = self.expectation(binding)
+        wrong = [{**expected, "bound_agent": "claude"}, {**expected, "bound_session": "session:two"},
+                 {**expected, "bound_agent": "claude", "bound_session": "owner:session:one"},
+                 {"generation": expected["generation"], "provider": "codex", "thread": THREAD}]
+        before = self.store.events()
+        for assertion in wrong:
+            for operation in (self.guarded_plan, self.guarded_begin):
+                with self.subTest(assertion=assertion, operation=operation.__name__), self.assertRaises(ConflictError):
+                    operation(assertion)
+                self.assertEqual(before, self.store.events())
+
+    def test_missing_binding_conflicts_with_assertion_and_retains_legacy_unbound_behavior(self):
+        expected = {"generation": 1, "provider": "codex", "thread": THREAD}
+        before = self.store.events()
+        for operation in (self.guarded_plan, self.guarded_begin):
+            with self.assertRaises(ConflictError):
+                operation(expected)
+        self.assertEqual("unbound", self.plan()["status"])
+        self.assertEqual("unbound", self.begin()["status"])
+        self.assertEqual(before, self.store.events())
+
+    def test_malformed_assertions_refuse_before_binding_read_or_write_transaction(self):
+        self.bind()
+        before = self.store.events()
+        malformed = ({}, {"generation": True, "provider": "codex", "thread": THREAD},
+                     {"generation": 1, "provider": "claude", "bound_agent": "claude"})
+        with mock.patch.object(self.store, "_transaction", side_effect=AssertionError("transaction started")), \
+                mock.patch.object(self.store, "_wake_binding", side_effect=AssertionError("binding read")):
+            for assertion in malformed:
+                for operation in (self.guarded_plan, self.guarded_begin):
+                    with self.subTest(assertion=assertion), self.assertRaises(ValidationError):
+                        operation(assertion)
+        self.assertEqual(before, self.store.events())
+
+    def test_rebinding_after_plan_conflicts_before_begin_without_reserving_or_appending(self):
+        expected = self.expectation(self.bind()["binding"])
+        self.assertEqual("ready", self.guarded_plan(expected)["status"])
+        self.bind(OTHER, replace=True)
+        after_rebind = self.store.events()
+        with self.assertRaises(ConflictError):
+            self.guarded_begin(expected)
+        self.assertEqual(after_rebind, self.store.events())
+        fresh = self.expectation()
+        begun = self.guarded_begin(fresh)
+        self.assertEqual(OTHER, begun["binding"]["thread"])
+        self.assertEqual(fresh["generation"], begun["binding"]["generation"])
+
+    def test_matching_paused_binding_stays_paused_but_stale_expectation_conflicts_first(self):
+        expected = self.expectation(self.bind()["binding"])
+        self.store.wake_control("pause", "operator", agent="claude", session="binder")
+        before = self.store.events()
+        for operation in (self.guarded_plan, self.guarded_begin):
+            self.assertEqual("paused", operation(expected)["status"])
+            with self.assertRaises(ConflictError):
+                operation({**expected, "generation": expected["generation"] + 1})
+        self.assertEqual(before, self.store.events())
+
+    def test_recipient_mismatch_precedes_same_message_id_deduplication(self):
+        expected = self.expectation(self.bind()["binding"])
+        begun = self.guarded_begin(expected, message_id="stable-guarded-message")
+        self.conclude(begun["attempt_seq"])
+        self.bind(OTHER, replace=True)
+        before = self.store.events()
+        with self.assertRaises(ConflictError):
+            self.guarded_begin(expected, message_id="stable-guarded-message")
+        fresh = self.expectation()
+        duplicate = self.guarded_begin(fresh, message_id="stable-guarded-message")
+        self.assertEqual("already_sent", duplicate["status"])
+        self.assertEqual(THREAD, duplicate["prior"]["thread"])
+        self.assertEqual(before, self.store.events())
+
+    def test_matching_expectation_keeps_open_uncertain_and_not_sent_guards(self):
+        expected = self.expectation(self.bind()["binding"])
+        opened = self.guarded_begin(expected, message_id="guarded-open")
+        self.assertEqual("already_sent", self.guarded_begin(expected, message_id="guarded-open")["status"])
+        self.conclude(opened["attempt_seq"], outcome="uncertain", reason="no_answer", transport="queue")
+        self.assertEqual("already_sent", self.guarded_begin(expected, message_id="guarded-open")["status"])
+        refused = self.guarded_begin(expected, message_id="guarded-not-sent")
+        self.conclude(refused["attempt_seq"], outcome="not_sent", reason="daemon_unreachable", transport=None)
+        retry = self.guarded_begin(expected, message_id="guarded-not-sent")
+        self.assertEqual("begun", retry["status"])
+        self.assertGreater(retry["attempt_seq"], refused["attempt_seq"])
+
+    def test_binding_snapshot_is_read_under_immediate_lock_and_lock_ends_at_commit(self):
+        expected = self.expectation(self.bind()["binding"])
+        original = self.store._wake_binding
+        witnessed = []
+
+        def read_with_independent_contender(role):
+            binding = original(role)
+            self.assertTrue(self.store._db.in_transaction)
+            contender = sqlite3.connect(self.home / "relay.sqlite3", timeout=0, isolation_level=None)
+            try:
+                with self.assertRaisesRegex(sqlite3.OperationalError, "locked"):
+                    contender.execute("BEGIN IMMEDIATE")
+                witnessed.append(binding["generation"])
+            finally:
+                contender.close()
+            return binding
+
+        with mock.patch.object(self.store, "_wake_binding", side_effect=read_with_independent_contender):
+            begun = self.guarded_begin(expected)
+        self.assertEqual([expected["generation"]], witnessed)
+        self.assertEqual("begun", begun["status"])
+        contender = sqlite3.connect(self.home / "relay.sqlite3", timeout=0, isolation_level=None)
+        try:
+            contender.execute("BEGIN IMMEDIATE")
+            contender.execute("ROLLBACK")
+        finally:
+            contender.close()
+
+
+class WakeCliExpectedBindingTests(WakeLedgerCase):
+    def test_parsed_plan_dispatch_enforces_expectations_without_main(self):
+        binding = self.bind()["binding"]
+        flags = ("--expect-generation", str(binding["generation"]), "--expect-provider", "codex",
+                 "--expect-thread", THREAD)
+        parser = core_cli.build_parser()
+
+        def parsed(extra):
+            return parser.parse_args(["wake-ledger", "plan", "operator", "--ref", "/srv/task.md",
+                                      "--requested", "queue", "--ref-sha256", "a" * 64, "--ref-size", "15", *extra])
+
+        before = self.store.events()
+        for extra in ((), flags):
+            with self.subTest(extra=extra):
+                self.assertEqual("ready", core_cli._dispatch(self.store, parsed(extra))["status"])
+        wrong = (*flags[:-1], OTHER)
+        with self.assertRaises(ConflictError):
+            core_cli._dispatch(self.store, parsed(wrong))
+        with mock.patch.object(self.store, "wake_plan", side_effect=AssertionError("malformed plan dispatched")):
+            with self.assertRaises(ValidationError):
+                core_cli._dispatch(self.store, parsed(("--expect-generation", "1")))
+        self.assertEqual(before, self.store.events())
+
+    def command(self, action, flags):
+        actor = ("--agent", "claude", "--session", "sender") if action == "begin" else ()
+        return self.cli("--json", "wake-ledger", action, "operator", "--ref", "/srv/task.md",
+                        "--requested", "queue", "--ref-sha256", "a" * 64, "--ref-size", "15",
+                        *actor, *flags)
+
+    def test_codex_flags_roundtrip_plan_and_begin_with_stale_assertion_refused(self):
+        binding = self.bind()["binding"]
+        flags = ("--expect-generation", str(binding["generation"]), "--expect-provider", "codex",
+                 "--expect-thread", THREAD)
+        before = self.store.events()
+        code, out, err = self.command("plan", flags)
+        self.assertEqual((0, ""), (code, err))
+        plan = json.loads(out)
+        self.assertEqual("ready", plan["status"])
+        self.assertEqual(binding["generation"], plan["binding"]["generation"])
+        self.assertEqual(before, self.store.events())
+        code, out, err = self.command("begin", flags)
+        self.assertEqual((0, ""), (code, err))
+        begun = json.loads(out)
+        self.assertEqual("begun", begun["status"])
+        self.assertEqual(THREAD, begun["binding"]["thread"])
+        self.bind(OTHER, replace=True)
+        after_rebind = self.store.events()
+        for action in ("plan", "begin"):
+            code, out, err = self.command(action, flags)
+            self.assertEqual((73, ""), (code, out))
+            self.assertIn("wake recipient binding changed", err)
+            self.assertEqual(after_rebind, self.store.events())
+
+    def test_claude_owner_flags_roundtrip_and_session_mismatch_refuses(self):
+        binding = self.store.wake_bind("operator", provider="claude", endpoint="unix:///srv/inbox.sock",
+                                       replace=False, agent="claude:owner", session="session:one")["binding"]
+        flags = ("--expect-generation", str(binding["generation"]), "--expect-provider", "claude",
+                 "--expect-bound-agent", "claude:owner", "--expect-bound-session", "session:one")
+        before = self.store.events()
+        code, out, err = self.command("plan", flags)
+        self.assertEqual((0, ""), (code, err))
+        self.assertEqual("ready", json.loads(out)["status"])
+        self.assertEqual(before, self.store.events())
+        code, out, err = self.command("begin", flags)
+        self.assertEqual((0, ""), (code, err))
+        self.assertEqual("begun", json.loads(out)["status"])
+        after_begin = self.store.events()
+        wrong = (*flags[:-1], "session:two")
+        code, out, err = self.command("begin", wrong)
+        self.assertEqual((73, ""), (code, out))
+        self.assertIn("wake recipient binding changed", err)
+        self.assertEqual(after_begin, self.store.events())
+
+    def test_partial_mixed_and_invalid_assertions_refuse_before_opening_ledger(self):
+        malformed = (
+            ("--expect-generation", "1"),
+            ("--expect-generation", "1", "--expect-provider", "codex"),
+            ("--expect-provider", "codex", "--expect-thread", THREAD),
+            ("--expect-generation", "1", "--expect-provider", "claude", "--expect-bound-agent", "claude"),
+            ("--expect-generation", "1", "--expect-provider", "codex", "--expect-thread", THREAD,
+             "--expect-bound-agent", "claude"),
+            ("--expect-generation", "0", "--expect-provider", "codex", "--expect-thread", THREAD),
+        )
+        with mock.patch.object(core_cli.RelayStore, "open", side_effect=AssertionError("ledger opened")):
+            for flags in malformed:
+                for action in ("plan", "begin"):
+                    with self.subTest(flags=flags, action=action):
+                        code, out, err = self.command(action, flags)
+                        self.assertEqual((64, ""), (code, out))
+                        self.assertIn("expected binding", err)
 
 
 class WakeBindingTests(WakeLedgerCase):

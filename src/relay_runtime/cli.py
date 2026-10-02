@@ -369,6 +369,8 @@ def _worker(access, args, argv):
                 raise StateError("initialized ledger failed integrity validation")
         return 0
     if read_only:
+        if args.command == "wake-ledger" and args.wake_action == "plan":
+            core_cli._wake_expectation(args)
         with RelayStore.open_readonly(repo=args.repo) as ledger:
             result = core_cli._dispatch(ledger, args)
             try:

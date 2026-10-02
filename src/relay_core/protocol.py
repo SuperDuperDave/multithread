@@ -426,6 +426,44 @@ def canonical_wake_thread(value: Any) -> str:
     return thread
 
 
+def canonical_wake_expectation(
+    value: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    """One complete assertion about the role binding a caller inspected.
+
+    Omission preserves legacy wake behavior. Claude's bound pair identifies the
+    recorded binding owner; it does not independently verify the inbox receiver.
+    Return a fresh mapping so validation does not retain caller-owned state.
+    """
+
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise ValidationError("expected binding must be a complete provider-specific object")
+    provider = value.get("provider")
+    if not isinstance(provider, str) or provider not in WAKE_PROVIDERS:
+        raise ValidationError("expected binding provider must be codex or claude")
+    fields = (
+        {"generation", "provider", "thread"} if provider == "codex"
+        else {"generation", "provider", "bound_agent", "bound_session"}
+    )
+    if set(value) != fields:
+        raise ValidationError("expected binding must contain exactly its provider's complete fields")
+    expected: dict[str, Any] = {
+        "generation": _positive_integer("expected binding generation", value["generation"]),
+        "provider": provider,
+    }
+    if provider == "codex":
+        expected["thread"] = canonical_wake_thread(value["thread"])
+    else:
+        for field in ("bound_agent", "bound_session"):
+            identifier = canonical_agent(value[field])
+            if identifier != value[field]:
+                raise ValidationError(f"expected binding {field} must be an exact canonical identifier")
+            expected[field] = identifier
+    return expected
+
+
 def canonical_wake_message_id(value: Any) -> str:
     message_id = _one_line("message id", value, 128)
     if message_id != value or not _WAKE_MESSAGE_ID_RE.fullmatch(message_id):
