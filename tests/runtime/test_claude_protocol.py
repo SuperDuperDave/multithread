@@ -10,7 +10,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stderr
+from contextlib import contextmanager, redirect_stderr
 from unittest import mock
 import uuid
 
@@ -906,6 +906,131 @@ class ClaudeProtocolTests(unittest.TestCase):
         self.assertEqual("Cut short", envelope["partial_result"])
         self.assertIn("without a validated main session result", envelope["message"])
         self.assert_raw(envelope, directory)
+
+
+class ObservationFramingTests(unittest.TestCase):
+    """Shared reader guarantees, independent of either provider's messages."""
+
+    @contextmanager
+    def observation(self):
+        with tempfile.TemporaryDirectory() as temporary, tempfile.TemporaryFile() as stdout:
+            directory = Path(temporary)
+            observation = native_io.Observation(mock.Mock(stdout=stdout), directory, {})
+            observation.driver = mock.Mock(session=None)
+            try:
+                yield observation, directory
+            finally:
+                observation.output.close()
+
+    def assert_raw(self, observation, directory, expected):
+        observation.snapshot()
+        self.assertEqual(expected, (directory / "stdout.json").read_bytes())
+        self.assertEqual(len(expected), observation.envelope["stdout_observation"]["bytes"])
+        self.assertEqual(hashlib.sha256(expected).hexdigest(),
+                         observation.envelope["stdout_observation"]["sha256"])
+
+    def test_every_fragment_boundary_preserves_records_and_identity_flush_order(self):
+        data = ' \r\n{"text":"雪"}\n\n{"text":"second"}\r\n'.encode()
+        for split in range(len(data) + 1):
+            with self.subTest(split=split), self.observation() as (observation, directory):
+                trace = []
+
+                def message(line):
+                    trace.append(native_io.decode(line))
+                    observation.driver.session = "fixture-session"
+
+                observation.driver.message.side_effect = message
+                chunks = [part for part in (data[:split], data[split:]) if part]
+                with mock.patch.object(native_io.os, "read", side_effect=[*chunks, b""]), \
+                     mock.patch.object(native_io.os, "fsync", side_effect=lambda fd: trace.append("fsync")):
+                    for _ in chunks:
+                        self.assertTrue(observation.read())
+                    self.assertFalse(observation.read())
+                self.assertEqual([{"text": "雪"}, "fsync", {"text": "second"}], trace)
+                self.assertEqual(b"", observation.buffer)
+                self.assert_raw(observation, directory, data)
+
+    def test_dense_records_preserve_order_and_whitespace_tail_is_incomplete(self):
+        records = [{"n": n} for n in range(2048)]
+        data = b"\n" + b"\r\n".join(json.dumps(value).encode() for value in records) + b"\n \t"
+        with self.observation() as (observation, directory):
+            received = []
+            observation.driver.message.side_effect = lambda line: received.append(native_io.decode(line))
+            with mock.patch.object(native_io.os, "read", side_effect=[data, b""]):
+                self.assertTrue(observation.read())
+                with self.assertRaisesRegex(native_io.ProtocolError, "incomplete JSONL record"):
+                    observation.read()
+            self.assertEqual(records, received)
+            self.assertEqual(b" \t", observation.buffer)
+            self.assert_raw(observation, directory, data)
+
+    def test_would_block_preserves_partial_record_and_raw_observation(self):
+        with self.observation() as (observation, directory):
+            first, second = b'{"value":', b'1}\n'
+            with mock.patch.object(native_io.os, "read", side_effect=[first, BlockingIOError(), second]):
+                self.assertTrue(observation.read())
+                self.assertFalse(observation.read())
+                self.assertEqual(first, observation.buffer)
+                self.assert_raw(observation, directory, first)
+                self.assertTrue(observation.read())
+            self.assertEqual({"value": 1}, native_io.decode(observation.driver.message.call_args.args[0]))
+            self.assert_raw(observation, directory, first + second)
+
+    def test_callback_error_retains_unprocessed_suffix_and_fault_drains_raw_only(self):
+        for error in (native_io.ProtocolError("fixture refusal"), KeyboardInterrupt()):
+            with self.subTest(error=type(error).__name__), self.observation() as (observation, directory):
+                data = b'{"n":1}\n{"n":2}\n{"n":3}\npartial'
+                later = b' remainder\n'
+                received = []
+
+                def message(line):
+                    received.append(native_io.decode(line))
+                    if len(received) == 2:
+                        raise error
+
+                observation.driver.message.side_effect = message
+                with mock.patch.object(native_io.os, "read", return_value=data):
+                    with self.assertRaises(type(error)):
+                        observation.read()
+                self.assertEqual(b'{"n":3}\npartial', observation.buffer)
+                observation.fault("fixture fault")
+                self.assertEqual(b"", observation.buffer)
+                with mock.patch.object(native_io.os, "read", side_effect=[later, b""]):
+                    self.assertTrue(observation.drain())
+                self.assertEqual([{"n": 1}, {"n": 2}], received)
+                self.assert_raw(observation, directory, data + later)
+
+    def test_identity_flush_failure_consumes_identity_record_before_next_delivery(self):
+        with self.observation() as (observation, directory):
+            data = b'{"n":1}\n{"n":2}\n'
+            received = []
+
+            def message(line):
+                received.append(native_io.decode(line))
+                observation.driver.session = "fixture-session"
+
+            observation.driver.message.side_effect = message
+            with mock.patch.object(native_io.os, "read", side_effect=[data, BlockingIOError()]), \
+                 mock.patch.object(native_io.os, "fsync", side_effect=OSError("fixture flush failure")):
+                with self.assertRaises(OSError):
+                    observation.read()
+                self.assertEqual(b'{"n":2}\n', observation.buffer)
+                self.assertFalse(observation.read())
+            self.assertEqual([{"n": 1}], received)
+            self.assert_raw(observation, directory, data)
+
+    def test_raw_cap_precedes_delivery_even_when_overflow_contains_a_complete_record(self):
+        with self.observation() as (observation, directory):
+            data = b"{}\n" + b"x" * 10
+            with mock.patch.object(native_io, "MAX_OUTPUT", 12), \
+                 mock.patch.object(native_io.os, "read", return_value=data) as read:
+                with self.assertRaisesRegex(native_io.ProtocolError, "exceeded its bound"):
+                    observation.read()
+                read.assert_called_once_with(observation.process.stdout.fileno(), 13)
+            observation.driver.message.assert_not_called()
+            self.assertTrue(observation.truncated)
+            self.assertEqual(b"", observation.buffer)
+            self.assert_raw(observation, directory, data)
 
 
 if __name__ == "__main__":

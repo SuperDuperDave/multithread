@@ -213,6 +213,7 @@ class Observation:
         self.observed = 0
         self.truncated = False
         self.buffer = bytearray()
+        self.searched = 0
         self.eof = False
         self.interpret = True
         self.closed = False
@@ -242,20 +243,34 @@ class Observation:
         if not self.interpret or self.driver is None:
             return True
         self.buffer.extend(data)
-        while b"\n" in self.buffer:
-            line, _, remainder = self.buffer.partition(b"\n")
-            self.buffer = bytearray(remainder)
-            if line.strip():
-                previous_session = self.driver.session
-                self.driver.message(line)
-                if previous_session is None and self.driver.session is not None:
-                    # Persist native identity before the queued task can write.
-                    os.fsync(self.output.fileno())
+        consumed = 0
+        try:
+            while True:
+                newline = self.buffer.find(b"\n", self.searched)
+                if newline < 0:
+                    self.searched = len(self.buffer)
+                    break
+                line = self.buffer[consumed:newline]
+                consumed = newline + 1
+                self.searched = consumed
+                if line.strip():
+                    previous_session = self.driver.session
+                    self.driver.message(line)
+                    if previous_session is None and self.driver.session is not None:
+                        # Persist native identity before the queued task can write.
+                        os.fsync(self.output.fileno())
+        finally:
+            # Consume each delivered line even if its callback fails, while
+            # retaining the unprocessed suffix. Compact once per read.
+            if consumed:
+                del self.buffer[:consumed]
+                self.searched -= consumed
         return True
 
     def fault(self, message):
         self.interpret = False
         self.buffer.clear()
+        self.searched = 0
         if self.driver is not None:
             self.driver.problem(message)
         else:
