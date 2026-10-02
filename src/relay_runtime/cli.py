@@ -589,6 +589,46 @@ def _complete_refusal(refused, args, registry):
         return refused
 
 
+def _native_arguments(args, global_repos=()):
+    """Keep one explicit checkout selection; never resolve its enrollment spelling."""
+    forwarded = list(args.provider_args)
+    if args.native_help:
+        forwarded += ["--help"]
+    boundary = forwarded.index("--") if "--" in forwarded else len(forwarded)
+    scoped = args.command != "hooks" and not (
+        args.command == "agent" and forwarded[:2] in (
+            ["muse", "list"], ["muse", "inspect"], ["muse", "register"], ["muse", "remove"])) and not (
+        args.command == "peer" and forwarded[:1] in (["report"], ["control"]))
+    inherited = []
+    if scoped:
+        names = ("--repo", "--enroll-repo") if args.command == "update" else ("--repo",)
+        selections = []
+        supplied = False
+        for index, token in enumerate(forwarded[:boundary]):
+            option, equal, value = token.partition("=")
+            # The helper parsers accept long-option abbreviations. Include
+            # prefixes so an abbreviated selection cannot evade the guard.
+            # Preserve argv for the helper's own syntax validation afterward.
+            if not option.startswith("--") or not any(name.startswith(option) for name in names):
+                continue
+            supplied = True
+            if equal:
+                selections.append(value)
+            elif index + 1 < boundary:
+                selections.append(forwarded[index + 1])
+        if args.repo is not None:
+            selections.append(args.repo)
+        selections.extend(global_repos)
+        if selections and any(Path(value).absolute() != Path(selections[0]).absolute()
+                              for value in selections[1:]):
+            raise ValidationError("conflicting repository selections; use --repo once for the intended checkout")
+        if args.repo is not None and not supplied:
+            inherited += ["--repo", args.repo]
+    if args.json and args.command != "agent":
+        inherited += ["--json"]
+    return forwarded[:boundary] + inherited + forwarded[boundary:]
+
+
 def main(argv=None, *, registry=None, command_alias_check=None):
     raw = list(argv if argv is not None else sys.argv[1:])
     if "--json" in raw:
@@ -596,17 +636,34 @@ def main(argv=None, *, registry=None, command_alias_check=None):
     # Option-only helpers have no initial provider positional to make argparse's
     # REMAINDER retain flags. Parse only their global prefix, then give their
     # own parser the unchanged suffix (including unknown flags for diagnosis).
+    parser = _parser()
     boundary = 0
+    global_repos = []
     while boundary < len(raw):
         token = raw[boundary]
-        if token in {"--repo", "--home"}:
-            boundary += 2
-        elif token == "--json" or token.startswith(("--repo=", "--home=")):
+        option, equal, value = token.partition("=")
+        matches = ([option] if option in parser._option_string_actions else
+                   [name for name in parser._option_string_actions
+                    if len(option) > 2 and name.startswith(option)])
+        if len(matches) != 1:
+            break
+        action = parser._option_string_actions[matches[0]]
+        if action.dest == "repo":
+            if equal:
+                global_repos.append(value)
+                boundary += 1
+            else:
+                if boundary + 1 < len(raw):
+                    global_repos.append(raw[boundary + 1])
+                boundary += 2
+        elif action.dest == "state_home":
+            boundary += 1 if equal else 2
+        elif action.nargs == 0:
             boundary += 1
         else:
             break
     helper = boundary < len(raw) and raw[boundary] in {"agent", "bind", "hooks", "setup", "update", "wake"}
-    args = _parser().parse_args(raw[:boundary + 1] if helper else raw)
+    args = parser.parse_args(raw[:boundary + 1] if helper else raw)
     if helper:
         args.provider_args = raw[boundary + 1:]
     # Provider settings live where the provider reads them; capture that before
@@ -618,6 +675,7 @@ def main(argv=None, *, registry=None, command_alias_check=None):
         if args.state_home is not None or "RELAY_HOME" in os.environ:
             raise StateError("installed Multithread refuses state-directory overrides")
         if args.command in {"agent", "bind", "hooks", "launch", "peer", "setup", "update", "wake"}:
+            forwarded = _native_arguments(args, global_repos)
             # A compatibility invocation must verify the preferred alias before
             # any helper executes it. Keep hooks and read-only runtime diagnosis
             # outside this check; an unavailable observation stays nonblocking.
@@ -635,15 +693,6 @@ def main(argv=None, *, registry=None, command_alias_check=None):
             from .setup import setup_main
             from .update import update_main
             from .wake import bind_main, wake_main
-            forwarded = list(args.provider_args)
-            if args.native_help:
-                forwarded += ["--help"]
-            if args.repo is not None and args.command != "hooks" and (
-                    args.command != "agent" or forwarded[:2] not in (
-                        ["muse", "list"], ["muse", "inspect"], ["muse", "register"], ["muse", "remove"])):
-                forwarded += ["--repo", args.repo]
-            if args.json and args.command != "agent":
-                forwarded += ["--json"]
             return {"agent": agent_main, "bind": bind_main, "hooks": hooks_main, "launch": launch_main,
                     "peer": peer_main, "setup": setup_main, "update": update_main,
                     "wake": wake_main}[args.command](forwarded)

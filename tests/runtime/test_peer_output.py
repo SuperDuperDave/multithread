@@ -235,8 +235,8 @@ class PeerOutputTests(unittest.TestCase):
                                if line.startswith("Follow-up preparation: "))
                 self.assertEqual(prefix, shlex.split(command))
                 self.assertIn("assess this result and confirm session ownership and the remaining scope", output)
-                self.assertIn("Append a new task file path to this prefix", output)
-                self.assertIn("dry-run; it does not start the provider", output)
+                self.assertIn("Append a new task file path and a fresh --output-dir to this prefix", output)
+                self.assertIn("dry-run; it does not check the output directory or start the provider", output)
                 self.assertIn("The reviewed change handles the boundary case.", output)
 
     def test_follow_up_preparation_is_suppressed_when_attention_or_outcome_is_unresolved(self):
