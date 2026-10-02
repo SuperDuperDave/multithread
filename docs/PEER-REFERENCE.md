@@ -415,9 +415,10 @@ helper against the installed account launcher that setup prints. Leave
 `--multithread` unset. Codex trusts one exact hook command, so a Codex call
 accepts only that launcher.
 
-A configuration plan's hook must name the selected launcher and checkout as
-literal shell arguments. Safe quoting and spacing are preserved exactly for
-native review. Shell expansions, operators and unquoted wildcards are refused
+A configuration plan's hook must encode the reviewed hook argv as literal shell
+arguments. Claude includes the checkout; Codex omits it so one account hook
+serves every enrolled checkout. Safe quoting and spacing are preserved exactly
+for native review. Shell expansions, operators and unquoted wildcards are refused
 before provider startup. A reviewed custom launcher should generate its command
 with `shlex.join()`; quoted path characters remain literal, including spaces,
 dollar signs and apostrophes.
