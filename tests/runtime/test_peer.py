@@ -1129,5 +1129,88 @@ class PeerTests(unittest.TestCase):
         config.assert_not_called()
 
 
+class RepositoryRoutingTests(unittest.TestCase):
+    def test_conflicting_selections_refuse_before_alias_or_native_work(self):
+        cases = (
+            ["peer", "claude", "--repo", "/srv/other", "--task-file", "task.txt"],
+            ["peer", "claude", "--rep=/srv/other", "--task-file", "task.txt"],
+            ["peer", "claude", "--repo", "-1", "--task-file", "task.txt"],
+            ["peer", "packet", "--repo=/srv/other", "--path", "src/file.py"],
+            ["launch", "codex", "--repo", "/srv/other"],
+            ["setup", "--repo", "/srv/other", "--apply"],
+            ["update", "--enroll-repo=/srv/other", "--yes"],
+            ["update", "--enroll", "/srv/other", "--yes"],
+            ["bind", "reviewer", "--repo", "/srv/other"],
+            ["wake", "reviewer", "--repo", "/srv/other", "--ref", "1"],
+            ["agent", "muse", "send", "Buddy", "packet.json", "--r", "/srv/other"],
+        )
+        for suffix in cases:
+            with (self.subTest(suffix=suffix), redirect_stderr(io.StringIO()) as error,
+                  mock.patch.object(cli, "Admission") as admission,
+                  mock.patch.object(peer, "peer_main") as helper,
+                  mock.patch.object(peer.subprocess, "Popen") as native,
+                  mock.patch.object(peer.subprocess, "run") as config):
+                alias = mock.Mock(side_effect=AssertionError("routing refusal reached alias/helper"))
+                code = cli.main(["--repo", "/srv/checkout", *suffix], command_alias_check=alias)
+            self.assertEqual(64, code)
+            self.assertIn("conflicting repository selections", error.getvalue())
+            alias.assert_not_called()
+            admission.assert_not_called()
+            helper.assert_not_called()
+            native.assert_not_called()
+            config.assert_not_called()
+
+    def test_repeated_native_conflict_also_refuses_without_global_selection(self):
+        with (redirect_stderr(io.StringIO()), mock.patch.object(peer, "peer_main") as helper):
+            code = cli.main(["peer", "claude", "--repo", "/srv/checkout", "--repo=/srv/other"])
+        self.assertEqual(64, code)
+        helper.assert_not_called()
+
+    def test_repeated_global_conflict_refuses_before_it_can_be_collapsed(self):
+        for first in (["--repo", "/srv/checkout"], ["--rep=/srv/checkout"], ["--r", "/srv/checkout"],
+                      ["--re=/srv/checkout"], ["--j", "--repo", "/srv/checkout"]):
+            with (self.subTest(first=first), redirect_stderr(io.StringIO()),
+                  mock.patch.object(peer, "peer_main") as helper):
+                code = cli.main([*first, "--repo=/srv/other", "peer", "claude"])
+            self.assertEqual(64, code)
+            helper.assert_not_called()
+
+    def test_equal_or_single_selections_preserve_the_helper_spelling(self):
+        absolute = str(Path("checkout").absolute())
+        for global_args, selected in ((["--repo", absolute], ["--rep=checkout"]),
+                                      (["--repo", "/srv/checkout"], ["--repo=/srv/checkout"]),
+                                      ([], ["--repo", "/srv/checkout"])):
+            suffix = ["claude", *selected, "--task-file", "task.txt"]
+            with (self.subTest(selected=selected), mock.patch.object(peer, "peer_main", return_value=7) as helper,
+                  mock.patch.object(Path, "resolve", side_effect=AssertionError("resolved enrollment path"))):
+                self.assertEqual(7, cli.main([*global_args, "peer", *suffix]))
+            helper.assert_called_once_with(suffix)
+
+    def test_distinct_symlink_or_parent_spellings_do_not_collapse(self):
+        for selected in ("/srv/checkout/../checkout", "/srv/checkout-alias"):
+            with (self.subTest(selected=selected), redirect_stderr(io.StringIO()),
+                  mock.patch.object(Path, "resolve", side_effect=AssertionError("resolved enrollment path")),
+                  mock.patch.object(peer, "peer_main") as helper):
+                self.assertEqual(64, cli.main(["--repo", "/srv/checkout", "peer", "claude", "--repo", selected]))
+            helper.assert_not_called()
+
+    def test_inherited_options_precede_separator_and_do_not_scan_positional_payload(self):
+        suffix = ["muse", "prepare", "Buddy", "--", "--repo=/srv/payload"]
+        with mock.patch("relay_runtime.agent.agent_main", return_value=7) as helper:
+            self.assertEqual(7, cli.main(["--repo", "/srv/checkout", "agent", *suffix]))
+        helper.assert_called_once_with(["muse", "prepare", "Buddy", "--repo", "/srv/checkout",
+                                      "--", "--repo=/srv/payload"])
+
+    def test_receipt_and_account_helpers_do_not_inherit_checkout_authority(self):
+        cases = (("peer", ["report", "--call-dir", "/srv/receipt"], "relay_runtime.provider.peer_main"),
+                 ("peer", ["control", "status", "--call-dir", "/srv/receipt"], "relay_runtime.provider.peer_main"),
+                 ("agent", ["muse", "list"], "relay_runtime.agent.agent_main"),
+                 ("hooks", ["check"], "relay_runtime.hooks.hooks_main"))
+        for command, suffix, target in cases:
+            with self.subTest(command=command, suffix=suffix), mock.patch(target, return_value=7) as helper:
+                self.assertEqual(7, cli.main(["--repo", "/srv/checkout", command, *suffix]))
+            helper.assert_called_once_with(suffix)
+
+
 if __name__ == "__main__":
     unittest.main()

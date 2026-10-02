@@ -1617,4 +1617,5 @@ def _display_peer(envelope, *, report_entry=None):
     if preparation and envelope["state"] == "returned" and not envelope.get("needs_attention"):
         print("Before follow-up, assess this result and confirm session ownership and the remaining scope.")
         _display_command("Follow-up preparation", preparation["argv_prefix"])
-        print("Append a new task file path to this prefix to prepare a dry-run; it does not start the provider.")
+        print("Append a new task file path and a fresh --output-dir to this prefix to prepare a dry-run; "
+              "it does not check the output directory or start the provider.")

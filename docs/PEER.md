@@ -54,6 +54,10 @@ requires authorization for the actual provider usage and sharing scope.
 
 ## Before calling
 
+Select the checkout with `--repo` either before `peer` or in its arguments.
+Conflicting selections are refused before preparing or starting the call.
+Use one selection when moving from a main checkout to a linked worktree.
+
 Use a functioning provider environment and an enrolled checkout. Follow
 [setup](SETUP.md). The installation also includes `multithread launch`
 for interactive Codex/Claude launches; `multithread launch claude --json` only prepares
@@ -356,8 +360,15 @@ deliberate resume. Claude uses a session UUID:
 ```sh
 ~/.local/bin/multithread peer claude --repo /absolute/enrolled/reviewer-checkout \
   --resume <exact-session-uuid> --task-file follow-up.txt \
-  --output-dir /absolute/private/new-peer-follow-up --json
+  --output-dir /absolute/private/new-peer-follow-up --dry-run --json
 ```
+
+For a manual resume, preserve the previous call's selected provider entry
+(`request.json`'s `argv[0]`) with `--provider`, and any explicitly reviewed
+launcher selection. Retain or deliberately revise the prior timeout, turn limit,
+model, effort and input/progress options; the example uses defaults. Review the
+dry-run, then remove `--dry-run` for the authorized call. A dry run checks neither
+readiness nor the output directory.
 
 For Codex, select `codex` and pass its returned `session_id`
 unchanged to `--resume`. Treat that thread ID as opaque; do not convert it to a
@@ -381,10 +392,12 @@ include `follow_up_preparation.argv_prefix`. This argument array preserves the
 selected Multithread launcher, provider wrapper, verified session, checkout and
 call bounds, using the source entry when supplied. It includes `--dry-run --json`
 and ends with `--task-file`: append the
-path of the new follow-up task, optionally followed by a fresh `--output-dir`.
+path of the new follow-up task, followed by a fresh `--output-dir` to retain
+the next call's evidence in your chosen private location.
 Keep arguments separate when executing it, or quote each argument for the shell.
 It reuses neither the prior task nor its output directory. Review the preparation,
-which starts no provider, then remove `--dry-run` only for the authorized call.
+which starts no provider and does not check the output directory, then remove
+`--dry-run` only for the authorized call.
 The prefix is absent for uncertain or adverse outcomes; inspect those outcomes
 before deciding whether to use the manual resume command above. A prepared
 invocation does not establish session ownership or completion of the prior task.
