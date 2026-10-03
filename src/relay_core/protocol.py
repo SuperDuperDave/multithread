@@ -131,6 +131,7 @@ _DECISION_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{2,79}$")
 _DECISION_OPTION_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 _DECISION_ARTIFACT_RE = re.compile(r"^git:[0-9a-f]{40}$")
 _WAKE_ROLE_RE = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
+_WAKE_PROJECT_RE = re.compile(r"^[a-z][a-z0-9-]{0,79}$")
 _WAKE_MESSAGE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _WAKE_SEQUENCE_REF_RE = re.compile(r"^[1-9][0-9]{0,11}$")
 _RESOURCE_RE = re.compile(
@@ -252,6 +253,7 @@ _META_KEYS: dict[str, frozenset[str]] = {
             "ref_sha256",
             "ref_size",
             "requested",
+            "sender",
         }
     ),
     "wake.concluded": frozenset(
@@ -304,7 +306,7 @@ class Event:
     target: str | None
     scope: str | None
     artifact: str | None
-    meta: dict[str, str | int | bool | list[str]]
+    meta: dict[str, Any]
     canonical_json: str
     body_hash: str
 
@@ -464,6 +466,39 @@ def canonical_wake_expectation(
     return expected
 
 
+def canonical_wake_project(value: Any) -> str | None:
+    """A safe optional display label, never a repository identity."""
+
+    if value is None:
+        return None
+    project = _one_line("sender project", value, 80)
+    if project != value or not _WAKE_PROJECT_RE.fullmatch(project):
+        raise ValidationError("sender project must be an exact lowercase name of letters, digits and dashes")
+    return project
+
+
+def canonical_wake_sender(value: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    """An observed source binding snapshot, not sender authentication or authority.
+
+    Omission preserves old attempts. A supplied snapshot is complete;
+    its ledger is a followable absolute pointer, not a cross-ledger assertion.
+    """
+
+    if value is None:
+        return None
+    if not isinstance(value, Mapping) or set(value) != {"ledger", "role", "generation", "project"}:
+        raise ValidationError("wake sender must contain exactly ledger, role, generation and project")
+    generation = _positive_integer("sender generation", value["generation"])
+    if generation > 10**12:
+        raise ValidationError("sender generation is out of range")
+    return {
+        "ledger": _absolute_path("sender ledger", value["ledger"]),
+        "role": canonical_wake_role(value["role"]),
+        "generation": generation,
+        "project": canonical_wake_project(value["project"]),
+    }
+
+
 def canonical_wake_message_id(value: Any) -> str:
     message_id = _one_line("message id", value, 128)
     if message_id != value or not _WAKE_MESSAGE_ID_RE.fullmatch(message_id):
@@ -552,6 +587,8 @@ def _validate_wake(kind: str, meta: Mapping[str, Any]) -> None:
     _positive_integer("generation", meta.get("generation"))
     if kind == "wake.attempted":
         _wake_target(meta)
+        if "sender" in meta and canonical_wake_sender(meta["sender"]) is None:
+            raise ValidationError("a supplied wake sender must be a complete object")
         canonical_wake_message_id(meta.get("message_id"))
         canonical_wake_content(
             canonical_wake_ref(meta.get("ref")), meta.get("ref_sha256"), meta.get("ref_size")
@@ -715,7 +752,7 @@ def normalize_event(raw: Mapping[str, Any], *, internal: bool = False) -> Event:
 
 def _validate_semantics(
     kind: str,
-    meta: Mapping[str, str | int | bool | list[str]],
+    meta: Mapping[str, Any],
     *,
     internal: bool,
 ) -> None:
@@ -876,7 +913,7 @@ def _validate_semantics(
 
 def _normalize_meta(
     kind: str, raw: Mapping[str, Any]
-) -> dict[str, str | int | bool | list[str]]:
+) -> dict[str, Any]:
     allowed = _META_KEYS[kind]
     unknown = sorted(set(raw) - allowed)
     if unknown:
@@ -884,11 +921,16 @@ def _normalize_meta(
             f"metadata keys not allowed for {kind}: {', '.join(unknown)}"
         )
 
-    out: dict[str, str | int | bool | list[str]] = {}
+    out: dict[str, Any] = {}
     for key, value in raw.items():
         if _SECRET_KEY_RE.search(str(key)):
             raise ValidationError(f"secret-shaped metadata key rejected: {key}")
-        if isinstance(value, bool):
+        if kind == "wake.attempted" and key == "sender":
+            sender = canonical_wake_sender(value)
+            if sender is None:
+                raise ValidationError("a supplied wake sender must be a complete object")
+            out[key] = sender
+        elif isinstance(value, bool):
             out[str(key)] = value
         elif isinstance(value, int) and not isinstance(value, bool):
             if abs(value) > 10**12:

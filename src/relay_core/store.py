@@ -39,8 +39,10 @@ from .protocol import (
     canonical_wake_content,
     canonical_wake_expectation,
     canonical_wake_message_id,
+    canonical_wake_project,
     canonical_wake_ref,
     canonical_wake_role,
+    canonical_wake_sender,
     canonical_wake_thread,
     canonical_work_id,
     new_event_id,
@@ -1242,8 +1244,15 @@ class RelayStore:
                     "WHERE kind = 'wake.bound' ORDER BY target"
                 ).fetchall()
             ]
+        common = self.paths.git_common_dir
+        common_owner = common.parent if common.name == ".git" else self.paths.repo_root
+        try:
+            project = canonical_wake_project(common_owner.name)
+        except ValidationError:
+            project = None
         return {
             "ledger": str(self.paths.repo_root),
+            "project": project,
             "bindings": [self._wake_state(item) for item in roles],
         }
 
@@ -1456,12 +1465,14 @@ class RelayStore:
         ref_sha256: str | None = None,
         ref_size: int | None = None,
         expected_binding: Mapping[str, Any] | None = None,
+        sender: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Atomically check the binding and the id, then record the attempt."""
 
         # Reject malformed assertions before acquiring a write transaction.
         # Recipient comparison itself remains inside the atomic decision below.
         expected_binding = canonical_wake_expectation(expected_binding)
+        sender = canonical_wake_sender(sender)
         with self._transaction():
             decision = self._wake_decide(
                 role, ref=ref, requested=requested, message_id=message_id,
@@ -1494,12 +1505,14 @@ class RelayStore:
                             if ref_sha256 is not None else {}
                         ),
                         "requested": requested,
+                        **({"sender": sender} if sender is not None else {}),
                     },
                 },
                 internal=True,
             )
             seq, _ = self._insert_event(event)
-            return {**decision, "status": "begun", "attempt_seq": seq}
+            return {**decision, "status": "begun", "attempt_seq": seq,
+                    **({"sender": sender} if sender is not None else {})}
 
     def wake_conclude(
         self,
@@ -1755,6 +1768,8 @@ class RelayStore:
             "requested": meta["requested"],
             "outcome": "open",
         }
+        if "sender" in meta:
+            attempt["sender"] = canonical_wake_sender(meta["sender"])
         bound = self._execute("SELECT * FROM events WHERE seq = ?", (meta["generation"],)).fetchone()
         if bound is None or bound["kind"] != "wake.bound":
             raise StateError("wake attempt has no original binding")

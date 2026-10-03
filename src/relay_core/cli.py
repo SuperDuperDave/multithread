@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -23,6 +24,7 @@ from .protocol import (
     RelayError,
     ValidationError,
     canonical_wake_expectation,
+    canonical_wake_sender,
     session_target,
     canonical_target,
     WAKE_CONCLUSIONS,
@@ -325,6 +327,7 @@ def build_parser() -> argparse.ArgumentParser:
         attempt.add_argument("role")
         if name == "begin":
             _add_actor(attempt)
+            attempt.add_argument("--sender-json", help="one complete observed sender-binding snapshot")
         attempt.add_argument("--ref", required=True)
         attempt.add_argument("--requested", required=True, choices=sorted(WAKE_REQUESTS))
         attempt.add_argument("--id", dest="message_id")
@@ -370,6 +373,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if args.command == "wake-ledger" and args.wake_action in ("plan", "begin"):
             _wake_expectation(args)
+            if args.wake_action == "begin":
+                _wake_sender(args)
         if args.command == "channel-pending":
             with RelayStore.open_readonly(
                 repo=args.repo,
@@ -651,12 +656,23 @@ def _dispatch_wake(store: RelayStore, args: argparse.Namespace) -> Any:
             message_id=args.message_id, agent=agent, session=session,
             ref_sha256=args.ref_sha256, ref_size=args.ref_size,
             expected_binding=_wake_expectation(args),
+            sender=_wake_sender(args),
         )
     return store.wake_conclude(
         args.attempt_seq, outcome=args.outcome, reason=args.reason,
         transport=args.transport, native_id=args.native_id,
         agent=agent, session=session, detail=args.detail,
     )
+
+
+def _wake_sender(args: argparse.Namespace) -> dict[str, Any] | None:
+    if args.sender_json is None:
+        return None
+    try:
+        data = args.sender_json.encode("utf-8", errors="strict")
+    except UnicodeEncodeError as exc:
+        raise ValidationError("sender JSON is not valid UTF-8") from exc
+    return canonical_wake_sender(_read_json_object(io.BytesIO(data)))
 
 
 def _render_wake_control(command: str, result: Mapping[str, Any]) -> str:

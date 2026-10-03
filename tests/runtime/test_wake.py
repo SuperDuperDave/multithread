@@ -358,6 +358,249 @@ class WakeCase(unittest.TestCase):
         self.daemon.threads[THREAD]["turns"] = [{"id": LIVE_TURN, "status": status, "items": []}]
 
 
+class SenderContextTests(WakeCase):
+    """Source discovery uses disposable ledgers; delivery uses the existing fakes."""
+
+    def setUp(self):
+        super().setUp()
+        self.source = self.base / "ideas"
+        self.source.mkdir()
+        self.source_home = self.base / "source-state"
+        subprocess.run(["git", "-C", str(self.source), "init", "-q"], check=True, capture_output=True)
+        self.source_reply = None
+        self.source_failure = False
+        with self.source_store():
+            pass  # Known empty source state is different from a failed observation.
+
+    def source_store(self):
+        with mock.patch("relay_core.store._expected_workspace_binding",
+                        return_value=(self.source / ".git").resolve()):
+            return RelayStore.open(repo=self.source, state_home=self.source_home)
+
+    def ledger(self, repo, *arguments):
+        source_read = Path(repo).is_relative_to(self.source)
+        if source_read and arguments[:2] == ("wake-ledger", "show"):
+            if self.source_failure or self.source_reply is not None:
+                self.ledger_calls.append((str(repo), arguments))
+                return (74, None, "synthetic source state unavailable") if self.source_failure else (
+                    0, json.loads(json.dumps(self.source_reply)), "")
+        expected = self.source / ".git" if source_read else self.repo / ".git"
+        state_home = self.source_home if source_read else self.home
+        with mock.patch("relay_core.store._expected_workspace_binding", return_value=expected.resolve()), \
+             mock.patch.object(self, "home", state_home):
+            return super().ledger(repo, *arguments)
+
+    def source_binding(self, role="engineer", *, provider="claude", session="sender", thread=OTHER):
+        with self.source_store() as store:
+            result = store.wake_bind(role, provider=provider, replace=False, agent="claude", session=session,
+                                    endpoint="unix:///srv/fixture-source.sock",
+                                    **({"thread": thread, "cwd": str(self.source)} if provider == "codex" else {}))
+        return result["binding"]
+
+    def source_snapshot(self):
+        with self.source_store() as store:
+            return store.wake_bindings()
+
+    def sender_wake(self, *extra, recipient="operator", agent="claude", session="sender", cwd=None, ref=None):
+        actor = ["--agent", agent, *([] if session is None else ["--session", session])]
+        with mock.patch.object(wake.os, "getcwd", return_value=str(cwd or self.source)), \
+             mock.patch.dict(os.environ, {"RELAY_SESSION": ""}):
+            code, out = self.run_helper(wake.wake_main, recipient, "--ref", str(ref or self.task), *actor,
+                                        "--codex", str(self.codex), "--json", *extra)
+        result = json.loads(out)
+        self.assertEqual(code, result["exit_code"])
+        return result
+
+    def expected_sender(self, binding, project="ideas"):
+        return {"ledger": str(self.source), "role": binding["role"],
+                "generation": binding["generation"], "project": project}
+
+    def assert_queue_text(self, text):
+        call = self.codex_calls()[-1]
+        self.assertEqual(text, call[call.index("--message") + 1])
+        self.assertEqual(THREAD, call[call.index("--thread") + 1])
+
+    def test_default_source_subdirectory_and_paused_holder_survive_forwarded_filename(self):
+        self.bound()
+        binding = self.source_binding()
+        with self.source_store() as store:
+            store.wake_control("pause", "engineer", agent="claude", session="sender")
+        subdirectory = self.source / "notes"
+        subdirectory.mkdir()
+        forwarded = self.base / "forwarded-codex-session-31.md"
+        forwarded.write_text("synthetic forwarded work\n")
+        source_before = self.source_snapshot()
+        result = self.sender_wake(cwd=subdirectory, ref=forwarded)
+        self.assertEqual(("QUEUED", "observed"), (result["status"], result["sender_state"]))
+        expected = self.expected_sender(binding)
+        self.assertEqual(expected, result["sender"])
+        self.assertEqual(str(self.repo), result["ledger"])
+        text = f"Multithread wake from claude (ideas/engineer): {forwarded}"
+        self.assertEqual(text, result["text"])
+        self.assert_queue_text(text)
+        self.assertEqual(expected, self.events("wake.attempted")[-1]["meta"]["sender"])
+        self.assertEqual(source_before, self.source_snapshot(), "source observation must not mutate its bindings")
+        self.assertIn((str(subdirectory), ("wake-ledger", "show")), self.ledger_calls)
+
+    def test_explicit_source_override_reaches_running_turn_with_original_snapshot(self):
+        self.bound()
+        self.live()
+        binding = self.source_binding()
+        result = self.sender_wake("--sender-repo", str(self.source), "--steer", cwd=self.repo)
+        expected = self.expected_sender(binding)
+        self.assertEqual(("STEERED", "observed"), (result["status"], result["sender_state"]))
+        self.assertEqual(expected, result["sender"])
+        text = f"Multithread wake from claude (ideas/engineer): {self.task}"
+        requests = [r["params"] for r in self.daemon.requests if r.get("method") == "turn/steer"]
+        self.assertEqual([{"threadId": THREAD, "expectedTurnId": LIVE_TURN,
+                          "clientUserMessageId": result["message_id"],
+                          "input": [{"type": "text", "text": text}]}], requests)
+        self.assertEqual([], self.codex_calls())
+        self.assertEqual(expected, self.events("wake.attempted")[-1]["meta"]["sender"])
+
+    def test_codex_recipient_identity_not_binding_recorder_supplies_claude_inbox_header(self):
+        inbox = FakeInbox(self.codex_home / "source-context.sock")
+        self.inbox = inbox
+        self.addCleanup(inbox.close)
+        code, out = self.run_helper(wake.bind_main, "reviewer", "--claude-socket", str(inbox.path),
+                                    "--agent", "claude", "--session", "receiver", "--json")
+        self.assertEqual(0, code, out)
+        binding = self.source_binding(provider="codex", session="registrar", thread=OTHER)
+        result = self.sender_wake(recipient="reviewer", agent="codex", session=OTHER)
+        self.assertEqual(("DELIVERED TO INBOX", "observed"), (result["status"], result["sender_state"]))
+        expected = self.expected_sender(binding)
+        self.assertEqual(expected, result["sender"])
+        text = f"Multithread wake from codex (ideas/engineer): {self.task}"
+        self.assertEqual([{"type": "user", "message": {"role": "user", "content": text}}],
+                         ClaudeTests.received(self))
+        self.assertEqual(expected, self.events("wake.attempted")[-1]["meta"]["sender"])
+        self.assertEqual([], self.codex_calls())
+        self.assertEqual(0, self.daemon.connections, "no source daemon probe is needed to read a binding")
+        for agent, session in (("claude", "registrar"), ("codex", "registrar")):
+            with self.subTest(agent=agent):
+                recorder = self.sender_wake("--dry-run", "--id", "recorder-only-" + agent,
+                                            recipient="reviewer", agent=agent, session=session)
+                self.assertEqual("unbound", recorder["sender_state"])
+                self.assertNotIn("sender", recorder)
+                self.assertEqual(f"Multithread wake from {agent}: {self.task}", recorder["text"])
+
+    def test_multiple_same_session_roles_fall_back_until_explicitly_selected(self):
+        self.bound()
+        self.source_binding()
+        selected = self.source_binding("researcher")
+        automatic = self.sender_wake()
+        self.assertEqual(("QUEUED", "ambiguous"), (automatic["status"], automatic["sender_state"]))
+        self.assertNotIn("sender", automatic)
+        self.assert_queue_text(f"Multithread wake from claude: {self.task}")
+        self.assertNotIn("sender", self.events("wake.attempted")[-1]["meta"])
+        explicit = self.sender_wake("--sender-role", "researcher", "--id", "selected-researcher")
+        self.assertEqual(("QUEUED", "observed"), (explicit["status"], explicit["sender_state"]))
+        self.assertEqual(self.expected_sender(selected), explicit["sender"])
+        self.assert_queue_text(f"Multithread wake from claude (ideas/researcher): {self.task}")
+        self.assertIn((str(self.source), ("wake-ledger", "show", "researcher")), self.ledger_calls)
+
+    def test_explicit_wrong_holder_or_unavailable_source_refuses_before_target_mutation(self):
+        self.bound()
+        self.source_binding("foreign", session="someone-else")
+        self.source_binding("recorded-only", provider="codex", session="sender", thread=OTHER)
+        before = self.events()
+        transport = (self.daemon.connections, self.codex_calls(), self.daemon.methods())
+        for role in ("foreign", "recorded-only", "missing"):
+            with self.subTest(role=role):
+                result = self.sender_wake("--sender-role", role)
+                self.assertEqual("NOT SENT", result["status"])
+                self.assertNotIn("sender", result)
+                self.assertEqual(before, self.events())
+                self.assertEqual(transport, (self.daemon.connections, self.codex_calls(), self.daemon.methods()))
+        self.source_failure = True
+        failed = self.sender_wake("--sender-role", "foreign")
+        self.assertEqual(("NOT SENT", "unavailable"), (failed["status"], failed["sender_state"]))
+        self.assertEqual(before, self.events())
+        self.assertEqual(transport, (self.daemon.connections, self.codex_calls(), self.daemon.methods()))
+        target_steps = [args[1] for repo, args in self.ledger_calls
+                        if repo == str(self.repo) and len(args) > 1 and args[0] == "wake-ledger"]
+        self.assertNotIn("begin", target_steps)
+        self.assertNotIn("conclude", target_steps)
+
+    def test_known_unbound_failed_and_malformed_source_have_distinct_fallback_states(self):
+        self.bound()
+        absent = self.sender_wake("--id", "known-unbound")
+        self.assertEqual(("QUEUED", "unbound"), (absent["status"], absent["sender_state"]))
+        self.assertNotIn("sender", absent)
+        self.assert_queue_text(f"Multithread wake from claude: {self.task}")
+        self.source_failure = True
+        failed = self.sender_wake("--id", "source-unavailable")
+        self.assertEqual(("QUEUED", "unavailable"), (failed["status"], failed["sender_state"]))
+        self.assertNotIn("sender", failed)
+        self.assertNotIn("sender", self.events("wake.attempted")[-1]["meta"])
+        self.source_failure = False
+        self.source_binding()
+        valid = self.source_snapshot()
+        corruptions = [
+            {**valid, "ledger": "relative/source"},
+            {**valid, "project": "ideas\nforged"},
+            {**valid, "bindings": [{**valid["bindings"][0], "generation": True}]},
+            {**valid, "ledger": "relative/source", "bindings": []},
+            {**valid, "project": "ideas\nforged", "bindings": [{"role": "engineer", "state": "unbound"}]},
+        ]
+        for index, malformed in enumerate(corruptions):
+            with self.subTest(index=index):
+                self.source_reply = malformed
+                result = self.sender_wake("--id", "malformed-" + str(index))
+                self.assertEqual(("QUEUED", "unavailable"), (result["status"], result["sender_state"]))
+                self.assertNotIn("sender", result)
+                self.assert_queue_text(f"Multithread wake from claude: {self.task}")
+                self.assertNotIn("sender", self.events("wake.attempted")[-1]["meta"])
+
+    def test_source_role_change_preserves_duplicate_suppression_and_historical_snapshot(self):
+        self.bound()
+        original = self.source_binding()
+        first = self.sender_wake()
+        original_sender = self.expected_sender(original)
+        self.assertEqual(original_sender, self.events("wake.attempted")[-1]["meta"]["sender"])
+        with self.source_store() as store:
+            store.wake_control("unbind", "engineer", agent="claude", session="sender")
+        replacement = self.source_binding("researcher")
+        attempts = self.events("wake.attempted")
+        again = self.sender_wake()
+        self.assertEqual("ALREADY SENT", again["status"])
+        self.assertEqual(first["message_id"], again["message_id"])
+        self.assertEqual(attempts, self.events("wake.attempted"))
+        self.assertEqual(1, len(self.codex_calls()))
+        with self.store() as store:
+            historical = store.wake_history("operator")["attempts"]
+        self.assertEqual(1, len(historical))
+        self.assertEqual(original_sender, historical[0]["sender"])
+        deliberate = self.sender_wake("--id", first["message_id"] + ".2")
+        self.assertEqual("QUEUED", deliberate["status"])
+        self.assertEqual(self.expected_sender(replacement), self.events("wake.attempted")[-1]["meta"]["sender"])
+        self.assertEqual(original_sender, self.events("wake.attempted")[0]["meta"]["sender"])
+
+    def test_dry_run_observes_exact_session_and_null_project_without_writes_or_inheritance(self):
+        self.bound()
+        binding = self.source_binding()
+        before = self.events()
+        exact = self.sender_wake("--dry-run")
+        self.assertEqual(("DRY RUN", "observed"), (exact["status"], exact["sender_state"]))
+        self.assertEqual(self.expected_sender(binding), exact["sender"])
+        self.source_reply = {**self.source_snapshot(), "project": None}
+        nullable = self.sender_wake("--dry-run")
+        self.assertEqual(self.expected_sender(binding, project=None), nullable["sender"])
+        self.assertEqual(f"Multithread wake from claude (engineer): {self.task}", nullable["text"])
+        self.source_reply = None
+        source_reads = [call for call in self.ledger_calls if Path(call[0]).is_relative_to(self.source)]
+        missing = self.sender_wake("--dry-run", session=None)
+        self.assertEqual(("DRY RUN", "unavailable"), (missing["status"], missing["sender_state"]))
+        self.assertNotIn("sender", missing)
+        self.assertEqual(f"Multithread wake from claude: {self.task}", missing["text"])
+        explicit = self.sender_wake("--dry-run", "--sender-role", "engineer", session=None)
+        self.assertEqual("NOT SENT", explicit["status"])
+        self.assertEqual(source_reads, [call for call in self.ledger_calls
+                                       if Path(call[0]).is_relative_to(self.source)])
+        self.assertEqual(before, self.events())
+        self.assertEqual([], self.codex_calls())
+
+
 class WakeOutcomeTests(WakeCase):
     def test_status_reads_original_attempt_after_ref_vanishes_without_native_contact(self):
         generation = self.bound()
