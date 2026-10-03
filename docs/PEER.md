@@ -434,10 +434,31 @@ multithread bind operator --thread <conversation uuid> --scope project/workstrea
 multithread wake operator --ref /absolute/path/task.md --agent claude --session <session>
 ```
 
-The conversation receives `Multithread wake from claude: /absolute/path/task.md`.
+Without an observed sender role, the conversation receives
+`Multithread wake from claude: /absolute/path/task.md`.
 A ledger sequence also works as `--ref`; the message then names this checkout's
 ledger. The binding and every attempt live in the ledger of the checkout you
 run them in, or of `--repo`.
+
+On unreleased main, an exact sender binding adds compact context:
+`Multithread wake from claude (project/reviewer): /absolute/path/task.md`.
+The source is the command's original current directory; `--sender-repo` selects
+another source checkout, independently of the recipient's `--repo`. A Codex
+sender matches its exact conversation, while a Claude sender matches the binding's
+recorded owner agent and session. Pausing incoming wakes does not remove a held
+sender role. If several roles match, `--sender-role reviewer` selects one and
+requires that exact source binding before recording or sending.
+
+Automatic lookup keeps the plain header when the sender is unbound, ambiguous
+or unavailable. JSON distinguishes those states through `sender_state`; an
+unavailable source is never reported as an empty ledger. A safe project label
+comes from the shared checkout's directory name, so linked worktrees use the
+same label. Other directory names produce role-only context. The original
+attempt retains the source ledger, role, generation and nullable project under
+`sender`; later rebinding cannot relabel it or change duplicate suppression.
+These labels describe an observed binding and grant no authority. A role in a
+filename can identify its author, but a forwarded file's author can differ from
+the sender. No filename convention is required for wake attribution.
 
 - **Bind** asks the daemon whether the conversation exists, shows its directory
   and status, and records the binding; its sequence is the binding's
@@ -600,7 +621,7 @@ multithread wake operator --status --ref /absolute/path/task.md --json
 For the first history page omit `--before`; use the returned sequence for older
 pages. `roles` shows the binding generation, holder, declared scope and charter.
 History preserves each attempt's original generation and recipient, transport
-outcome and consumption evidence. `wake --status` is read-only: it neither
+outcome, optional observed sender and consumption evidence. `wake --status` is read-only: it neither
 rereads the task file (which may have vanished), probes the recipient nor sends
 again. `QUEUED`, `STEERED` and `DELIVERED TO INBOX` record transport acceptance.
 File-pointer and non-delivery-event consumption remain `unknown`; a wake naming

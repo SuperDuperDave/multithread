@@ -26,8 +26,8 @@ import subprocess
 import sys
 
 from relay_core.protocol import (ValidationError, canonical_agent, canonical_wake_expectation,
-                                 canonical_wake_message_id, canonical_wake_ref,
-                                 canonical_wake_role, canonical_wake_thread)
+                                 canonical_wake_message_id, canonical_wake_project, canonical_wake_ref,
+                                 canonical_wake_role, canonical_wake_sender, canonical_wake_thread)
 from . import account_launcher, hooks
 from .enrollment import NotEnrolled
 
@@ -387,10 +387,58 @@ def fingerprint(path):
     return digest.hexdigest(), size
 
 
-def message_text(agent, ref, ledger):
+def message_text(agent, ref, ledger, sender=None):
     """The whole wake: who sends it and where the work is, never the work itself."""
     where = f"ledger sequence {ref} in {ledger}" if ref.isdigit() else ref
-    return f"Multithread wake from {agent}: {where}"
+    context = ""
+    if sender is not None:
+        label = f"{sender['project']}/{sender['role']}" if sender["project"] else sender["role"]
+        context = f" ({label})"
+    return f"Multithread wake from {agent}{context}: {where}"
+
+
+def _sender_context(source, agent, session, role, ledger):
+    """Observe one source ledger; a display label never grants coordination authority."""
+    if not session:
+        return "unavailable", None
+    code, reply, problem = ledger(source, "wake-ledger", "show", *([role] if role else []))
+    if code != 0:
+        return "unavailable", None
+    try:
+        if not isinstance(reply, dict) or not isinstance(reply.get("bindings"), list):
+            raise ValidationError("unusable sender bindings")
+        # A missing project field means this source cannot supply the new snapshot.
+        project = canonical_wake_project(reply["project"])
+        source_ledger = canonical_wake_ref(reply["ledger"])
+        if not source_ledger.startswith("/"):
+            raise ValidationError("sender ledger must be an absolute path")
+        matches = []
+        for binding in reply["bindings"]:
+            if not isinstance(binding, dict) or binding.get("state") not in ("active", "paused", "unbound"):
+                raise ValidationError("unusable sender binding")
+            bound_role = canonical_wake_role(binding.get("role"))
+            if role is not None and bound_role != role:
+                raise ValidationError("sender lookup returned another role")
+            if binding["state"] == "unbound":
+                continue
+            if binding.get("provider") == "codex":
+                thread = canonical_wake_thread(binding.get("thread"))
+                owns = agent == "codex" and session == thread
+            elif binding.get("provider") == "claude":
+                owner = canonical_agent(binding.get("bound_agent"))
+                owner_session = canonical_agent(binding.get("bound_session"))
+                owns = agent == owner and session == owner_session
+            else:
+                raise ValidationError("unusable sender provider")
+            snapshot = canonical_wake_sender({"ledger": source_ledger, "role": bound_role,
+                                              "generation": binding.get("generation"), "project": project})
+            if owns:
+                matches.append(snapshot)
+        if len(matches) > 1:
+            return "ambiguous", None
+        return ("observed", matches[0]) if matches else ("unbound", None)
+    except (KeyError, TypeError, ValidationError):
+        return "unavailable", None
 
 
 def _native(value):
@@ -432,10 +480,15 @@ def wake_status(args, ledger=launcher_ledger):
 
 
 def wake(args, ledger=launcher_ledger):
-    repo = Path(args.repo or os.getcwd()).absolute()
+    cwd = os.getcwd()
+    repo = Path(args.repo or cwd).absolute()
+    source = Path(getattr(args, "sender_repo", None) or cwd).absolute()
     requested = "steer" if args.steer else "queue"
     try:
-        agent, session = _actor(args, session_required=not args.dry_run)
+        sender_role = getattr(args, "sender_role", None)
+        if sender_role is not None:
+            sender_role = canonical_wake_role(sender_role)
+        agent, session = _actor(args, session_required=not args.dry_run or sender_role is not None)
         role = canonical_wake_role(args.role)
         ref = canonical_wake_ref(args.ref)
         if args.message_id is not None:
@@ -460,11 +513,18 @@ def wake(args, ledger=launcher_ledger):
                             "sent.", "Make the file readable, or pass another task file, then run this again.")
         content = ["--ref-sha256", sha256, "--ref-size", str(size)]
 
+    sender_state, sender = _sender_context(source, agent, session, sender_role, ledger)
+    if sender_role is not None and sender_state != "observed":
+        return _outcome("NOT SENT", f"The source ledger at {source} did not confirm {sender_role} for this "
+                        f"sender session ({sender_state}). Nothing was recorded or sent.",
+                        "Read the source binding and reconcile --sender-role, --sender-repo and the exact "
+                        "sender identity before sending again.", sender_state=sender_state)
     step = ["plan", role] if args.dry_run else ["begin", role, "--agent", agent, "--session", session]
+    sender_arguments = ["--sender-json", json.dumps(sender)] if sender is not None and not args.dry_run else []
     expectation = [argument for field, value in (expected_binding or {}).items()
                    for argument in ("--expect-" + field.replace("_", "-"), str(value))]
     code, decision, problem = ledger(repo, "wake-ledger", *step, "--ref", ref, "--requested", requested, *content,
-                                     *(["--id", args.message_id] if args.message_id else []), *expectation)
+                                     *(["--id", args.message_id] if args.message_id else []), *expectation, *sender_arguments)
     if code != 0:
         next_step = ("Read the role's binding again and reconcile the expected recipient deliberately; "
                      "do not retry automatically."
@@ -475,6 +535,7 @@ def wake(args, ledger=launcher_ledger):
     status, binding, message_id = decision["status"], decision["binding"], decision["message_id"]
     base = {"role": role, "ref": ref, "requested": requested, "ledger": decision["ledger"],
             "message_id": message_id,
+            "sender_state": sender_state, **({"sender": sender} if sender is not None else {}),
             "recipient_state": {"reachability": "unknown", "turn_state": "unknown", "source": "unobserved"},
             **({"ref_sha256": content[1], "ref_size": int(content[3])} if content else {})}
     if status == "unbound":
@@ -489,6 +550,11 @@ def wake(args, ledger=launcher_ledger):
                         "is still unused.", **base)
     if status == "already_sent":
         prior = decision["prior"]
+        # A later source binding cannot relabel an immutable original attempt.
+        base.pop("sender", None)
+        base["sender_state"] = "observed" if prior.get("sender") is not None else "unavailable"
+        if prior.get("sender") is not None:
+            base["sender"] = prior["sender"]
         again = _next_id(message_id)
         unchanged = (f", and {ref} hasn't changed since" if content and prior.get("ref_sha256") == content[1]
                      else "")
@@ -503,7 +569,7 @@ def wake(args, ledger=launcher_ledger):
                         f"Check the recipient's conversation first. If it didn't arrive, send it with --id {again}.",
                         prior=prior, **base)
 
-    text = message_text(agent, ref, decision["ledger"])
+    text = message_text(agent, ref, decision["ledger"], sender)
     base.update(text=text)
     endpoint = binding["endpoint"]
     path = endpoint.removeprefix("unix://")
@@ -716,7 +782,7 @@ def _wake_inbox(args, role, path, text, message_id, base, conclude):
 
 def wake_main(argv=None, *, ledger=launcher_ledger):
     parser = argparse.ArgumentParser(prog="multithread wake", description=(
-        "Send `Multithread wake from <agent>: <ref>` to what a role is bound to. A Codex conversation gets it "
+        "Send a compact agent and observed project/role pointer to what a role is bound to. A Codex conversation gets it "
         "through the shared Codex daemon, queued by default; --steer submits it to the observed running turn "
         "instead, and queues when none is running. A Claude Code session gets it in its inbox. Acceptance "
         "does not establish a new turn or consumption. Each attempt is recorded in this ledger; --status "
@@ -737,6 +803,8 @@ def wake_main(argv=None, *, ledger=launcher_ledger):
     parser.add_argument("--expect-bound-session", help="expected Claude binding's recorded owner session")
     parser.add_argument("--agent", help="sender named in the wake; default RELAY_AGENT")
     parser.add_argument("--session", help="sender's session for the ledger record; default RELAY_SESSION")
+    parser.add_argument("--sender-repo", help="source checkout for sender-role observation; default: original current directory")
+    parser.add_argument("--sender-role", help="select and require this exact sender role when a session holds several")
     parser.add_argument("--codex", help="absolute Codex executable for codex queue; default: PATH")
     parser.add_argument("--repo", help="checkout whose ledger holds the binding; default: current directory")
     parser.add_argument("--json", action="store_true", help="one JSON object with the same outcome")
@@ -744,9 +812,10 @@ def wake_main(argv=None, *, ledger=launcher_ledger):
     if not args.status and args.ref is None:
         parser.error("--ref is required unless --status is used")
     if args.status and (args.steer or args.dry_run or args.message_id is not None
+                        or args.sender_repo is not None or args.sender_role is not None
                         or any(getattr(args, "expect_" + field) is not None for field in
                                ("generation", "provider", "thread", "bound_agent", "bound_session"))):
-        parser.error("--status cannot be combined with --steer, --dry-run, --id or --expect-* flags")
+        parser.error("--status cannot be combined with sending or sender-selection flags")
     return _emit(wake_status(args, ledger) if args.status else wake(args, ledger), args.json)
 
 

@@ -28,6 +28,7 @@ from relay_core.protocol import (  # noqa: E402
     WAKE_ATTEMPT_KINDS,
     WAKE_BINDING_KINDS,
     canonical_wake_expectation,
+    canonical_wake_sender,
     normalize_event,
     session_target,
 )
@@ -219,6 +220,152 @@ class WakeExpectationProtocolTests(unittest.TestCase):
         for value in malformed:
             with self.subTest(value=value), self.assertRaises(ValidationError):
                 canonical_wake_expectation(value)
+
+
+class WakeSenderProtocolTests(unittest.TestCase):
+    def test_omission_and_complete_nullable_project_return_detached_snapshots(self):
+        self.assertIsNone(canonical_wake_sender(None))
+        for project in (None, "source-project", "p" * 80):
+            source = {"ledger": "/srv/source", "role": "engineer", "generation": 7, "project": project}
+            sender = canonical_wake_sender(MappingProxyType(source))
+            self.assertEqual(source, sender)
+            self.assertIs(type(sender), dict)
+            source["generation"] = 8
+            self.assertEqual(7, sender["generation"])
+
+    def test_sender_shape_and_canonical_fields_refuse_malformed_values(self):
+        source = {"ledger": "/srv/source", "role": "engineer", "generation": 7, "project": "source-project"}
+        malformed = [False, [], "source", {}, {**source, "extra": "value"}]
+        malformed.extend({k: v for k, v in source.items() if k != field} for field in source)
+        for field, values in {
+            "ledger": (None, "source", " /srv/source", "/srv/source\n", "/srv/\x1bsource", "/" + "a" * 400),
+            "role": (None, "Engineer", " engineer", "engineer\n", False),
+            "generation": (None, True, False, 0, -1, "7", 7.0, 10**12 + 1),
+            "project": (False, "", "Source", "source project", "source_project", " source", "source\n", "p" * 81),
+        }.items():
+            malformed.extend({**source, field: value} for value in values)
+        for value in malformed:
+            with self.subTest(value=value), self.assertRaises(ValidationError):
+                canonical_wake_sender(value)
+
+    def test_only_attempt_metadata_accepts_one_complete_nested_sender(self):
+        source = {"ledger": "/srv/source", "role": "engineer", "generation": 7, "project": None}
+        attempt = {"kind": "wake.attempted", "agent": "claude", "session": "sender", "target": "operator",
+                   "summary": "Wake", "meta": {"role": "operator", "generation": 1, "provider": "codex",
+                    "thread": THREAD, "message_id": "sender-roundtrip", "ref": "/srv/task.md",
+                    **TASK, "requested": "queue", "sender": source}}
+        event = normalize_event(attempt, internal=True)
+        self.assertEqual(source, event.as_dict()["meta"]["sender"])
+        source["generation"] = 8
+        self.assertEqual(7, event.meta["sender"]["generation"])
+        for malformed in (None, {}, {**source, "generation": True}, {**source, "project": "bad\nlabel"}):
+            with self.subTest(malformed=malformed), self.assertRaises(ValidationError):
+                normalize_event({**attempt, "meta": {**attempt["meta"], "sender": malformed}}, internal=True)
+        for raw in (bound(sender=source), concluded(sender=source)):
+            with self.assertRaisesRegex(ValidationError, "metadata keys not allowed"):
+                normalize_event(raw, internal=True)
+
+
+class WakeSenderLedgerTests(WakeLedgerCase):
+    def sender(self):
+        return {"ledger": "/srv/source", "role": "engineer", "generation": 7, "project": "source-project"}
+
+    def send(self, sender=None, message_id=None):
+        return self.store.wake_begin("operator", ref="/srv/task.md", requested="queue",
+                                     agent="claude", session="sender", sender=sender,
+                                     message_id=message_id, **TASK)
+
+    def test_sender_snapshot_roundtrips_and_survives_source_binding_changes(self):
+        self.bind()
+        source = self.bind(OTHER, role="engineer")["binding"]
+        sender = {"ledger": str(self.repo), "role": "engineer", "generation": source["generation"],
+                  "project": "controller"}
+        original = dict(sender)
+        begun = self.send(sender)
+        self.assertEqual(original, begun["sender"])
+        sender["generation"] += 100
+        event = self.store.events(after=begun["attempt_seq"] - 1, limit=1)[0]
+        self.assertEqual(original, event["meta"]["sender"])
+        self.bind(THREAD, role="engineer", replace=True)
+        self.store.wake_control("pause", "engineer", agent="claude", session="binder")
+        self.assertEqual(original, self.store.wake_history("operator")["attempts"][0]["sender"])
+        shown = self.store.wake_bindings("operator")["bindings"][0]["last_attempt"]
+        self.assertEqual(original, shown["sender"])
+        shown["sender"]["project"] = "changed-query"
+        self.assertEqual(original, self.store.wake_history("operator")["attempts"][0]["sender"])
+
+    def test_sender_omission_keeps_legacy_attempt_and_decision_shapes(self):
+        self.bind()
+        begun = self.send()
+        self.assertNotIn("sender", begun)
+        self.assertNotIn("sender", self.store.events(after=begun["attempt_seq"] - 1, limit=1)[0]["meta"])
+        self.assertNotIn("sender", self.store.wake_history("operator")["attempts"][0])
+
+    def test_changing_sender_does_not_change_identity_or_resend_open_and_concluded_attempts(self):
+        self.bind()
+        expected_id = self.plan()["message_id"]
+        begun = self.send(self.sender())
+        self.assertEqual(expected_id, begun["message_id"])
+        changed = {**self.sender(), "generation": 99, "ledger": "/srv/other", "project": "other-project"}
+        before = self.store.events()
+        duplicate = self.send(changed)
+        self.assertEqual("already_sent", duplicate["status"])
+        self.assertEqual(self.sender(), duplicate["prior"]["sender"])
+        self.assertEqual(before, self.store.events())
+        self.conclude(begun["attempt_seq"])
+        before = self.store.events()
+        self.assertEqual("already_sent", self.send(changed)["status"])
+        self.assertEqual(before, self.store.events())
+
+    def test_malformed_sender_refuses_before_binding_read_or_write_transaction(self):
+        self.bind()
+        before = self.store.events()
+        malformed = ({}, {**self.sender(), "generation": True}, {**self.sender(), "project": "two\nlines"},
+                     {**self.sender(), "extra": "field"})
+        with mock.patch.object(self.store, "_transaction", side_effect=AssertionError("transaction started")), \
+                mock.patch.object(self.store, "_wake_binding", side_effect=AssertionError("binding read")):
+            for sender in malformed:
+                with self.subTest(sender=sender), self.assertRaises(ValidationError):
+                    self.send(sender)
+        self.assertEqual(before, self.store.events())
+
+    def test_project_names_common_owner_across_linked_worktrees(self):
+        linked = self.base / "different-worktree-name"
+        subprocess.run(["git", "-C", str(self.repo), "worktree", "add", "-q", "-b", "linked", str(linked)], check=True)
+        with RelayStore.open(repo=linked, state_home=self.home) as other:
+            self.assertEqual("controller", self.store.wake_bindings()["project"])
+            self.assertEqual("controller", other.wake_bindings()["project"])
+            self.assertEqual(str(linked), other.wake_bindings()["ledger"])
+
+    def test_unsafe_or_unbounded_project_name_is_null(self):
+        for name in ("Unsafe-Name", "unsafe_name", "a" * 81):
+            repo = self.make_repo(name)
+            with mock.patch("relay_core.store._expected_workspace_binding", return_value=(repo / ".git").resolve()):
+                with RelayStore.open(repo=repo, state_home=self.base / (name + "-state")) as store:
+                    self.assertIsNone(store.wake_bindings()["project"])
+
+    def test_cli_sender_roundtrip_and_strict_rejection_before_opening_ledger(self):
+        self.bind()
+        base = ("--json", "wake-ledger", "begin", "operator", "--agent", "claude", "--session", "sender",
+                "--ref", "/srv/task.md", "--requested", "queue", "--ref-sha256", TASK["ref_sha256"],
+                "--ref-size", str(TASK["ref_size"]))
+        code, out, err = self.cli(*base, "--sender-json", json.dumps(self.sender()))
+        self.assertEqual((0, ""), (code, err))
+        self.assertEqual(self.sender(), json.loads(out)["sender"])
+        before = self.store.events()
+        malformed = ("null", "[]", "{", '{"ledger":"/srv/source","ledger":"/srv/other"}',
+                     json.dumps({**self.sender(), "generation": True}),
+                     json.dumps({**self.sender(), "project": "two\nlines"}),
+                     json.dumps({**self.sender(), "generation": float("nan")}),
+                     json.dumps({k: v for k, v in self.sender().items() if k != "project"}),
+                     json.dumps({**self.sender(), "extra": "field"}))
+        with mock.patch.object(core_cli.RelayStore, "open", side_effect=AssertionError("ledger opened")):
+            for raw in malformed:
+                with self.subTest(raw=raw):
+                    code, out, err = self.cli(*base, "--sender-json", raw)
+                    self.assertEqual((64, ""), (code, out))
+                    self.assertTrue(err)
+        self.assertEqual(before, self.store.events())
 
 
 class WakeExpectedBindingTests(WakeLedgerCase):
