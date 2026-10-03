@@ -695,7 +695,8 @@ class _Driver:
             self.observe("codex_model_rerouted", {"model": params.get("toModel")})
         elif method == "thread/tokenUsage/updated":
             usage = params.get("tokenUsage")
-            names = ("inputTokens", "outputTokens", "cachedInputTokens", "reasoningOutputTokens", "totalTokens")
+            names = ("inputTokens", "outputTokens", "cachedInputTokens", "cacheWriteInputTokens",
+                     "reasoningOutputTokens", "totalTokens")
             replace_measurement_errors(self.envelope, {}, "usage", "model_context_window")
             if not isinstance(usage, dict):
                 measurement_error(self.envelope, "usage")
