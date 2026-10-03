@@ -74,7 +74,10 @@ def build_parser() -> argparse.ArgumentParser:
     _add_actor(signal)
     signal.add_argument("--summary", required=True)
     signal.add_argument("--work-id")
-    signal.add_argument("--target")
+    signal.add_argument(
+        "--target",
+        help="recipient agent label or encoded exact recipient; wake role names are not resolved",
+    )
     signal.add_argument("--target-session", help="exact recipient session; requires --target agent")
     signal.add_argument("--scope")
     signal.add_argument("--artifact", help="required for work.handoff/review.requested unless --commit is used; "

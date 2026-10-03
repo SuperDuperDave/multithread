@@ -1183,7 +1183,8 @@ class RelayStore:
         exact = session_target(agent, session)
         if signal["target"] not in {None, agent, exact}:
             raise ConflictError(
-                f"signal {signal_seq} is targeted to {signal['target']}, not {exact}"
+                f"signal {signal_seq} is targeted to {signal['target']}, not {exact}. "
+                "Signal targets are agent identities; wake role bindings do not redirect ACKs."
             )
         recipient = exact if signal["target"] == exact else agent
         digest = hashlib.sha256(recipient.encode("utf-8")).hexdigest()[:24]

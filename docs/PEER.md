@@ -185,6 +185,14 @@ To address one reviewer session, use `--target claude --target-session EXACT_REV
 Exact recipients are stored as a compact JSON pair, such as `["claude","reviewer-session"]`.
 For direct event emission use a string containing that pair as `target`; bare labels containing
 colons retain their existing generic-agent meaning.
+`signal --target` addresses an agent identity; it does not resolve a role binding.
+For example, `wake reviewer` uses the role's current native route, while a handoff
+for one Codex reviewer uses `--target codex --target-session EXACT_REVIEWER_SESSION`.
+Inspect `roles reviewer --json` to establish the current binding. A Codex binding's
+`thread` is its conversation ID; a Claude binding's recorded holder is not proof
+of the recipient's session identity. Obtain that identity from the recipient's
+actual coordination context before targeting it. A handoff's stored recipient
+does not follow a role handover.
 The [first read-only collaboration](#first-collaboration) needs no handoff.
 
 Use the installed launcher's actual path, normally:
@@ -567,6 +575,16 @@ signal, explicitly record `multithread acknowledge SEQ --agent codex --session
 EXACT_SESSION`; an ACK records consumption, not approval or task completion.
 An exact-session signal requires that recipient's exact identity. Do not
 acknowledge on another session's behalf.
+If an ACK refuses because a signal names a role instead of your agent identity,
+keep your `--agent` and `--session` unchanged. Read the full event with
+`events --after PREVIOUS_SEQ --limit 1`, where PREVIOUS_SEQ is the signal's
+sequence minus one. Preserve any written consumption assessment. If a new delivery
+or durable handoff is needed within the existing task authority, its sender verifies
+the intended recipient and issues a new handoff with the correct agent/session.
+The original signal remains evidence; rebinding a role does not repair its target
+or authorize consuming it as another identity. Wake events are notification
+records, not ACK-eligible handoffs. Decision requests use `decision respond`
+rather than a standalone ACK.
 
 Inspect the role before changing it, and page its original-binding attempts
 with the returned `next_before` cursor:
