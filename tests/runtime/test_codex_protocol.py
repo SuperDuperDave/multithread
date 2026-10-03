@@ -27,6 +27,7 @@ OTHER_TURN = "40000000-0000-4000-8000-000000000004"
 ANSWER = "Scoped final answer 雪"
 COUNTS = {"totalTokens": 30, "inputTokens": 20, "cachedInputTokens": 5,
           "outputTokens": 10, "reasoningOutputTokens": 3}
+SELECTED_COUNTS = {**COUNTS, "cacheWriteInputTokens": None}
 MODEL = "fixture-requested-model"
 EFFORT = "fixture-effort"
 UNOBSERVED = {"source": "unavailable", "reported_model": None, "relation": "unknown"}
@@ -1113,8 +1114,8 @@ class CodexProtocolTests(unittest.TestCase):
         self.configure(events=[usage_notification(usage), item(), completed()])
         code, result, _ = self.invoke()
         self.assertEqual(0, code, result)
-        self.assertEqual(COUNTS, result["usage"]["total"])
-        self.assertEqual(COUNTS, result["usage"]["last"])
+        self.assertEqual(SELECTED_COUNTS, result["usage"]["total"])
+        self.assertEqual(SELECTED_COUNTS, result["usage"]["last"])
         self.assertEqual("native_thread_last_and_total", result["usage_scope_id"])
         self.assertEqual(1000, result["model_context_window"])
         self.assertEqual([], result.get("measurement_errors", []))
@@ -1130,7 +1131,7 @@ class CodexProtocolTests(unittest.TestCase):
         self.assertEqual("returned", result["state"])
         self.assertEqual(ANSWER, result["result"])
         self.assertFalse(result["needs_attention"])
-        self.assertEqual({"last": COUNTS, "total": COUNTS}, result["usage"])
+        self.assertEqual({"last": SELECTED_COUNTS, "total": SELECTED_COUNTS}, result["usage"])
         self.assertIsNone(result["model_context_window"])
         self.assertIsNone(result["provider_duration_ms"])
         self.assertEqual({"model_context_window", "provider_duration_ms"},
@@ -1148,8 +1149,8 @@ class CodexProtocolTests(unittest.TestCase):
                 self.assertEqual("returned", result["state"])
                 self.assertEqual(ANSWER, result["result"])
                 self.assertFalse(result["needs_attention"])
-                self.assertEqual({**COUNTS, "inputTokens": None}, result["usage"]["last"])
-                self.assertEqual(COUNTS, result["usage"]["total"])
+                self.assertEqual({**SELECTED_COUNTS, "inputTokens": None}, result["usage"]["last"])
+                self.assertEqual(SELECTED_COUNTS, result["usage"]["total"])
                 self.assertEqual(["usage.last.inputTokens"], result["measurement_errors"])
                 self.assertEqual("native_thread_last_and_total", result["usage_scope_id"])
                 self.assertEqual("unknown", result["actual_billed_cost"])
@@ -1163,8 +1164,8 @@ class CodexProtocolTests(unittest.TestCase):
 
     def test_invalid_usage_object_or_part_is_unavailable_without_losing_answer(self):
         cases = [("fixture-invalid-usage", None, ["usage"]),
-                 ({"last": [], "total": COUNTS}, {"last": None, "total": COUNTS}, ["usage.last"]),
-                 ({"last": COUNTS, "total": False}, {"last": COUNTS, "total": None}, ["usage.total"])]
+                 ({"last": [], "total": COUNTS}, {"last": None, "total": SELECTED_COUNTS}, ["usage.last"]),
+                 ({"last": COUNTS, "total": False}, {"last": SELECTED_COUNTS, "total": None}, ["usage.total"])]
         for usage, expected, errors in cases:
             with self.subTest(usage=usage):
                 self.configure(events=[usage_notification(usage), item(), completed()])
@@ -1183,9 +1184,9 @@ class CodexProtocolTests(unittest.TestCase):
         self.assertEqual(0, code, result)
         self.assertEqual(ANSWER, result["result"])
         self.assertFalse(result["needs_attention"])
-        self.assertEqual({name: 0 if name == "inputTokens" else None for name in COUNTS},
+        self.assertEqual({name: 0 if name == "inputTokens" else None for name in SELECTED_COUNTS},
                          result["usage"]["last"])
-        self.assertEqual(dict.fromkeys(COUNTS), result["usage"]["total"])
+        self.assertEqual(dict.fromkeys(SELECTED_COUNTS), result["usage"]["total"])
         self.assertEqual([], result.get("measurement_errors", []))
 
     def test_latest_usage_replaces_stale_counters_and_deduplicates_named_errors(self):
@@ -1198,7 +1199,7 @@ class CodexProtocolTests(unittest.TestCase):
         self.assertEqual(0, code, result)
         self.assertEqual(ANSWER, result["result"])
         self.assertFalse(result["needs_attention"])
-        self.assertEqual({**COUNTS, "inputTokens": None, "outputTokens": 42}, result["usage"]["last"])
+        self.assertEqual({**SELECTED_COUNTS, "inputTokens": None, "outputTokens": 42}, result["usage"]["last"])
         self.assertIsNone(result["usage"]["total"])
         self.assertIsNone(result["model_context_window"])
         self.assertEqual({"usage.last.inputTokens", "usage.total"}, set(result["measurement_errors"]))
@@ -1220,7 +1221,8 @@ class CodexProtocolTests(unittest.TestCase):
                 self.assertEqual("returned", result["state"])
                 self.assertEqual(ANSWER, result["result"])
                 self.assertFalse(result["needs_attention"])
-                self.assertEqual({"last": latest_counts, "total": latest_counts}, result["usage"])
+                expected_counts = {**latest_counts, "cacheWriteInputTokens": None}
+                self.assertEqual({"last": expected_counts, "total": expected_counts}, result["usage"])
                 self.assertEqual(2000, result["model_context_window"])
                 self.assertEqual([], result.get("measurement_errors", []))
                 raw = [json.loads(line) for line in (directory / "stdout.json").read_text().splitlines()]
@@ -1279,7 +1281,7 @@ class CodexProtocolTests(unittest.TestCase):
         self.assertEqual(0, code, result)
         self.assertEqual(ANSWER, result["result"])
         self.assertFalse(result["needs_attention"])
-        self.assertEqual(related, result["usage"])
+        self.assertEqual({"last": SELECTED_COUNTS, "total": SELECTED_COUNTS}, result["usage"])
         self.assertEqual([], result.get("measurement_errors", []))
 
     def test_foreign_usage_cannot_clear_related_measurement_warnings(self):
@@ -1293,10 +1295,83 @@ class CodexProtocolTests(unittest.TestCase):
         self.assertEqual(0, code, result)
         self.assertEqual(ANSWER, result["result"])
         self.assertFalse(result["needs_attention"])
-        self.assertEqual({"last": {**COUNTS, "inputTokens": None}, "total": COUNTS}, result["usage"])
+        self.assertEqual({"last": {**SELECTED_COUNTS, "inputTokens": None},
+                          "total": SELECTED_COUNTS}, result["usage"])
         self.assertIsNone(result["model_context_window"])
         self.assertEqual({"usage.last.inputTokens", "model_context_window"},
                          set(result["measurement_errors"]))
+
+    def test_cache_write_usage_retains_supplied_integers_without_changing_other_counters(self):
+        for last, total in ((0, 0), (7, 11), (2**53 - 1, 2**53 - 1)):
+            with self.subTest(last=last, total=total):
+                usage = {"last": {**COUNTS, "cacheWriteInputTokens": last},
+                         "total": {**COUNTS, "cacheWriteInputTokens": total}}
+                self.configure(events=[usage_notification(usage), item(), completed()])
+                code, result, _ = self.invoke()
+                self.assertEqual(0, code, result)
+                self.assertEqual("returned", result["state"])
+                self.assertEqual(ANSWER, result["result"])
+                self.assertFalse(result["needs_attention"])
+                self.assertEqual(usage, result["usage"])
+                for part in ("last", "total"):
+                    self.assertEqual(COUNTS, {name: result["usage"][part][name] for name in COUNTS})
+                self.assertEqual([], result.get("measurement_errors", []))
+                self.assertEqual("unknown", result["actual_billed_cost"])
+
+    def test_absent_or_null_cache_write_usage_is_unknown_without_warning(self):
+        for explicit_null in (False, True):
+            with self.subTest(explicit_null=explicit_null):
+                usage = {"last": dict(COUNTS), "total": dict(COUNTS)}
+                if explicit_null:
+                    for part in ("last", "total"):
+                        usage[part]["cacheWriteInputTokens"] = None
+                self.configure(events=[usage_notification(usage), item(), completed()])
+                code, result, _ = self.invoke()
+                self.assertEqual(0, code, result)
+                self.assertEqual(ANSWER, result["result"])
+                self.assertFalse(result["needs_attention"])
+                self.assertEqual({"last": SELECTED_COUNTS, "total": SELECTED_COUNTS}, result["usage"])
+                self.assertEqual([], result.get("measurement_errors", []))
+
+    def test_invalid_cache_write_usage_preserves_answer_and_independent_counters(self):
+        for part in ("last", "total"):
+            for invalid in (-1, True, 1.5, "fixture-invalid-cache-write", [], {}, 2**53):
+                with self.subTest(part=part, invalid=invalid):
+                    usage = {"last": {**COUNTS, "cacheWriteInputTokens": 7},
+                             "total": {**COUNTS, "cacheWriteInputTokens": 11}}
+                    usage[part]["cacheWriteInputTokens"] = invalid
+                    self.configure(events=[usage_notification(usage), item(), completed()])
+                    code, result, directory = self.invoke()
+                    self.assertEqual(0, code, result)
+                    self.assertEqual("returned", result["state"])
+                    self.assertEqual(ANSWER, result["result"])
+                    self.assertFalse(result["needs_attention"])
+                    expected = {"last": {**COUNTS, "cacheWriteInputTokens": 7},
+                                "total": {**COUNTS, "cacheWriteInputTokens": 11}}
+                    expected[part]["cacheWriteInputTokens"] = None
+                    self.assertEqual(expected, result["usage"])
+                    self.assertEqual(["usage." + part + ".cacheWriteInputTokens"], result["measurement_errors"])
+                    self.assertEqual("native_thread_last_and_total", result["usage_scope_id"])
+                    self.assertEqual("unknown", result["actual_billed_cost"])
+                    self.assertEqual(result, json.loads((directory / "result.json").read_text()))
+                    raw = [json.loads(line) for line in (directory / "stdout.json").read_text().splitlines()]
+                    self.assertIn(usage_notification(usage), raw)
+                    self.assertNotIn("fixture-invalid-cache-write", json.dumps(result))
+
+    def test_latest_absent_cache_write_usage_clears_earlier_field_warnings(self):
+        earlier = {"last": {**COUNTS, "cacheWriteInputTokens": -1},
+                   "total": {**COUNTS, "cacheWriteInputTokens": False}}
+        latest = {"last": dict(COUNTS), "total": dict(COUNTS)}
+        self.configure(events=[usage_notification(earlier), usage_notification(latest), item(), completed()])
+        code, result, directory = self.invoke()
+        self.assertEqual(0, code, result)
+        self.assertEqual(ANSWER, result["result"])
+        self.assertFalse(result["needs_attention"])
+        self.assertEqual({"last": SELECTED_COUNTS, "total": SELECTED_COUNTS}, result["usage"])
+        self.assertEqual([], result.get("measurement_errors", []))
+        raw = [json.loads(line) for line in (directory / "stdout.json").read_text().splitlines()]
+        self.assertIn(usage_notification(earlier), raw)
+        self.assertIn(usage_notification(latest), raw)
 
     def test_invalid_usage_does_not_relax_final_answer_or_terminal_identity_requirements(self):
         invalid = usage_notification({"last": {**COUNTS, "inputTokens": -1}, "total": COUNTS})
