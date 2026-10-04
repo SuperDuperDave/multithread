@@ -473,7 +473,20 @@ the sender. No filename convention is required for wake attribution.
   `multithread unbind`, `pause` and `resume` change one under the ownership rules
   below.
 - **Wake queues by default.** The message starts a new turn when the
-  conversation is idle, or right after its current turn. Use `--steer` only for
+  conversation is loaded and eligible, or after its current turn if eligible.
+  An unloaded conversation can accept a queue entry without starting a turn;
+  an interrupted turn can suppress automatic pickup even when runtime status
+  is idle. Before queue submission, wake makes one bounded, metadata-only
+  runtime read. JSON exposes this dated snapshot as `recipient_runtime`,
+  separate from the latest historical turn in `recipient_state`. Missing or
+  malformed runtime state is unknown. A loaded snapshot never guarantees pickup.
+  For an unloaded conversation, the result keeps the accepted queue UUID and
+  directs the owner to load its existing task with execution settings preserved.
+  Wake never resumes, force-starts, reorders or resends that queue entry.
+  Cold resume may use current configuration, so omitting overrides does not
+  guarantee identical permissions or instructions. Approval/input waits and
+  deliberate interruptions remain the recipient's responsibility.
+  Use `--steer` only for
   news about the recipient's current work: it joins the running turn at its next
   input boundary, and queues when no turn is running. If Codex refuses the steer
   before accepting it, the wake queues once with the same message id. Any other

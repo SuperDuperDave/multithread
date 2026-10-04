@@ -8,6 +8,7 @@ conversation or account configuration is touched.
 
 import base64
 from contextlib import redirect_stderr, redirect_stdout
+from datetime import datetime, timezone
 import hashlib
 import io
 import json
@@ -22,6 +23,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from unittest import mock
 
@@ -124,6 +126,7 @@ class FakeDaemon:
         self.path = path
         self.threads = {}  # id -> {"cwd", "status", "turns"}
         self.steer = "accept"  # a key of STEER_REPLIES, or hang | close
+        self.read_mode = "accept"  # metadata only: hang | close | traffic | trickle
         self.requests = []
         self.connections = 0
         self.server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -176,6 +179,20 @@ class FakeDaemon:
                     if "id" not in message:
                         continue
                     reply = self.answer(message)
+                    if reply in ("traffic", "trickle"):
+                        if reply == "traffic":
+                            deadline = time.monotonic() + 0.8
+                            while time.monotonic() < deadline and not self.stopped.is_set():
+                                self.send(connection, {"method": "fixture/notification", "params": {}})
+                                connection.sendall(bytes([0x89, 4]) + b"ping")
+                                time.sleep(0.01)
+                        else:
+                            body = json.dumps({"method": "fixture/notification", "params": {"text": "x" * 450}}).encode()
+                            frame = bytes([0x81, 126]) + struct.pack(">H", len(body)) + body
+                            for byte in frame:
+                                connection.sendall(bytes([byte]))
+                                time.sleep(0.002)
+                        return
                     if reply == "close":
                         return
                     if reply is None:
@@ -195,9 +212,16 @@ class FakeDaemon:
         if method in ("thread/read", "thread/turns/list", "turn/steer") and thread is None:
             return {"id": message["id"], "error": {"code": -32600, "message": "thread not found"}}
         if method == "thread/read":
+            if self.read_mode != "accept":
+                return None if self.read_mode == "hang" else self.read_mode
+            if "read_reply" in thread:
+                return {"id": message["id"], **thread["read_reply"]}
+            status = {"type": thread["status"]}
+            if "active_flags" in thread:
+                status["activeFlags"] = thread["active_flags"]
             return {"id": message["id"], "result": {"thread": {
                 "id": thread.get("answers_as", params["threadId"]), "cwd": thread["cwd"],
-                "status": {"type": thread["status"]}}}}
+                "status": status}}}
         if method == "thread/turns/list":
             if "list_reply" in thread:
                 return {"id": message["id"], **thread["list_reply"]}
@@ -1001,6 +1025,196 @@ class WakeOutcomeTests(WakeCase):
                                     "--codex", str(self.codex), "--dry-run")
         self.assertEqual(0, code, out)
         self.assertTrue(out.startswith("DRY RUN: Would queue for operator"))
+
+
+class QueuedReadinessTests(WakeCase):
+    def assert_observation_only(self, methods):
+        self.assertEqual(1, methods.count("thread/read"))
+        self.assertEqual({"initialize", "thread/turns/list", "thread/read"}, set(methods))
+        for name in ("thread/resume", "thread/start", "thread/queue/start", "thread/queue/list"):
+            self.assertNotIn(name, methods)
+
+    def test_unloaded_queue_admission_keeps_exact_id_and_dates_separate_runtime_snapshot(self):
+        self.bound()
+        self.daemon.threads[THREAD]["status"] = "notLoaded"
+        before = len(self.daemon.methods())
+        result = self.wake()
+        self.assertEqual("QUEUED", result["status"])
+        self.assertEqual("completed", result["recipient_state"]["turn_state"])
+        runtime = result["recipient_runtime"]
+        self.assertEqual(("notLoaded", "before_queue"), (runtime["status"], runtime["phase"]))
+        self.assertEqual(timezone.utc, datetime.fromisoformat(runtime["observed_at"]).tzinfo)
+        self.assertIn("not loaded", result["happened"])
+        self.assertIn("execution settings preserved", result["next"])
+        self.assertIn(QUEUED_ID, result["next"])
+        self.assertIn("Do not resend", result["next"])
+        self.assertEqual("unknown", result["consumption_state"])
+        self.assertEqual(QUEUED_ID, self.conclusion()["native_id"])
+        self.assertEqual(1, len(self.codex_calls()))
+        self.assert_observation_only(self.daemon.methods()[before:])
+        read = [x for x in self.daemon.requests if x["method"] == "thread/read"][-1]
+        self.assertEqual({"threadId": THREAD, "includeTurns": False}, read["params"])
+
+    def test_interrupted_history_requires_deliberate_continuation_even_if_unloaded(self):
+        self.bound()
+        self.live("interrupted")
+        for status in ("idle", "notLoaded"):
+            with self.subTest(runtime=status):
+                self.daemon.threads[THREAD]["status"] = status
+                before = len(self.daemon.methods())
+                result = self.wake("--id", "interrupted-" + status)
+                self.assertEqual("QUEUED", result["status"])
+                self.assertEqual("interrupted", result["recipient_state"]["turn_state"])
+                self.assertEqual(status, result["recipient_runtime"]["status"])
+                self.assertIn("interrupted", result["happened"])
+                self.assertIn("deliberate continuation", result["next"])
+                self.assertIn("Do not load", result["next"])
+                self.assertIn("force-start", result["next"])
+                self.assertNotIn("owner to load", result["next"])
+                self.assert_observation_only(self.daemon.methods()[before:])
+        self.assertEqual(2, len(self.codex_calls()))
+
+    def test_approval_and_input_waits_preserve_wait_while_admitting_one_queue_entry(self):
+        self.bound()
+        for index, flag in enumerate(("waitingOnApproval", "waitingOnUserInput")):
+            with self.subTest(flag=flag):
+                self.daemon.threads[THREAD].update(status="active", active_flags=[flag])
+                before = len(self.daemon.methods())
+                result = self.wake("--id", "wait-" + str(index))
+                self.assertEqual("QUEUED", result["status"])
+                self.assertEqual([flag], result["recipient_runtime"]["active_flags"])
+                self.assertIn("resolve its wait", result["next"])
+                self.assertIn(QUEUED_ID, result["next"])
+                self.assertIn("Do not force-start", result["next"])
+                self.assert_observation_only(self.daemon.methods()[before:])
+        self.assertEqual(2, len(self.codex_calls()))
+
+    def test_malformed_metadata_is_unknown_and_cannot_change_queue_admission(self):
+        self.bound()
+        replies = [None, [], {}, {"thread": []},
+                   {"thread": {"id": OTHER, "status": {"type": "notLoaded"}}},
+                   {"thread": {"id": THREAD, "status": {"type": 1}}},
+                   {"thread": {"id": THREAD, "status": {"type": []}}},
+                   {"thread": {"id": THREAD, "status": {"type": {"future": "idle"}}}},
+                   {"thread": {"id": THREAD, "status": {"type": "active", "activeFlags": ["futureWait"]}}},
+                   {"thread": {"id": THREAD, "status": {"type": "active", "activeFlags": [{}]}}},
+                   {"thread": {"id": THREAD, "status": {"type": "active", "activeFlags": "waitingOnApproval"}}},
+                   {"thread": {"id": THREAD, "status": {"type": "futureStatus"}}}]
+        for index, reply in enumerate(replies):
+            with self.subTest(reply=reply):
+                self.daemon.threads[THREAD]["read_reply"] = {"result": reply}
+                before = len(self.daemon.methods())
+                result = self.wake("--id", "metadata-" + str(index))
+                self.assertEqual("QUEUED", result["status"])
+                self.assertEqual("unknown", result["recipient_runtime"]["status"])
+                self.assertEqual([], result["recipient_runtime"]["active_flags"])
+                self.assertIn("readiness was unavailable", result["happened"])
+                self.assertNotIn("owner to load", result["next"])
+                self.assertEqual(index + 1, len(self.codex_calls()))
+                self.assert_observation_only(self.daemon.methods()[before:])
+
+    def test_runtime_error_qualifies_queue_without_claiming_provider_repair(self):
+        self.bound()
+        self.daemon.threads[THREAD]["status"] = "systemError"
+        result = self.wake()
+        self.assertEqual("QUEUED", result["status"])
+        self.assertEqual("systemError", result["recipient_runtime"]["status"])
+        self.assertIn("inspect its error", result["next"])
+        self.assertIn(QUEUED_ID, result["next"])
+        self.assertEqual(1, len(self.codex_calls()))
+
+    def test_refused_closed_or_silent_metadata_read_does_not_retry_or_block_queue(self):
+        self.bound()
+        for index, mode in enumerate(("refused", "close", "hang")):
+            with self.subTest(mode=mode):
+                self.daemon.read_mode = "accept" if mode == "refused" else mode
+                self.daemon.threads[THREAD].pop("read_reply", None)
+                if mode == "refused":
+                    self.daemon.threads[THREAD]["read_reply"] = {"error": {"code": -32603,
+                                                                         "message": "synthetic metadata failure"}}
+                before = len(self.daemon.methods())
+                with mock.patch.object(wake, "_READINESS_TIMEOUT", 0.08):
+                    result = self.wake("--id", "read-failure-" + str(index))
+                self.assertEqual("QUEUED", result["status"])
+                self.assertEqual("unknown", result["recipient_runtime"]["status"])
+                self.assertEqual("read_failed", result["recipient_runtime"]["unavailable_reason"])
+                self.assertEqual(index + 1, len(self.codex_calls()))
+                self.assert_observation_only(self.daemon.methods()[before:])
+
+    def test_notifications_and_trickled_frame_cannot_extend_readiness_deadline(self):
+        self.bound()
+        for index, mode in enumerate(("traffic", "trickle")):
+            with self.subTest(mode=mode):
+                self.daemon.read_mode = mode
+                before = len(self.daemon.methods())
+                started = time.monotonic()
+                with mock.patch.object(wake, "_READINESS_TIMEOUT", 0.08):
+                    result = self.wake("--id", "stream-" + str(index))
+                self.assertLess(time.monotonic() - started, 0.65,
+                                "Total read must finish while the fixture still supplies traffic")
+                self.assertEqual("QUEUED", result["status"])
+                self.assertEqual("unknown", result["recipient_runtime"]["status"])
+                self.assertEqual(index + 1, len(self.codex_calls()))
+                self.assert_observation_only(self.daemon.methods()[before:])
+
+    def test_live_steer_never_adds_the_optional_readiness_probe(self):
+        self.bound()
+        self.live()
+        self.daemon.read_mode = "hang"
+        before = len(self.daemon.methods())
+        result = self.wake("--steer")
+        self.assertEqual("STEERED", result["status"])
+        self.assertNotIn("recipient_runtime", result)
+        self.assertNotIn("thread/read", self.daemon.methods()[before:])
+        self.assertEqual([], self.codex_calls())
+
+    def test_paused_role_does_not_contact_any_readiness_or_queue_transport(self):
+        self.bound()
+        self.control("pause")
+        before = (len(self.events()), self.daemon.connections, list(self.daemon.methods()))
+        result = self.wake()
+        self.assertEqual("NOT SENT", result["status"])
+        self.assertEqual(before, (len(self.events()), self.daemon.connections, self.daemon.methods()))
+        self.assertEqual([], self.codex_calls())
+
+    def test_unknown_queue_outcome_stays_unknown_despite_known_unloaded_snapshot(self):
+        self.bound()
+        self.daemon.threads[THREAD]["status"] = "notLoaded"
+        self.codex_mode("lost_connection")
+        before = len(self.daemon.methods())
+        result = self.wake()
+        self.assertEqual("UNCERTAIN", result["status"])
+        self.assertEqual("notLoaded", result["recipient_runtime"]["status"])
+        self.assertEqual("unknown", result["consumption_state"])
+        self.assertEqual("uncertain", self.conclusion()["outcome"])
+        self.assertNotIn("native_id", self.conclusion())
+        self.assert_observation_only(self.daemon.methods()[before:])
+        blocked = self.wake()
+        self.assertEqual("ALREADY SENT", blocked["status"])
+        self.assertEqual(1, len(self.codex_calls()))
+        self.assertEqual(1, self.daemon.methods()[before:].count("thread/read"))
+
+    def test_runtime_snapshot_can_change_before_enqueue_without_pickup_claim(self):
+        self.bound()
+        actual_run = wake.subprocess.run
+
+        def change_before_queue(command, *args, **kwargs):
+            if command[0] == str(self.codex):
+                self.daemon.threads[THREAD].update(status="active", active_flags=["waitingOnApproval"])
+            return actual_run(command, *args, **kwargs)
+
+        before = len(self.daemon.methods())
+        with mock.patch.object(wake.subprocess, "run", side_effect=change_before_queue):
+            result = self.wake()
+        self.assertEqual("QUEUED", result["status"])
+        self.assertEqual("idle", result["recipient_runtime"]["status"])
+        self.assertEqual("before_queue", result["recipient_runtime"]["phase"])
+        self.assertEqual("active", self.daemon.threads[THREAD]["status"])
+        self.assertEqual("unknown", result["consumption_state"])
+        self.assertIn("consumption are unobserved", result["happened"])
+        self.assertNotIn("picked up", result["happened"])
+        self.assertEqual(1, len(self.codex_calls()))
+        self.assert_observation_only(self.daemon.methods()[before:])
 
 
 class WakeAdmissionTests(WakeCase):
