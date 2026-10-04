@@ -12,6 +12,7 @@ not the recipient reading it: acknowledgement stays the recipient's own act.
 
 import argparse
 import base64
+from datetime import datetime, timezone
 import hashlib
 import json
 import os
@@ -24,6 +25,7 @@ import stat
 import struct
 import subprocess
 import sys
+import time
 
 from relay_core.protocol import (ValidationError, canonical_agent, canonical_wake_expectation,
                                  canonical_wake_message_id, canonical_wake_project, canonical_wake_ref,
@@ -40,6 +42,7 @@ _WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 _MAX_MESSAGE = 1024 * 1024
 _DAEMON_TIMEOUT = 10
 _STEER_TIMEOUT = 20
+_READINESS_TIMEOUT = 2
 _QUEUE_TIMEOUT = 60
 _LEDGER_TIMEOUT = 30
 _INBOX_TIMEOUT = 10
@@ -102,6 +105,64 @@ def _detail(exc):
     return text if text.isprintable() and len(text) <= 200 else exc.__class__.__name__
 
 
+def _observe_runtime(daemon, thread_id):
+    """A bounded non-loading observation, never permission to start queued work."""
+    observation = {"status": "unknown", "active_flags": [], "source": "codex_thread_read",
+                   "phase": "before_queue"}
+    try:
+        reply = daemon.call("thread/read", {"threadId": thread_id, "includeTurns": False},
+                            timeout=_READINESS_TIMEOUT)
+    except (Refused, Unusable, NoAnswer):
+        observation["unavailable_reason"] = "read_failed"
+    else:
+        thread = reply.get("thread") if isinstance(reply, dict) else None
+        status = thread.get("status") if isinstance(thread, dict) else None
+        kind = status.get("type") if isinstance(status, dict) else None
+        flags = status.get("activeFlags") if isinstance(status, dict) else None
+        if (isinstance(thread, dict) and thread.get("id") == thread_id
+                and kind in ("notLoaded", "idle", "systemError", "active")
+                and (kind != "active" or isinstance(flags, list) and all(
+                    isinstance(flag, str) and flag in ("waitingOnApproval", "waitingOnUserInput")
+                    for flag in flags))):
+            observation["status"] = kind
+            observation["active_flags"] = list(flags) if kind == "active" else []
+        else:
+            observation["unavailable_reason"] = "unusable_reply"
+    observation["observed_at"] = datetime.now(timezone.utc).isoformat()
+    return observation
+
+
+def _queued_readiness(base, native_id):
+    """Qualify admission without inferring pickup from an earlier runtime snapshot."""
+    runtime = base["recipient_runtime"]
+    kind = runtime["status"]
+    if base["recipient_state"]["turn_state"] == "interrupted":
+        sentence = " The latest observed turn was interrupted; automatic pickup may remain suppressed."
+        next_step = (f"Leave original queue entry {native_id} for the recipient's deliberate continuation. "
+                     "Do not load, force-start or resend it merely to clear the queue.")
+    elif kind == "notLoaded":
+        sentence = " Before submission, Codex reported the conversation was not loaded."
+        next_step = ("Ask the recipient's owner to load the existing conversation with its execution settings "
+                     f"preserved, then inspect original queue entry {native_id}. Do not resend it.")
+    elif runtime["active_flags"]:
+        sentence = " Before submission, Codex reported an approval or user-input wait."
+        next_step = (f"Wait for the recipient to resolve its wait; inspect original queue entry {native_id} "
+                     "if pickup remains unobserved. Do not force-start or resend it.")
+    elif kind == "systemError":
+        sentence = " Before submission, Codex reported a runtime error."
+        next_step = (f"Ask the recipient's owner to inspect its error and original queue entry {native_id}. "
+                     "Do not resend blindly.")
+    elif kind == "unknown":
+        sentence = " Runtime readiness was unavailable."
+        next_step = (f"Wait for acknowledgement. If none arrives, inspect original queue entry {native_id} "
+                     "with the recipient; do not resend blindly.")
+    else:
+        return "", _WAIT, None
+    detail = (f"before_queue runtime={kind}; latest_turn={base['recipient_state']['turn_state']}; "
+              f"flags={','.join(runtime['active_flags'])}; observed_at={runtime['observed_at']}")
+    return sentence, next_step, detail
+
+
 class Daemon:
     """One connection to the shared daemon, initialized; requests run one at a time."""
 
@@ -109,6 +170,7 @@ class Daemon:
         self.sock = None
         self.buffer = b""
         self.next_id = 0
+        self.deadline = None
         try:
             self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             self.sock.settimeout(timeout)
@@ -144,16 +206,19 @@ class Daemon:
         """
         self.next_id += 1
         pending = self.next_id
+        self.deadline = time.monotonic() + timeout
         try:
-            self.sock.settimeout(timeout)
             self._send(json.dumps({"id": pending, "method": method, "params": params}).encode("utf-8"))
             while True:
+                self._check_deadline()
                 message = self._message()
                 if "method" in message or message.get("id") != pending:
                     continue  # Notifications and other traffic are not this answer.
                 break
         except (OSError, ValueError) as exc:
             raise NoAnswer(_detail(exc)) from None
+        finally:
+            self.deadline = None
         has_result, has_error = "result" in message, "error" in message
         if has_result and not has_error:
             return message["result"]
@@ -175,7 +240,15 @@ class Daemon:
         self.sock.close()
         self.sock = None
 
+    def _check_deadline(self):
+        if self.deadline is not None:
+            remaining = self.deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("the daemon request deadline expired")
+            self.sock.settimeout(remaining)
+
     def _send(self, data, opcode=1):
+        self._check_deadline()
         mask = os.urandom(4)
         size = len(data)
         header = bytes([0x80 | opcode]) + (
@@ -184,7 +257,9 @@ class Daemon:
         self.sock.sendall(header + mask + bytes(byte ^ mask[index % 4] for index, byte in enumerate(data)))
 
     def _take(self, size):
+        self._check_deadline()
         while len(self.buffer) < size:
+            self._check_deadline()
             chunk = self.sock.recv(65536)
             if not chunk:
                 raise ConnectionError("the daemon closed the connection")
@@ -679,6 +754,9 @@ def wake(args, ledger=launcher_ledger):
                 return conclude(_outcome("STEERED", f"Codex accepted the steer for running turn {turn_id}. "
                                          "Recipient consumption is unobserved.", _WAIT, **base),
                                 "steered", "live_turn", "steer", _native(turn_id))
+        # History alone does not show whether Codex has a queue consumer loaded.
+        # This read cannot load/resume a thread or override an intentional wait.
+        base["recipient_runtime"] = _observe_runtime(daemon, binding["thread"])
     finally:
         daemon.close()
 
@@ -720,8 +798,11 @@ def wake(args, ledger=launcher_ledger):
                                      f"conversation {binding['thread']} ({said}). The message may or may not have "
                                      "been queued." + first, unsure, **base), "uncertain", "no_receipt", "queue",
                             detail=said)
+        native_id = receipt.group(1)
+        readiness, next_step, detail = _queued_readiness(base, native_id)
         return conclude(_outcome("QUEUED", why + " Codex accepted the queue entry; a recipient turn and "
-                                 "consumption are unobserved.", _WAIT, **base), "queued", reason, "queue", receipt.group(1))
+                                 "consumption are unobserved." + readiness, next_step, **base),
+                        "queued", reason, "queue", native_id, detail=detail)
     if _refused_before_sending(completed):
         return conclude(_outcome("NOT SENT", f"codex queue refused before sending: {said}. Nothing was queued."
                                  + first, "Check `codex app-server daemon version`, then retry with the same message "
