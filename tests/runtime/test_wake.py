@@ -2085,6 +2085,7 @@ class GuideTests(unittest.TestCase):
 
     def test_the_outcome_table_lists_every_wake_status_with_its_exit_code(self):
         section = (ROOT / "docs/PEER.md").read_text(encoding="utf-8").split("## Wake an existing conversation")[1]
+        section = section.split("### Observe a Codex role without sending", 1)[0]
         rows = re.findall(r"^\| `([A-Z ]+)` \| (\d) \|", section, re.MULTILINE)
         binding = {"BOUND", "ALREADY BOUND", "NOT BOUND"}
         self.assertEqual({status: code for status, code in wake.EXIT_CODES.items() if status not in binding},
