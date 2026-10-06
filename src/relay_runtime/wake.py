@@ -166,20 +166,24 @@ def _queued_readiness(base, native_id):
 class Daemon:
     """One connection to the shared daemon, initialized; requests run one at a time."""
 
-    def __init__(self, path, timeout=_DAEMON_TIMEOUT):
+    def __init__(self, path, timeout=_DAEMON_TIMEOUT, *, experimental_api=False, overall_deadline=None):
         self.sock = None
         self.buffer = b""
         self.next_id = 0
         self.deadline = None
+        self.overall_deadline = overall_deadline
         try:
             self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self.deadline = time.monotonic() + timeout
             self.sock.settimeout(timeout)
+            self._check_deadline()
             self.sock.connect(str(path))
             key = base64.b64encode(os.urandom(16)).decode("ascii")
             self.sock.sendall(("GET / HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\n"
                                "Connection: Upgrade\r\nSec-WebSocket-Key: " + key
                                + "\r\nSec-WebSocket-Version: 13\r\n\r\n").encode("ascii"))
             while b"\r\n\r\n" not in self.buffer:
+                self._check_deadline()
                 chunk = self.sock.recv(4096)
                 if not chunk or len(self.buffer) > 16384:
                     raise ConnectionError("the daemon closed the connection during the handshake")
@@ -191,7 +195,11 @@ class Daemon:
                     name.strip().lower() == b"sec-websocket-accept" and value.strip() == accept
                     for name, _, value in (line.partition(b":") for line in lines[1:])):
                 raise ConnectionError("the daemon refused the WebSocket upgrade")
-            if not isinstance(self.call("initialize", {"clientInfo": _CLIENT_INFO}, timeout=timeout), dict):
+            self.deadline = None
+            params = {"clientInfo": _CLIENT_INFO}
+            if experimental_api:
+                params["capabilities"] = {"experimentalApi": True}
+            if not isinstance(self.call("initialize", params, timeout=timeout), dict):
                 raise Unusable("its initialize answer was not an object")
             self._send(json.dumps({"method": "initialized", "params": {}}).encode("utf-8"))
         except (OSError, ValueError, Refused, Unusable, NoAnswer) as exc:
@@ -241,8 +249,9 @@ class Daemon:
         self.sock = None
 
     def _check_deadline(self):
-        if self.deadline is not None:
-            remaining = self.deadline - time.monotonic()
+        deadlines = [value for value in (self.deadline, self.overall_deadline) if value is not None]
+        if deadlines:
+            remaining = min(deadlines) - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError("the daemon request deadline expired")
             self.sock.settimeout(remaining)
@@ -292,7 +301,10 @@ class Daemon:
                 raise ConnectionError("the daemon closed the connection")
             body += payload
             if first & 0x80:
-                value = json.loads(body)
+                try:
+                    value = json.loads(body)
+                except RecursionError:
+                    raise ValueError("the daemon's JSON exceeded its nesting bound") from None
                 if not isinstance(value, dict):
                     raise ValueError("the daemon sent a message that is not an object")
                 return value
@@ -349,14 +361,15 @@ def deliver(path, text, timeout=_INBOX_TIMEOUT):
 
 # --- The ledger: one admitted step per installed launcher run ----------------
 
-def launcher_ledger(repo, *arguments):
+def launcher_ledger(repo, *arguments, timeout=None):
     """Run one ledger step: (exit code or None when it didn't answer, result, message)."""
+    timeout = _LEDGER_TIMEOUT if timeout is None else timeout
     command = [str(account_launcher()), "--repo", str(repo), "--json", *arguments]
     try:
         completed = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, text=True,
-                                   timeout=_LEDGER_TIMEOUT, check=False)
+                                   timeout=timeout, check=False)
     except subprocess.TimeoutExpired:
-        return None, None, f"it didn't answer within {_LEDGER_TIMEOUT} s"
+        return None, None, f"it didn't answer within {timeout:g} s"
     except (OSError, UnicodeError) as exc:
         return 1, None, f"{command[0]} could not run ({_detail(exc)})"
     if completed.returncode != 0:
@@ -447,7 +460,265 @@ def _ledger_next(code, repo, again):
     return f"Check the ledger with `{_launcher('--repo', str(repo), 'doctor')}`, then {again}."
 
 
-# --- wake ----------------------------------------------------------------------
+# --- observe: bounded native diagnostics --------------------------------------
+
+_OBSERVE_TIMEOUT = 15
+_OBSERVE_RPC_TIMEOUT = 2
+_OBSERVE_PAGES = 3
+_OBSERVE_PAGE_SIZE = 20
+_OBSERVE_EXIT_CODES = {"OBSERVED": 0, "PARTIAL": 3, "UNAVAILABLE": 4, "STALE": 5}
+
+
+def _observed_at():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _remaining(deadline):
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("observation deadline expired")
+    return remaining
+
+
+def _observation_binding(ledger, repo, role, expected, deadline):
+    """Read the binding, never history or an inferred latest attempt."""
+    code, reply, _ = ledger(repo, "wake-ledger", "show", role, timeout=_remaining(deadline))
+    _remaining(deadline)
+    if code != 0 or not isinstance(reply, dict):
+        raise Unusable("binding_unavailable")
+    bindings = reply.get("bindings")
+    if (not isinstance(bindings, list) or len(bindings) != 1 or not isinstance(bindings[0], dict)
+            or bindings[0].get("role") != role):
+        raise Unusable("binding_malformed")
+    binding = bindings[0]
+    if binding.get("state") not in ("active", "paused", "unbound"):
+        raise Unusable("binding_malformed")
+    if binding["state"] != "active":
+        return None
+    if (type(binding.get("generation")) is not int or binding["generation"] <= 0
+            or binding.get("provider") not in ("codex", "claude")):
+        raise Unusable("binding_malformed")
+    if (binding["generation"] != expected["generation"] or binding["provider"] != expected["provider"]
+            or binding.get("thread") != expected["thread"]):
+        return None
+    endpoint = binding.get("endpoint")
+    if (not isinstance(endpoint, str) or not endpoint.startswith("unix://") or not endpoint.isprintable()
+            or len(endpoint) > 4096 or not Path(endpoint.removeprefix("unix://")).is_absolute()):
+        raise Unusable("binding_malformed")
+    # History may advance independently of a binding; it is neither a target nor a fence.
+    return {key: value for key, value in binding.items() if key != "last_attempt"}
+
+
+def _observation_runtime(reply, thread_id):
+    thread = reply.get("thread") if isinstance(reply, dict) else None
+    status = thread.get("status") if isinstance(thread, dict) else None
+    kind = status.get("type") if isinstance(status, dict) else None
+    flags = status.get("activeFlags") if isinstance(status, dict) else None
+    if (not isinstance(thread, dict) or thread.get("id") != thread_id
+            or kind not in ("notLoaded", "idle", "systemError", "active")
+            or kind == "active" and (not isinstance(flags, list) or not all(
+                isinstance(flag, str) and flag in ("waitingOnApproval", "waitingOnUserInput")
+                for flag in flags))):
+        raise Unusable("runtime_malformed")
+    return {"thread_id": thread_id, "status": kind,
+            "active_flags": list(flags) if kind == "active" else [], "observed_at": _observed_at()}
+
+
+def _observation_turns(reply):
+    turns = reply.get("data") if isinstance(reply, dict) else None
+    if not isinstance(turns, list) or len(turns) > 1:
+        raise Unusable("turns_malformed")
+    latest = None
+    if turns:
+        turn = turns[0]
+        if (not isinstance(turn, dict) or not isinstance(turn.get("id"), str)
+                or not turn["id"] or len(turn["id"]) > 1024 or not turn["id"].isprintable()
+                or turn.get("status") not in ("inProgress", "completed", "interrupted", "failed")):
+            raise Unusable("turns_malformed")
+        latest = {"id": turn["id"], "status": turn["status"]}
+    return {"latest": latest, "observed_at": _observed_at()}
+
+
+def _observation_page(reply, seen_ids, seen_cursors):
+    if (not isinstance(reply, dict) or not isinstance(reply.get("data"), list)
+            or len(reply["data"]) > _OBSERVE_PAGE_SIZE or "nextCursor" not in reply):
+        raise Unusable("queue_malformed")
+    cursor = reply["nextCursor"]
+    if cursor is not None and (not isinstance(cursor, str) or not cursor or len(cursor) > 1024
+                               or not cursor.isprintable() or cursor in seen_cursors):
+        raise Unusable("queue_cursor_malformed")
+    entries, page_ids = [], set()
+    for entry in reply["data"]:
+        if (not isinstance(entry, dict) or not isinstance(entry.get("id"), str)
+                or not re.fullmatch(_UUID, entry["id"]) or entry["id"] in seen_ids | page_ids
+                or not isinstance(entry.get("input"), list)
+                or not all(isinstance(item, dict) for item in entry["input"])):
+            raise Unusable("queue_entry_malformed")
+        client_id = entry.get("clientUserMessageId")
+        if (not isinstance(client_id, str) or not client_id
+                or len(client_id) > 1024 or not client_id.isprintable()):
+            raise Unusable("queue_entry_malformed")
+        try:
+            body = json.dumps(entry["input"], ensure_ascii=False, sort_keys=True,
+                              separators=(",", ":"), allow_nan=False).encode("utf-8")
+        except (ValueError, TypeError, UnicodeError, RecursionError):
+            raise Unusable("queue_input_malformed") from None
+        entries.append({"queue_id": entry["id"], "client_user_message_id": client_id,
+                        "input_bytes": len(body), "input_sha256": hashlib.sha256(body).hexdigest()})
+        page_ids.add(entry["id"])
+    return entries, cursor
+
+
+def observe_role(args, ledger=launcher_ledger):
+    """Active, non-loading diagnostics. Pagination and binding guards are not atomic."""
+    role = canonical_wake_role(args.role)
+    thread = canonical_wake_thread(args.expect_thread)
+    if type(args.expect_generation) is not int or args.expect_generation <= 0 or args.expect_provider != "codex":
+        raise ValidationError("observation requires a positive generation and provider codex")
+    nominated = args.queue_id
+    if nominated is not None and (not isinstance(nominated, str) or not re.fullmatch(_UUID, nominated)):
+        raise ValidationError("--queue-id must be an exact lowercase UUID")
+    expected = {"generation": args.expect_generation, "provider": "codex", "thread": thread}
+    deadline = time.monotonic() + _OBSERVE_TIMEOUT
+    result = {"schema": 1, "role": role, "expected_binding": expected, "binding": None,
+              "started_at": _observed_at(), "runtime": None, "turns": None,
+              "queue": {"entries": [], "pages": 0, "complete": False, "scan_status": "unavailable"},
+              "original": {"queue_id": nominated, "standing": "unknown", "seen_in_scan": False},
+              "binding_guard": {"before": "unavailable", "after": "not_run"}, "problems": [],
+              "limits": {"operation_seconds": _OBSERVE_TIMEOUT, "rpc_seconds": _OBSERVE_RPC_TIMEOUT,
+                         "pages": _OBSERVE_PAGES, "page_size": _OBSERVE_PAGE_SIZE,
+                         "frame_bytes": _MAX_MESSAGE},
+              "input_digest_profile": "json-utf8-sort-keys-compact-unescaped-unicode-no-nan-v1",
+              "limitations": ["Reads are active diagnostics; no subscription or loading is requested.",
+                              "Queue pagination is non-atomic, even when every page is scanned.",
+                              "Not seen does not prove pickup, consumption or completion.",
+                              "Binding equality after scanning is not an atomic action fence."]}
+
+    def finish(status):
+        result.update(status=status, exit_code=_OBSERVE_EXIT_CODES[status],
+                      usable=status == "OBSERVED", finished_at=_observed_at())
+        if status in ("OBSERVED", "PARTIAL") and nominated is not None:
+            result["original"]["standing"] = ("observed" if result["original"]["seen_in_scan"] else
+                                                "not_seen" if result["queue"]["complete"] else "unknown")
+        return result
+
+    try:
+        binding = _observation_binding(ledger, args.repo or os.getcwd(), role, expected, deadline)
+    except (Unusable, OSError):
+        result["problems"].append("binding_before_unavailable")
+        return finish("UNAVAILABLE")
+    if binding is None:
+        result["binding_guard"]["before"] = "stale"
+        return finish("STALE")
+    result["binding"] = {"role": role, "state": binding["state"], **expected}
+    result["binding_guard"]["before"] = "matched"
+    daemon = None
+    try:
+        daemon = Daemon(binding["endpoint"].removeprefix("unix://"),
+                        timeout=min(_OBSERVE_RPC_TIMEOUT, _remaining(deadline)),
+                        experimental_api=True, overall_deadline=deadline)
+        for key, method, params, validate in (
+                ("runtime", "thread/read", {"threadId": thread, "includeTurns": False},
+                 lambda reply: _observation_runtime(reply, thread)),
+                ("turns", "thread/turns/list", {"threadId": thread, "limit": 1, "sortDirection": "desc"},
+                 _observation_turns)):
+            try:
+                reply = daemon.call(method, params, timeout=min(_OBSERVE_RPC_TIMEOUT, _remaining(deadline)))
+                result[key] = validate(reply)
+            except (Refused, Unusable, NoAnswer, OSError):
+                result["problems"].append(key + "_unavailable")
+        cursor, seen_ids, seen_cursors = None, set(), set()
+        for _ in range(_OBSERVE_PAGES):
+            params = {"threadId": thread, "limit": _OBSERVE_PAGE_SIZE}
+            if cursor is not None:
+                params["cursor"] = cursor
+            try:
+                reply = daemon.call("thread/queue/list", params,
+                                    timeout=min(_OBSERVE_RPC_TIMEOUT, _remaining(deadline)))
+                entries, cursor = _observation_page(reply, seen_ids, seen_cursors)
+            except (Refused, Unusable, NoAnswer, OSError):
+                result["problems"].append("queue_unavailable")
+                break
+            queue = result["queue"]
+            queue["entries"].extend(entries)
+            queue["pages"] += 1
+            queue["observed_at"] = _observed_at()
+            seen_ids.update(entry["queue_id"] for entry in entries)
+            result["original"]["seen_in_scan"] = nominated in seen_ids
+            if cursor is None:
+                queue["complete"] = True
+                break
+            seen_cursors.add(cursor)
+        queue = result["queue"]
+        queue["scan_status"] = ("complete" if queue["complete"] else
+                                "partial" if queue["pages"] else "unavailable")
+    except (DaemonUnavailable, OSError):
+        result["problems"].append("daemon_unavailable")
+    finally:
+        if daemon is not None:
+            daemon.close()
+    try:
+        after = _observation_binding(ledger, args.repo or os.getcwd(), role, expected, deadline)
+    except (Unusable, OSError):
+        result["problems"].append("binding_after_unavailable")
+        result["binding_guard"]["after"] = "unavailable"
+        return finish("UNAVAILABLE")
+    if after is None or after != binding:
+        result["binding_guard"]["after"] = "stale"
+        return finish("STALE")
+    result["binding_guard"]["after"] = "matched"
+    if result["runtime"] is not None and result["turns"] is not None and result["queue"]["complete"]:
+        return finish("OBSERVED")
+    if result["runtime"] is not None or result["turns"] is not None or result["queue"]["pages"]:
+        return finish("PARTIAL")
+    return finish("UNAVAILABLE")
+
+
+def observe_main(argv=None, *, ledger=launcher_ledger):
+    parser = argparse.ArgumentParser(prog="multithread observe", description=(
+        "Observe one exact Codex role binding with bounded, active, non-loading native reads. "
+        "A complete non-atomic scan is not pickup proof or an action fence."))
+    parser.add_argument("role")
+    parser.add_argument("--expect-generation", type=int, required=True)
+    parser.add_argument("--expect-provider", choices=("codex",), required=True)
+    parser.add_argument("--expect-thread", required=True)
+    parser.add_argument("--queue-id", help="original native queue UUID to locate; no latest-attempt default")
+    parser.add_argument("--repo")
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args(argv)
+    try:
+        result = observe_role(args, ledger=ledger)
+    except ValidationError as exc:
+        parser.error(str(exc))
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True, allow_nan=False))
+    else:
+        print(_printable(f"{result['status']}: {result['role']}; queue scan {result['queue']['scan_status']}; "
+                         f"original {result['original']['standing']}."))
+        print(_printable(f"Expected binding: generation {args.expect_generation}; codex thread "
+                         f"{args.expect_thread}; guards before={result['binding_guard']['before']}, "
+                         f"after={result['binding_guard']['after']}."))
+        if result["runtime"] is not None:
+            print(_printable(f"Runtime: {result['runtime']['status']}; "
+                             f"wait flags: {','.join(result['runtime']['active_flags']) or 'none'}; "
+                             f"observed at {result['runtime']['observed_at']}."))
+        if result["turns"] is not None:
+            turn = result["turns"]["latest"]
+            print(_printable(f"Latest turn: {turn['id']} {turn['status']}." if turn else "Latest turn: none seen."))
+        print(f"Queue: {len(result['queue']['entries'])} entries in {result['queue']['pages']} pages.")
+        for entry in result["queue"]["entries"]:
+            print(_printable(f"Queue UUID {entry['queue_id']}; clientUserMessageId "
+                             f"{json.dumps(entry['client_user_message_id'])}; canonical input "
+                             f"{entry['input_bytes']} bytes, sha256 {entry['input_sha256']}."))
+        if args.queue_id is not None:
+            print(f"Nominated original: {args.queue_id}; {result['original']['standing']}.")
+        if result["problems"]:
+            print("Unavailable: " + ", ".join(result["problems"]) + ".")
+        print("Non-atomic diagnostics; this does not prove pickup or authorize another action.")
+    return result["exit_code"]
+
+
+# --- wake ---------------------------------------------------------------------
 
 def fingerprint(path):
     """A task file's sha256 and size, read once: the wake records the bytes it pointed at."""

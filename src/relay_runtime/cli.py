@@ -75,7 +75,8 @@ def _parser():
                                       ("peer", "call Codex or Claude and return its result to this task"),
                                       ("setup", "check readiness or explicitly enroll this repository"),
                                       ("update", "review and explicitly install a public release update"),
-                                      ("wake", "send a short attributed wake to a bound Codex conversation")):
+                                      ("wake", "send a short attributed wake to a bound Codex conversation"),
+                                      ("observe", "inspect a guarded Codex role and original queue without sending")):
                 native = action.add_parser(name, help=description, add_help=False)
                 native.add_argument("--help", action="store_true", dest="native_help")
                 native.add_argument("provider_args", nargs=argparse.REMAINDER)
@@ -664,7 +665,7 @@ def main(argv=None, *, registry=None, command_alias_check=None):
             boundary += 1
         else:
             break
-    helper = boundary < len(raw) and raw[boundary] in {"agent", "bind", "hooks", "setup", "update", "wake"}
+    helper = boundary < len(raw) and raw[boundary] in {"agent", "bind", "hooks", "setup", "update", "wake", "observe"}
     args = parser.parse_args(raw[:boundary + 1] if helper else raw)
     if helper:
         args.provider_args = raw[boundary + 1:]
@@ -676,7 +677,7 @@ def main(argv=None, *, registry=None, command_alias_check=None):
     try:
         if args.state_home is not None or "RELAY_HOME" in os.environ:
             raise StateError("installed Multithread refuses state-directory overrides")
-        if args.command in {"agent", "bind", "hooks", "launch", "peer", "setup", "update", "wake"}:
+        if args.command in {"agent", "bind", "hooks", "launch", "peer", "setup", "update", "wake", "observe"}:
             forwarded = _native_arguments(args, global_repos)
             # A compatibility invocation must verify the preferred alias before
             # any helper executes it. Keep hooks and read-only runtime diagnosis
@@ -694,10 +695,10 @@ def main(argv=None, *, registry=None, command_alias_check=None):
             from .hooks import hooks_main
             from .setup import setup_main
             from .update import update_main
-            from .wake import bind_main, wake_main
+            from .wake import bind_main, wake_main, observe_main
             return {"agent": agent_main, "bind": bind_main, "hooks": hooks_main, "launch": launch_main,
                     "peer": peer_main, "setup": setup_main, "update": update_main,
-                    "wake": wake_main}[args.command](forwarded)
+                    "wake": wake_main, "observe": observe_main}[args.command](forwarded)
         if args.command == "provider-hook":
             seen = {}
             try:

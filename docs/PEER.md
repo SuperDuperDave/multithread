@@ -557,6 +557,65 @@ and one steered message reached the model at its next input boundary, 108
 seconds after Codex accepted it. The duplicate check is Multithread's own; how
 Codex treats a repeated `clientUserMessageId` is untested.
 
+### Observe a Codex role without sending
+
+On unreleased main, `observe` reads a bound Codex conversation's runtime, latest
+turn and bounded queue identities. Capture the role's generation and exact
+thread first, then supply all recipient guards:
+
+```sh
+multithread --repo /path/to/repository --json observe reviewer \
+  --expect-generation 42 --expect-provider codex \
+  --expect-thread a0000000-0000-7000-8000-000000000001 \
+  --queue-id d0000000-0000-7000-8000-00000000000a
+```
+
+The optional queue UUID nominates the original entry to inspect. It is separate
+from `clientUserMessageId`, and never defaults to the latest recorded wake.
+Queued input is returned only as canonical byte counts and digests, without its
+text or file references. An older original can remain relevant after later wakes.
+The digest covers an opaque array of input objects encoded as compact, sorted-key
+UTF-8 JSON with unescaped Unicode and no nonfinite numbers. It is a comparison
+profile, not a hash of the original wire bytes or validation of each input type.
+Queue UUIDs and required client message IDs are checked independently; latest
+turn IDs remain opaque strings.
+
+This is an active provider diagnostic. It does not subscribe, load, resume,
+start, steer, resend, acknowledge or mutate a queue. It respects paused bindings
+and requires the observed recipient to match before and after the reads. Binding
+drift or unavailable final validation cannot establish a usable current result.
+Even matching guards are not an atomic fence for a later recovery action.
+
+Keep complete scans, bounded partial observations and unavailable or malformed
+state distinct. Pagination is not an atomic queue snapshot; an original not seen
+in a completed scan is not proof of ingestion. Loaded/idle status does not prove
+eligible pickup, subscriber ownership or preserved execution context. Approval,
+user-input waits and interrupted turns remain separate observations owned by the
+recipient. No observation supplies permission to recover a task.
+
+The operation allows 15 seconds overall, two seconds per native request, three
+pages of at most 20 queue entries and 1 MiB per native message. It makes no
+retries. JSON includes timestamps, binding guards, runtime and latest-turn
+metadata, queue completeness, the nominated original's standing, limits and
+unavailable components. Valid earlier observations remain visible after a later
+failure; `usable` is true only for a complete, guarded `OBSERVED` result.
+
+| Result | Exit | Meaning |
+| --- | --- | --- |
+| `OBSERVED` | 0 | All requested facts read and queue scan complete, with matching guards. |
+| `PARTIAL` | 3 | Some facts read, but a component or queue page is unavailable or bounded. |
+| `UNAVAILABLE` | 4 | No native facts read, or binding validation is unavailable. |
+| `STALE` | 5 | Binding differs from the expectation, is paused/unbound or changed during the reads. |
+
+`original.standing` is `observed`, `not_seen` or `unknown`; it never means
+consumed. Even a complete result describes several dated reads, not one atomic
+instant. Invalid command arguments exit 2 before contacting the provider.
+
+`wake --status` remains a ledger-only read of recorded attempts and ACKs;
+`observe` contacts the provider to obtain dated runtime facts. Use the original
+wake reference for status/history, which can be a file path or ledger sequence.
+A file-path wake does not automatically associate a separate signal's ACK.
+
 ### Claude Code sessions
 
 A Claude Code session (2.1.224 or later) listens on a private inbox socket and
