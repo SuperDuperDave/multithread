@@ -688,10 +688,14 @@ multithread roles operator --json
 multithread roles operator --history --before SEQ --limit 30 --json
 multithread wake operator --status --json
 multithread wake operator --status --ref /absolute/path/task.md --json
+multithread wake operator --status --ref 42 --json
 ```
 
 For the first history page omit `--before`; use the returned sequence for older
 pages. `roles` shows the binding generation, holder, declared scope and charter.
+Use `--ref` with the original task-file path or ledger sequence to narrow wake
+status history. `--id` selects a sending/dry-run message ID and is rejected with
+`--status`.
 History preserves each attempt's original generation and recipient, transport
 outcome, optional observed sender and consumption evidence. `wake --status` is read-only: it neither
 rereads the task file (which may have vanished), probes the recipient nor sends
