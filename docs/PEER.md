@@ -169,12 +169,22 @@ initiating session's exact coordination identity from its Multithread context:
   --commit HEAD
 ```
 
-`--commit` resolves a revision to its immutable full Git OID and records a
-bounded commit capsule. Alternatively use `--artifact git:FULL_COMMIT_OID` or
+`--commit` resolves a revision in the checkout selected by global `--repo`
+(the current directory if omitted) to its immutable full Git OID and records a
+bounded commit capsule. That checkout also selects the enrolled ledger.
+Alternatively use `--artifact git:FULL_COMMIT_OID` or
 `--artifact sha256:FULL_64_HEX_DIGEST` for reviewed frozen bytes. A pathname,
 branch name, or bare digest is not an immutable artifact. The digest identifies
 bytes; it does not deliver the file or authorize sharing it. Do not combine
 `--commit` with `--artifact` or `--commit-oid`.
+
+For source owned by another repository, keep `--repo` pointed at the intended
+ledger and use `--artifact git:FULL_COMMIT_OID`, optionally with
+`--commit-oid FULL_COMMIT_OID` metadata. Those options do not look up, fetch or
+deliver the source. Include its owning checkout and repo-relative file path in
+the bounded summary so the recipient can locate and inspect the immutable bytes
+before acknowledging. A commit's presence in the ledger checkout is not required
+for this form of handoff.
 
 Use both `--agent` and `--session` for ledger mutations unless their exact
 values are already supplied by `RELAY_AGENT` and `RELAY_SESSION`. These identify

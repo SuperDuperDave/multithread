@@ -86,9 +86,11 @@ def build_parser() -> argparse.ArgumentParser:
                         "git:<full-oid>, sha256:<64-hex-digest> or receipt:<stable-id>")
     signal.add_argument(
         "--commit",
-        help="resolve a commit and use its immutable OID + bounded subject as the handoff capsule",
+        help="resolve a revision in --repo (current directory if omitted) and use its "
+             "immutable OID + bounded subject as the handoff capsule",
     )
-    signal.add_argument("--commit-oid")
+    signal.add_argument("--commit-oid", help="record commit OID metadata without Git lookup; "
+                        "does not supply --artifact")
     signal.add_argument("--evidence-sha256")
     signal.add_argument("--resource")
     signal.add_argument("--reason")
