@@ -96,6 +96,7 @@
     "tests/runtime/test_provider_hook.py",
     "tests/runtime/test_user_hooks.py",
     "tests/runtime/test_wake.py",
+    "tests/runtime/test_observe.py",
     "tests/runtime/test_public_external_recovery.py",
     "tests/runtime/test_public_peer.py",
     "tests/runtime/test_public_profile.py",

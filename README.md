@@ -28,7 +28,8 @@ The commands below use the current published `multithread` entry point. See
 [compatibility](docs/SETUP.md#compatibility) for older releases and the retained
 `relay` command from the former Agent Relay name.
 
-Main includes unreleased session inbox, role-handover and wake-status additions.
+Main includes unreleased session inbox, role-handover, wake-status and guarded
+native queue observation additions.
 Their documentation targets the next runtime release; installed v0.4.18 does
 not yet include them. Merging source changes does not update an installation.
 
