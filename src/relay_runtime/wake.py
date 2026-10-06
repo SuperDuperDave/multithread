@@ -1141,12 +1141,12 @@ def wake_main(argv=None, *, ledger=launcher_ledger):
         "reads its original recipient and explicit acknowledgement. Exit 0 sent, status or dry run, 3 already "
         "sent, 4 not sent, 5 uncertain."))
     parser.add_argument("role", help="the bound role, for example operator")
-    parser.add_argument("--ref", help="absolute task-file path, or a ledger sequence number; optional for --status")
-    parser.add_argument("--status", action="store_true", help="read recorded attempts and acknowledgements; never read the task file or send")
+    parser.add_argument("--ref", help="absolute task-file path, or a ledger sequence number; filters history with --status")
+    parser.add_argument("--status", action="store_true", help="read recorded attempts and acknowledgements; use --ref to filter; never read the task file or send")
     parser.add_argument("--steer", action="store_true",
                         help="for news about a Codex recipient's current work: fold into the running turn")
     parser.add_argument("--id", dest="message_id",
-                        help="message id; default: derived from this ledger, the role, its binding and the ref")
+                        help="send/dry-run message id; status is filtered with --ref; default: derived from this ledger, the role, its binding and the ref")
     parser.add_argument("--dry-run", action="store_true", help="decide and report; send and record nothing")
     parser.add_argument("--expect-generation", type=int, help="require this binding generation before recording or sending")
     parser.add_argument("--expect-provider", choices=("codex", "claude"), help="expected recipient provider; requires generation and recipient")
@@ -1167,7 +1167,8 @@ def wake_main(argv=None, *, ledger=launcher_ledger):
                         or args.sender_repo is not None or args.sender_role is not None
                         or any(getattr(args, "expect_" + field) is not None for field in
                                ("generation", "provider", "thread", "bound_agent", "bound_session"))):
-        parser.error("--status cannot be combined with sending or sender-selection flags")
+        parser.error("--status cannot be combined with sending, sender-selection or recipient-guard flags; "
+                     "--id is for sending/dry-run; use --ref to filter recorded attempts")
     return _emit(wake_status(args, ledger) if args.status else wake(args, ledger), args.json)
 
 
