@@ -199,7 +199,7 @@ class RestrictedCallTests(ClaudeIntegrationTests):
 
     def setUp(self):
         super().setUp()
-        self.review = mock.patch("relay_runtime.claude_review.reviewed", return_value=protocol.REVIEWED)
+        self.review = mock.patch("relay_runtime.claude_peer.reviewed", return_value=protocol.REVIEWED)
         self.found = self.review.start()
         self.addCleanup(self.review.stop)
 
@@ -214,13 +214,13 @@ class RestrictedCallTests(ClaudeIntegrationTests):
         argv = json.loads(self.receipt.read_text())['argv']
         self.assertEqual(os.path.realpath(self.provider), argv[0], 'the hashed file is the one executed')
         shutil.rmtree(self.base / 'stream-evidence', ignore_errors=True)
-        with mock.patch('relay_runtime.claude_review.binary_changed', return_value=True):
+        with mock.patch('relay_runtime.claude_peer.binary_changed', return_value=True):
             code, value, _ = self.invoke(self.restricted_steps(), restricted=True)
         self.assertNotEqual(0, code)
         self.assertEqual(('uncertain', None, True), (value['state'], value['result'], value['provider_binary_changed']))
 
     def test_an_unreviewed_or_unknowable_binary_starts_nothing(self):
-        from relay_runtime import claude_review
+        from relay_runtime import claude_peer as claude_review
         for name, effect, why in (
                 ('unreviewed', None, 'has no recorded review for restricted calls'),
                 ('unreadable reviews', claude_review.ReviewError('reviews could not be read.'), 'could not be read')):

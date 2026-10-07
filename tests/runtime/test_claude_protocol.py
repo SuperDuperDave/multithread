@@ -17,7 +17,8 @@ import uuid
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
-from relay_runtime import claude_peer, claude_review, native_io, provider
+from relay_runtime import claude_peer, native_io, provider
+from relay_runtime import claude_peer as claude_review
 
 #: The hand-reviewed binary's record, as a restricted call receives it.
 REVIEWED = {**next(iter(claude_review.BUILT_IN.values())), "source": "built_in"}

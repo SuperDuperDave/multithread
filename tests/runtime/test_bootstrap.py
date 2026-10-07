@@ -17,6 +17,15 @@ sys.path.insert(0, str(SOURCE))
 import relay_bootstrap as subject
 
 
+class ClosureTests(unittest.TestCase):
+    def test_every_runtime_module_is_inside_the_verified_closure(self):
+        # An installed release loads only these modules; one left out ships missing and fails on first import
+        # (0.4.20 shipped without its Claude review module). Source tests import modules directly and cannot see it.
+        sources = {str(path.relative_to(SOURCE)) for package in ("relay_core", "relay_runtime")
+                   for path in (SOURCE / package).glob("*.py")}
+        self.assertEqual(set(), sources - subject.PAYLOAD_FILES)
+
+
 class BootstrapTests(unittest.TestCase):
     def setUp(self):
         previous = os.umask(0o077)

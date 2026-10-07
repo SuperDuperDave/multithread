@@ -26,7 +26,7 @@ class PeerTests(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory(prefix="relay-peer-test-", dir="/tmp")
         self.addCleanup(temporary.cleanup)
         # Restricted calls admit only reviewed binaries; these fixtures stand in for the hand-reviewed one.
-        from relay_runtime import claude_review
+        from relay_runtime import claude_peer as claude_review
         reviewed = mock.patch.object(claude_review, "reviewed",
                                      return_value={**next(iter(claude_review.BUILT_IN.values())), "source": "built_in"})
         reviewed.start()

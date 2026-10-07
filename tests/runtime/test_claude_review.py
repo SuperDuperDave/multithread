@@ -11,7 +11,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
-from relay_runtime import claude_review  # noqa: E402
+from relay_runtime import claude_peer as claude_review  # noqa: E402
 
 HELP = """Usage: claude [options]
 

@@ -1107,7 +1107,7 @@ def peer_main(argv=None, *, report_entry=None):
         from .review_packet import packet_main
         return packet_main(raw[1:])
     if raw and raw[0] == "review-claude":
-        from .claude_review import review_main
+        from .claude_peer import review_main
         return review_main(raw[1:], account_launcher())
     parser = argparse.ArgumentParser(prog="multithread peer", description="Call a native provider and return its observed result to the initiating task.",
                                      epilog="For an existing call: peer report --call-dir PATH [--json] gives a read-only summary; peer packet --help freezes a scoped review diff; peer control --help covers live input.")
@@ -1257,12 +1257,12 @@ def _run_peer(args, interruption):
         identity = reviewed = None
         if args.tools is not None:
             # A restricted call runs only an exact binary whose restricted behaviour was reviewed, by resolved path.
-            from . import claude_review
+            from . import claude_peer
             stage = "provider_review"
             try:
-                identity = claude_review.binary_identity(plan["argv"][0])
-                reviewed = claude_review.reviewed(identity[1], args.relay or account_launcher(), plan["repo"])
-            except claude_review.ReviewError as exc:
+                identity = claude_peer.binary_identity(plan["argv"][0])
+                reviewed = claude_peer.reviewed(identity[1], args.relay or account_launcher(), plan["repo"])
+            except claude_peer.ReviewError as exc:
                 raise LaunchError(f"{exc} No provider was started.") from None
             if reviewed is None:
                 review = [str(args.relay or account_launcher()), "--repo", plan["repo"], "peer", "review-claude",
@@ -1503,8 +1503,8 @@ def _run_peer(args, interruption):
             envelope["read_scope"]["late_ignored"] = late
             envelope["needs_attention"] = True
     if getattr(args, "tools", None) is not None and envelope.get("provider_review") is not None:
-        from . import claude_review
-        if claude_review.binary_changed(envelope["provider_review"]["binary_path"],
+        from . import claude_peer
+        if claude_peer.binary_changed(envelope["provider_review"]["binary_path"],
                                          envelope["provider_review"]["binary_sha256"]):
             envelope["provider_binary_changed"] = True
     if (getattr(args, "tools", None) is not None and envelope.get("state") == "returned"
