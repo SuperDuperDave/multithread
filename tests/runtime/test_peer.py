@@ -1129,6 +1129,44 @@ class PeerTests(unittest.TestCase):
         config.assert_not_called()
 
 
+    def test_tools_and_attachments_run_restricted_in_stream_mode(self):
+        image = self.base / "card.png"
+        image.write_bytes(b"\x89PNG\r\n\x1a\n" + b"pixels")
+        code, dry, _ = self.invoke("--tools", "none", "--attach", str(image), "--dry-run")
+        self.assertEqual(0, code)
+        argv = dry["argv"]
+        self.assertEqual(["--tools", "", "--restricted", "--strict-mcp-config"],
+                         argv[argv.index("--tools"):argv.index("--tools") + 4])
+        self.assertEqual("stream-json", argv[argv.index("--input-format") + 1])
+        self.assertEqual({"requested": [], "reported": None, "mcp_servers": None, "source": "not_observed"},
+                         dry["provider_tools"])
+        self.assertEqual([{"path": str(image), "media_type": "image/png", "bytes": 14,
+                           "sha256": hashlib.sha256(image.read_bytes()).hexdigest()}], dry["attachments"])
+        code, dry, _ = self.invoke("--tools", "Read,Glob", "--dry-run")
+        self.assertEqual("Glob,Read", dry["argv"][dry["argv"].index("--tools") + 1])
+        self.assertFalse(self.calls.exists())
+
+    def test_unusable_attachments_are_refused_before_launch(self):
+        text = self.base / "notes.txt"
+        text.write_text("not an image")
+        image = self.base / "card.png"
+        image.write_bytes(b"\x89PNG\r\n\x1a\n" + b"x" * 64)
+        link = self.base / "link.png"
+        link.symlink_to(image)
+        for path, why in ((text, "is not a PNG, JPEG, GIF or WebP image"), (link, "could not be opened"),
+                          (self.base / "absent.png", "could not be opened")):
+            with self.subTest(path=path.name):
+                code, result, _ = self.invoke("--attach", str(path))
+                self.assertNotEqual(0, code)
+                self.assertEqual(("unavailable", False), (result["state"], result["provider_started"]))
+                self.assertIn(why, result["message"])
+        with mock.patch.object(peer, "_MAX_ATTACHMENT", 16):
+            code, result, _ = self.invoke("--attach", str(image))
+        self.assertIn("exceeds", result["message"])
+        self.assertFalse(self.calls.exists())
+        with self.assertRaises(SystemExit), redirect_stderr(io.StringIO()):
+            peer.peer_main(["claude", "--task-file", str(self.task), "--tools", "Read,Read"])
+
 class RepositoryRoutingTests(unittest.TestCase):
     def test_conflicting_selections_refuse_before_alias_or_native_work(self):
         cases = (

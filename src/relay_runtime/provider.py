@@ -433,6 +433,53 @@ def _task(path):
     return body
 
 
+# Images attached to a Claude task travel as native base64 content blocks.
+_MAX_ATTACHMENTS = 20
+_MAX_ATTACHMENT = 5 * 1024 * 1024
+_MAX_ATTACHMENTS_TOTAL = 10 * 1024 * 1024
+_IMAGE_MAGIC = ((b"\x89PNG\r\n\x1a\n", "image/png"), (b"\xff\xd8\xff", "image/jpeg"),
+                (b"GIF87a", "image/gif"), (b"GIF89a", "image/gif"))
+_TOOL_NAME = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,63}")
+
+
+def _tools(value):
+    """'none' or a comma-separated list of built-in tool names; the order is not meaningful."""
+    if value == "none":
+        return []
+    names = [name.strip() for name in value.split(",")]
+    if not names or any(not _TOOL_NAME.fullmatch(name) for name in names) or len(set(names)) != len(names):
+        raise argparse.ArgumentTypeError("--tools takes none or distinct built-in tool names, for example Read,Grep")
+    return sorted(names)
+
+
+def _attachments(paths):
+    """Read each attached image once: a regular file, a known image type, within its bounds."""
+    if len(paths) > _MAX_ATTACHMENTS:
+        raise LaunchError(f"At most {_MAX_ATTACHMENTS} images can be attached to one call.")
+    attached, total = [], 0
+    for path in paths:
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+        except OSError as exc:
+            raise LaunchError(f"Attachment {path} could not be opened ({exc.strerror or exc}); attach a regular image file.") from None
+        with os.fdopen(fd, "rb") as stream:
+            if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                raise LaunchError(f"Attachment {path} is not a regular file.")
+            body = stream.read(_MAX_ATTACHMENT + 1)
+        if len(body) > _MAX_ATTACHMENT:
+            raise LaunchError(f"Attachment {path} exceeds {_MAX_ATTACHMENT // (1024 * 1024)} MiB.")
+        media_type = next((kind for magic, kind in _IMAGE_MAGIC if body.startswith(magic)),
+                          "image/webp" if body[:4] == b"RIFF" and body[8:12] == b"WEBP" else None)
+        if media_type is None:
+            raise LaunchError(f"Attachment {path} is not a PNG, JPEG, GIF or WebP image.")
+        total += len(body)
+        if total > _MAX_ATTACHMENTS_TOTAL:
+            raise LaunchError(f"Attachments exceed {_MAX_ATTACHMENTS_TOTAL // (1024 * 1024)} MiB in total.")
+        attached.append({"path": str(Path(path).absolute()), "media_type": media_type, "bytes": len(body),
+                         "sha256": hashlib.sha256(body).hexdigest(), "body": body})
+    return attached
+
+
 def _private_file(directory, name):
     fd = os.open(directory / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     return os.fdopen(fd, "wb")
@@ -813,6 +860,12 @@ def peer_main(argv=None, *, report_entry=None):
                         + "; Codex accepts an effort its model advertises. The provider decides what it actually uses")
     parser.add_argument("--live-input", action="store_true", help="enable Claude session input while this call runs; queued input may start later turns within the call timeout. Codex always exposes exact-turn input")
     parser.add_argument("--stream-progress", action="store_true", help="use Claude's native event stream for content-free progress observations, without enabling live input; the default remains final JSON")
+    parser.add_argument("--tools", type=_tools, help="Claude only: give the session exactly these built-in tools (none, or names such as Read,Grep), "
+                        "in restricted mode with no settings-file tools, hooks or MCP servers beyond Multithread's own hooks. The session's "
+                        "reported registry is recorded; a missing or different one returns no result")
+    parser.add_argument("--attach", action="append", default=[], metavar="IMAGE",
+                        help="Claude only: attach a PNG, JPEG, GIF or WebP file to the task as an image; repeatable "
+                             f"(at most {_MAX_ATTACHMENTS}, {_MAX_ATTACHMENT // (1024 * 1024)} MiB each, {_MAX_ATTACHMENTS_TOTAL // (1024 * 1024)} MiB in total)")
     parser.add_argument("--dry-run", action="store_true", help="validate task/configuration and print a plan; no provider or evidence writes, and no readiness check (setup --check does that)")
     parser.add_argument("--json", action="store_true", help="return a structured result; this DOES launch unless --dry-run is used; exit 0 means a returned turn, so also check needs_attention and task evidence")
     args = parser.parse_args(raw)
@@ -823,6 +876,8 @@ def peer_main(argv=None, *, report_entry=None):
         parser.error("argument --effort: Claude accepts " + ", ".join(_CLAUDE_EFFORTS))
     if args.client == "codex" and args.stream_progress:
         parser.error("Codex already uses native streaming; --stream-progress is a Claude option")
+    if args.client == "codex" and (args.tools is not None or args.attach):
+        parser.error("--tools and --attach are Claude options")
     if args.client == "claude" and args.resume is not None:
         try:
             _session(args.resume)
@@ -868,6 +923,10 @@ def _follow_up_preparation(args, plan, envelope):
         prefix.extend(["--model", args.model])
     if args.effort is not None:
         prefix.extend(["--effort", args.effort])
+    tools = getattr(args, "tools", None)
+    if tools is not None:
+        # A resumed restricted session keeps its restriction; attachments belong to one task.
+        prefix.extend(["--tools", ",".join(tools) or "none"])
     if args.live_input:
         prefix.append("--live-input")
     if args.stream_progress:
@@ -901,10 +960,20 @@ def _run_peer(args, interruption):
     control = None
     code = 1
     stage = "task_read"
-    streaming = args.client == "codex" or args.live_input or args.stream_progress
+    # A tool registry is reported only in the native stream, and images travel only as stream input.
+    streaming = (args.client == "codex" or args.live_input or args.stream_progress
+                 or args.tools is not None or bool(args.attach))
+    attachments = []
     envelope["native_output_mode"] = "stream_json" if streaming else "final_json"
     try:
         task = _task(args.task_file)
+        attachments = _attachments(args.attach)
+        if args.tools is not None:
+            envelope["provider_tools"] = {"requested": args.tools, "reported": None, "mcp_servers": None,
+                                          "source": "not_observed"}
+        if attachments:
+            envelope["attachments"] = [{key: item[key] for key in ("path", "media_type", "bytes", "sha256")}
+                                       for item in attachments]
         stage = "relay_configuration"
         plan = prepare(args.client, args.repo, args.relay, args.provider)
         if args.client == "claude":
@@ -918,6 +987,8 @@ def _run_peer(args, interruption):
                 native.extend(["--model", args.model])
             if args.effort is not None:
                 native.extend(["--effort", args.effort])
+            if args.tools is not None:
+                native.extend(["--tools", ",".join(args.tools), "--restricted", "--strict-mcp-config"])
             native.extend(["--resume" if args.resume else "--session-id", session])
         else:
             native = [*plan["argv"], "app-server", "--listen", "stdio://"]
@@ -958,6 +1029,8 @@ def _run_peer(args, interruption):
                                            "producer_runtime": envelope["producer_runtime"],
                                            "requested_session_id": session, "resumed": bool(args.resume),
                                            "requested_model": args.model, "requested_effort": args.effort,
+                                           "requested_tools": args.tools,
+                                           "attachments": envelope.get("attachments", []),
                                            "task_sha256": hashlib.sha256(task).hexdigest(),
                                            "timeout_seconds": args.timeout})
         with _private_file(directory, "task.txt") as stream:
@@ -1010,7 +1083,8 @@ def _run_peer(args, interruption):
                                control=ObservedControl(control, envelope) if control is not None else None, observer=observer,
                                feedback=feedback,
                                **({"expected_hook": plan["relay_plan"]["hook_command"],
-                                   "hook_file": plan["hooks"]["file"]} if args.client == "codex" else {}))
+                                   "hook_file": plan["hooks"]["file"]} if args.client == "codex" else
+                                  {"attachments": attachments, "tools": args.tools}))
                     # EOF is the ordinary end of this owned stdio server.
                     # Retain a valid returned turn even if server shutdown
                     # needs cleanup; shutdown is not a second provider turn.

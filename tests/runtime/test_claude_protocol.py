@@ -1,5 +1,6 @@
 """Claude streaming peer contracts using disposable JSONL executables only."""
 
+import base64
 import fcntl
 import hashlib
 import io
@@ -181,7 +182,7 @@ class ClaudeProtocolTests(unittest.TestCase):
                     stream.close()
 
     def run_native(self, steps, *, task=None, control=None, resume=None, session=SESSION,
-                   timeout=5, pipe_size=None, feedback=None, capture_envelope=None):
+                   timeout=5, pipe_size=None, feedback=None, capture_envelope=None, attachments=(), tools=None):
         self.count += 1
         self.specification.write_text(json.dumps(steps))
         self.requests.unlink(missing_ok=True)
@@ -201,7 +202,7 @@ class ClaudeProtocolTests(unittest.TestCase):
             capture_envelope.append(envelope)
         body = (task if task is not None else self.task).encode("utf-8")
         claude_peer.run(process, body, str(self.repo), resume, directory, envelope,
-                        timeout, control=control, feedback=feedback)
+                        timeout, control=control, feedback=feedback, attachments=attachments, tools=tools)
         return envelope, directory, process
 
     def submitted(self):
@@ -907,6 +908,57 @@ class ClaudeProtocolTests(unittest.TestCase):
         self.assertIn("without a validated main session result", envelope["message"])
         self.assert_raw(envelope, directory)
 
+
+    # --- requested tool registry and attached images ---------------------
+
+    def test_the_reported_tool_registry_is_recorded_when_it_matches(self):
+        for tools in ([], ["Glob", "Read"]):
+            with self.subTest(tools=tools):
+                envelope, directory, _ = self.run_native(
+                    [{"read": 1}, {"emit": init(tools=list(reversed(tools)))}, {"emit": result()}], tools=tools)
+                self.assertEqual("returned", envelope["state"])
+                self.assertEqual({"requested": tools, "reported": tools, "mcp_servers": [],
+                                  "source": "claude_system_init"}, envelope["provider_tools"])
+                self.assert_raw(envelope, directory)
+
+    def test_a_missing_or_different_registry_fails_closed(self):
+        for name, frame, why in (
+                ("extra tool", init(tools=["Bash", "Read"]), "differs from the requested one"),
+                ("mcp server", init(tools=["Read"], mcp_servers=[{"name": "mail", "status": "connected"}]),
+                 "differs from the requested one"),
+                ("unreported", init(tools=None), "did not report its tool registry")):
+            with self.subTest(case=name):
+                envelope, directory, _ = self.run_native(
+                    [{"read": 1}, {"emit": frame}, {"emit": result()}, {"sleep": 0.2}], tools=["Read"])
+                self.assertEqual("uncertain", envelope["state"])
+                self.assertIsNone(envelope["result"])
+                self.assertTrue(envelope["needs_attention"])
+                self.assertIn(why, envelope["message"])
+                self.assertEqual(["Read"], envelope["provider_tools"]["requested"])
+                self.assert_raw(envelope, directory)
+
+    def test_attached_images_travel_as_base64_blocks_and_their_echo_is_kept_by_reference(self):
+        body = b"\x89PNG\r\n\x1a\n" + os.urandom(8 * 1024)
+        digest = hashlib.sha256(body).hexdigest()
+        attachment = {"path": "/fixture/a.png", "media_type": "image/png", "bytes": len(body),
+                      "sha256": digest, "body": body}
+        encoded = base64.b64encode(body).decode("ascii")
+        echo = {"type": "user", "uuid": "$uuid:0", "session_id": SESSION, "parent_tool_use_id": None,
+                "isReplay": True, "message": {"role": "user", "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": encoded}},
+                    {"type": "text", "text": self.task}]}}
+        envelope, directory, _ = self.run_native(
+            [{"read": 1}, {"emit": init()}, {"emit": echo}, {"emit": result()}],
+            attachments=[attachment], tools=[])
+        self.assertEqual("returned", envelope["state"])
+        sent = self.submitted()[0]["message"]["content"]
+        self.assertEqual([{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": encoded}},
+                          {"type": "text", "text": self.task}], sent)
+        raw = self.assert_raw(envelope, directory)
+        self.assertNotIn(encoded.encode(), raw)
+        self.assertIn(json.dumps({"omitted": "attachment_base64", "sha256": digest, "bytes": len(body)},
+                                 separators=(",", ":")).encode(), raw)
+        self.assertEqual(1, envelope["native_output"]["records_retained_by_reference"])
 
 class ObservationFramingTests(unittest.TestCase):
     """Shared reader guarantees, independent of either provider's messages."""

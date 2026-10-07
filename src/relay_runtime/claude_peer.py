@@ -7,6 +7,9 @@ native consumption observation never substitutes for a durable Multithread
 acknowledgement or for workflow completion.
 """
 
+import base64
+import binascii
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -41,9 +44,12 @@ def _canonical(value):
 
 
 class _Driver:
-    def __init__(self, process, task, repo, resume, envelope, timeout, control):
+    def __init__(self, process, task, repo, resume, envelope, timeout, control, attachments=(), tools=None):
         self.process = process
         self.task = task.decode("utf-8")
+        self.attachments = list(attachments)
+        self.attached = {item["sha256"] for item in self.attachments}
+        self.tools = tools
         self.repo = repo
         self.envelope = envelope
         self.requested = envelope.get("requested_session_id") or resume
@@ -115,13 +121,18 @@ class _Driver:
         # Record the actual identity before any of its bytes can reach the pipe.
         self.envelope["initial_message_uuid"] = identifier
         self.initial = identifier
-        self.submit(identifier, self.task, initial=True)
+        content = self.task
+        if self.attachments:
+            content = [*({"type": "image", "source": {"type": "base64", "media_type": item["media_type"],
+                                                       "data": base64.b64encode(item["body"]).decode("ascii")}}
+                         for item in self.attachments), {"type": "text", "text": self.task}]
+        self.submit(identifier, content, initial=True)
         # The queued task has not yet crossed the native stdin pipe.
         self.envelope["task_delivery"] = "in_progress"
 
-    def submit(self, identifier, text, initial=False):
+    def submit(self, identifier, content, initial=False):
         frame = {"type": "user", "uuid": identifier, "session_id": self.requested,
-                 "message": {"role": "user", "content": text}, "parent_tool_use_id": None}
+                 "message": {"role": "user", "content": content}, "parent_tool_use_id": None}
         body = (json.dumps(frame, ensure_ascii=True, separators=(",", ":")) + "\n").encode("utf-8")
         if self.stdin_closed or self.observation_only or self.queued + len(body) > MAX_OUTPUT:
             raise ProtocolError("Native input is unavailable or exceeded its bound; inspect retained evidence.")
@@ -282,6 +293,8 @@ class _Driver:
             elif source != "claude_model_usage":
                 self.envelope["model_observation"] = {"source": "unavailable", "reported_model": None,
                                                       "relation": "unknown"}
+        if self.tools is not None:
+            self.registry(value)
         self.session = session
         self.envelope["session_id"] = session
         # Streaming resume and native background turns can repeat init for the
@@ -293,6 +306,51 @@ class _Driver:
         self.progress("initialized")
         if first and self.control is not None and self.accepting and not self.observation_only:
             self.control.set_target(session, None)
+
+    def registry(self, value):
+        """Record the tool registry the session reports; anything but the requested one fails closed."""
+        tools, servers = value.get("tools"), value.get("mcp_servers")
+        names = (sorted(tools) if isinstance(tools, list) and len(tools) <= 256
+                 and all(identity(name) for name in tools) else None)
+        mcp = ([server.get("name") if isinstance(server, dict) else server for server in servers]
+               if isinstance(servers, list) and len(servers) <= 64 else None)
+        self.envelope["provider_tools"] = {"requested": self.tools, "reported": names,
+                                           "mcp_servers": mcp, "source": "claude_system_init"}
+        if names is None or mcp is None:
+            raise ProtocolError("Native initialization did not report its tool registry; this call fails closed. "
+                                "Inspect retained output.")
+        if names != self.tools or mcp:
+            raise ProtocolError("The native tool registry differs from the requested one; this call fails closed. "
+                                "Inspect retained output.")
+
+    def retain(self, body):
+        """Keep an echoed attachment by reference when its bytes are exactly an image this call sent."""
+        if len(body) < 1024 or b'"base64"' not in body:
+            return body
+        try:
+            value = decode(body)
+        except ProtocolError:
+            return body
+        message = value.get("message") if value.get("type") == "user" else None
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            return body
+        referenced = False
+        for block in content:
+            source = block.get("source") if isinstance(block, dict) and block.get("type") == "image" else None
+            if not isinstance(source, dict) or source.get("type") != "base64" or not isinstance(source.get("data"), str):
+                continue
+            try:
+                image = base64.b64decode(source["data"], validate=True)
+            except (binascii.Error, ValueError):
+                continue
+            digest = hashlib.sha256(image).hexdigest()
+            if digest in self.attached:
+                source["data"] = {"omitted": "attachment_base64", "sha256": digest, "bytes": len(image)}
+                referenced = True
+        if not referenced:
+            return body
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
     def system(self, value):
         subtype = value.get("subtype")
@@ -507,12 +565,15 @@ class _Driver:
 
 
 def run(process, task: bytes, repo: str, resume: str | None, directory: Path,
-        envelope: dict, timeout: float, control=None, observer=None, feedback=None) -> None:
+        envelope: dict, timeout: float, control=None, observer=None, feedback=None,
+        attachments=(), tools=None) -> None:
     """Observe one native streaming session separately from the caller's cleanup."""
-    driver = _Driver(process, task, repo, resume, envelope, timeout, control)
+    driver = _Driver(process, task, repo, resume, envelope, timeout, control, attachments, tools)
     owned_observer = observer is None
     observation = observer if observer is not None else Observation(process, directory, envelope)
     observation.driver = driver
+    if driver.attachments:
+        observation.retain = driver.retain
     try:
         with selectors.DefaultSelector() as selector:
             os.set_blocking(process.stdin.fileno(), False)
