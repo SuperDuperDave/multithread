@@ -442,6 +442,7 @@ _MAX_ATTACHMENTS_TOTAL = 10 * 1024 * 1024
 _TOOL_NAME = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,63}")
 # A subagent runs with tools this call cannot see, so a restricted call cannot offer one.
 _SUBAGENT_TOOLS = frozenset({"Agent", "Task"})
+_RESERVED_TOOL_WORDS = frozenset({"default", "all"})
 # Settings an administrator manages stay in force under --restricted, hooks included.
 # Sources as Claude Code 2.1.292 reads them: the machine directory, the cached
 # server-managed settings, and under WSL the Windows policy chain.
@@ -480,6 +481,35 @@ def _claude_config_home(cwd):
     return Path(cwd) / unicodedata.normalize("NFC", value)
 
 
+# WSL's bridge to Windows occasionally hangs a call (about 5% of concurrent reg.exe queries measured past 10 s,
+# while one normally answers in 40 ms); a read that hangs or fails is retried after these pauses.
+_REG_BACKOFF = (0.2, 0.5, 1.0)
+_REG_TIMEOUT = 3
+
+
+def _reg_query(parent):
+    """The subkeys reg.exe lists under a policy parent, or None and the last failure after every attempt.
+
+    It lists the parent's subkeys: key paths are not localized, unlike reg.exe's messages.
+    """
+    failure = "not attempted"
+    for pause in (0, *_REG_BACKOFF):
+        time.sleep(pause)
+        try:
+            answer = subprocess.run([str(_WSL_REG), "query", parent], stdin=subprocess.DEVNULL,
+                                    capture_output=True, timeout=_REG_TIMEOUT, check=False)
+        except subprocess.TimeoutExpired:
+            failure = "timed out"
+            continue
+        except OSError as exc:
+            failure = exc.strerror or type(exc).__name__
+            continue
+        if answer.returncode == 0:
+            return answer.stdout.decode("utf-8", "replace").splitlines(), None
+        failure = f"exit {answer.returncode}"
+    return None, failure
+
+
 def _managed_claude_sources(cwd):
     """Managed Claude settings this machine would apply to a restricted call: a best-effort preflight.
 
@@ -496,18 +526,11 @@ def _managed_claude_sources(cwd):
             found.append(str(_WSL_CLAUDE_POLICY))
         if _WSL_REG.exists():
             for parent in _WSL_POLICY_PARENTS:
-                # List the parent's subkeys: key paths are not localized, unlike reg.exe's messages.
-                try:
-                    answer = subprocess.run([str(_WSL_REG), "query", parent], stdin=subprocess.DEVNULL,
-                                            capture_output=True, timeout=15, check=False)
-                except (OSError, subprocess.TimeoutExpired):
-                    found.append(parent + "\\ClaudeCode (unreadable)")
-                    continue
-                if answer.returncode != 0:
-                    found.append(parent + "\\ClaudeCode (unreadable)")
+                listed, failure = _reg_query(parent)
+                if listed is None:
+                    found.append(parent + f"\\ClaudeCode (unreadable after {len(_REG_BACKOFF) + 1} attempts: {failure})")
                     continue
                 # reg.exe prints full hive names (HKEY_LOCAL_MACHINE\\...), so match the path below the hive.
-                listed = answer.stdout.decode("utf-8", "replace").splitlines()
                 if any(line.strip().lower().endswith("\\software\\policies\\claudecode") for line in listed):
                     found.append(parent + "\\ClaudeCode")
     return found
@@ -711,6 +734,9 @@ def _tools(value):
     names = [name.strip() for name in value.split(",")]
     if not names or any(not _TOOL_NAME.fullmatch(name) for name in names) or len(set(names)) != len(names):
         raise argparse.ArgumentTypeError("--tools takes none or distinct built-in tool names, for example Read,Grep")
+    if {name.lower() for name in names} & _RESERVED_TOOL_WORDS:
+        raise argparse.ArgumentTypeError("--tools takes tool names; default and all are the CLI's keywords for every "
+                                         "built-in tool, which a restricted call never offers")
     if _SUBAGENT_TOOLS & set(names):
         raise argparse.ArgumentTypeError("--tools cannot include a subagent tool (Agent or Task): its tools are outside the call's registry")
     return sorted(names)
@@ -1517,6 +1543,15 @@ def _run_peer(args, interruption):
     preparation = _follow_up_preparation(args, plan, envelope) if code == 0 else None
     if preparation is not None:
         envelope["follow_up_preparation"] = preparation
+    if directory is None and getattr(args, "output_dir", None) is not None and not getattr(args, "dry_run", False):
+        # A call refused before it started still leaves its record where the caller reads it; an existing
+        # directory belongs to another call and is never reused.
+        try:
+            args.output_dir.absolute().mkdir(mode=0o700)
+            directory = args.output_dir.absolute()
+            envelope["evidence_directory"] = str(directory)
+        except OSError:
+            pass
     if directory is not None:
         try:
             _atomic_record(directory, "result.json", envelope)

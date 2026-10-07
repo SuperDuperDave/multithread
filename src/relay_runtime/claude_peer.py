@@ -15,6 +15,7 @@ import json
 import os
 from pathlib import Path
 import selectors
+import signal
 import subprocess
 import sys
 import tempfile
@@ -54,6 +55,7 @@ class _Driver:
         self.attachments = list(attachments)
         self.attached = {item["sha256"] for item in self.attachments}
         self.tools = tools
+        self.registry_failed = False
         # The review admitting this exact binary: its version and remaining built-in surfaces are known.
         # Subagents need a tool no restricted call offers.
         self.reviewed = reviewed
@@ -261,7 +263,7 @@ class _Driver:
             self.subagent_frames += 1
             self.progress("subagent_frame")
             if self.tools is not None:
-                raise ProtocolError("A subagent ran in a restricted call; its tools are outside the requested "
+                raise self.fault("A subagent ran in a restricted call; its tools are outside the requested "
                                     "registry, so this call fails closed. Inspect retained output.")
             return False
         session = value.get("session_id")
@@ -318,6 +320,16 @@ class _Driver:
         if first and self.control is not None and self.accepting and not self.observation_only:
             self.control.set_target(session, None)
 
+    def fault(self, message):
+        """A restricted session doing what its call did not allow: it already holds the task, so it is killed
+        now rather than given the ordinary shutdown grace, and nothing it wrote is kept as a partial answer."""
+        self.registry_failed = True
+        try:
+            os.killpg(self.process.pid, signal.SIGKILL)  # the provider leads its own session
+        except (ProcessLookupError, PermissionError, AttributeError, TypeError):
+            pass
+        return ProtocolError(message)
+
     def registry(self, value):
         """Record what the session reports it can do; anything outside the reviewed set fails closed."""
         def names(field, key=None):
@@ -336,10 +348,10 @@ class _Driver:
                                            "source": "claude_system_init"}
         reviewed = self.reviewed
         if reviewed is None or not identity(version) or version != reviewed.get("version"):
-            raise ProtocolError(f"Claude Code reported {version if identity(version) else '(no version)'}, not the reviewed "
+            raise self.fault(f"Claude Code reported {version if identity(version) else '(no version)'}, not the reviewed "
                                 "binary's version; this call fails closed. Inspect retained output.")
         if any(surface is None for surface in surfaces.values()):
-            raise ProtocolError("Native initialization did not report its whole tool registry; this call fails closed. "
+            raise self.fault("Native initialization did not report its whole tool registry; this call fails closed. "
                                 "Inspect retained output.")
         builtin = isinstance(plugins, list) and all(
             isinstance(item, dict) and item.get("path") == "builtin" and item.get("source") == f"{item.get('name')}@builtin"
@@ -347,7 +359,7 @@ class _Driver:
         if (surfaces["reported"] != self.tools or surfaces["mcp_servers"] or surfaces["slash_commands"]
                 or surfaces["skills"] or not builtin or not set(surfaces["plugins"]) <= set(reviewed["plugins"])
                 or not set(surfaces["agents"]) <= set(reviewed["agents"])):
-            raise ProtocolError("The native tool registry differs from the requested one; this call fails closed. "
+            raise self.fault("The native tool registry differs from the requested one; this call fails closed. "
                                 "Inspect retained output.")
 
     def retain(self, body):
@@ -401,7 +413,7 @@ class _Driver:
             if block["type"] == "tool_use":
                 self.tool_requests += 1
                 if self.tools is not None and block.get("name") not in self.tools:
-                    raise ProtocolError("The session requested a tool outside the requested registry; this call "
+                    raise self.fault("The session requested a tool outside the requested registry; this call "
                                         "fails closed. Inspect retained output.")
         self.assistant_messages += 1
         self.progress("assistant_message")
@@ -536,7 +548,7 @@ class _Driver:
         if self.answer is not None and self.answer not in parts:
             parts.append(self.answer)
         partial = "\n\n".join(part for part in parts if part)[:_MAX_PARTIAL]
-        if partial and self.envelope.get("state") != "returned":
+        if partial and self.envelope.get("state") != "returned" and not self.registry_failed:
             self.envelope["partial_result"] = partial
         if resolve_pending:
             task = self.inputs.get(self.initial)

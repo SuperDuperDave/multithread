@@ -71,7 +71,7 @@ class ClaudeIntegrationTests(unittest.TestCase):
         value = json.loads(output.getvalue())
         self.assertTrue((directory/'result.json').exists(), value.get('message'))  # a refusal names its reason
         self.assertEqual(value, json.loads((directory/'result.json').read_text()))
-        self.assertIsNotNone(value['process_exit_code'])
+        self.assertIsNotNone(value['process_exit_code'], (value.get('unavailable_stage'), value.get('message')))
         self.assertEqual('not_checked', value['workflow_completion'])
         receipt = directory/'control/receipts'/(identifier+'.json')
         return code, value, json.loads(receipt.read_text()) if receipt.exists() else None
@@ -200,6 +200,12 @@ class RestrictedCallTests(ClaudeIntegrationTests):
 
     def setUp(self):
         super().setUp()
+        # The managed-settings preflight reads this host's Windows registry under WSL; fixtures never do.
+        from pathlib import Path
+        for name in ("_WSL_REG", "_WSL_CLAUDE_POLICY"):
+            isolated = mock.patch.object(peer, name, Path("/nonexistent") / name)
+            isolated.start()
+            self.addCleanup(isolated.stop)
         self.review = mock.patch("relay_runtime.claude_peer.reviewed", return_value=protocol.REVIEWED)
         self.found = self.review.start()
         self.addCleanup(self.review.stop)

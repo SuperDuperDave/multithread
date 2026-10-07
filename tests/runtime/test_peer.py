@@ -25,6 +25,11 @@ class PeerTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(prefix="relay-peer-test-", dir="/tmp")
         self.addCleanup(temporary.cleanup)
+        # The managed-settings preflight reads this host's Windows registry under WSL; fixtures never do.
+        for name in ("_WSL_REG", "_WSL_CLAUDE_POLICY"):
+            isolated = mock.patch.object(peer, name, Path("/nonexistent") / name)
+            isolated.start()
+            self.addCleanup(isolated.stop)
         # Restricted calls admit only reviewed binaries; these fixtures stand in for the hand-reviewed one.
         from relay_runtime import claude_peer as claude_review
         reviewed = mock.patch.object(claude_review, "reviewed",
@@ -140,11 +145,16 @@ class PeerTests(unittest.TestCase):
                 self.assertEqual((1, "unavailable", "relay_configuration"),
                                  (code, result["state"], result["unavailable_stage"]))
                 self.assertFalse(result["provider_started"])
-                self.assertIsNone(result["evidence_directory"])
+                # Nothing ran; a real call's refusal is recorded where its caller reads, and nothing else is.
+                self.assertEqual(None if dry else str(evidence), result["evidence_directory"])
                 self.assertIn("hook command", result["message"])
                 native.assert_not_called()
                 delivery.assert_not_called()
-                self.assertFalse(evidence.exists())
+                if dry:
+                    self.assertFalse(evidence.exists())
+                else:
+                    self.assertEqual(["result.json"], sorted(path.name for path in evidence.iterdir()))
+                    self.assertEqual(result, json.loads((evidence / "result.json").read_text()))
                 self.assertFalse(self.calls.exists())
                 self.assertFalse(self.receipt.exists())
                 self.assertFalse((self.base / "canary").exists())
@@ -1176,7 +1186,11 @@ class PeerTests(unittest.TestCase):
         home.mkdir()
         reg = self.base / "reg.exe"
         answers = self.base / "reg-answers.json"
-        reg.write_text(f"#!{sys.executable}\nimport json,sys,time\na=json.load(open({str(answers)!r}))[sys.argv[2]]\n"
+        # An answer is [exit, stdout(, seconds)], or a list of them given one per attempt (the last repeats).
+        reg.write_text(f"#!{sys.executable}\nimport json,sys,time\nA={str(answers)!r}\na=json.load(open(A))[sys.argv[2]]\n"
+                       "if isinstance(a[0], list):\n"
+                       "    c=json.load(open(A+'.n')) if __import__('os').path.exists(A+'.n') else {}\n"
+                       "    n=c.get(sys.argv[2], 0); c[sys.argv[2]]=n+1; json.dump(c, open(A+'.n','w')); a=a[min(n, len(a)-1)]\n"
                        "time.sleep(a[2] if len(a) > 2 else 0); sys.stdout.write(a[1]); sys.exit(a[0])\n")
         reg.chmod(0o700)
         hklm, hkcu = peer._WSL_POLICY_PARENTS
@@ -1184,9 +1198,11 @@ class PeerTests(unittest.TestCase):
                    hkcu: [0, "\r\nHKEY_CURRENT_USER\\SOFTWARE\\Policies\\Microsoft\r\n"]}
         def sources(*, wsl=True, keys=None, environ=None, cwd=None):
             answers.write_text(json.dumps(keys or listing))
+            Path(str(answers) + ".n").unlink(missing_ok=True)
             with (mock.patch.object(peer, "_MANAGED_CLAUDE_SETTINGS", {peer.platform.system(): machine}),
                   mock.patch.object(peer, "_WSL_CLAUDE_POLICY", policy), mock.patch.object(peer, "_WSL_REG", reg),
-                  mock.patch.object(peer, "_is_wsl", return_value=wsl),
+                  mock.patch.object(peer, "_is_wsl", return_value=wsl), mock.patch.object(peer, "_REG_BACKOFF", (0, 0, 0)),
+                  mock.patch.object(peer, "_REG_TIMEOUT", 0.5),
                   mock.patch.dict(os.environ, environ or {"CLAUDE_CONFIG_DIR": str(home)})):
                 return peer._managed_claude_sources(cwd or self.repo)
         self.assertEqual([], sources())
@@ -1212,9 +1228,18 @@ class PeerTests(unittest.TestCase):
         self.assertEqual([hklm + "\\ClaudeCode"], sources(keys=present))
         lower = dict(listing, **{hkcu: [0, "\r\nHKEY_CURRENT_USER\\Software\\Policies\\claudecode\r\n"]})
         self.assertEqual([hkcu + "\\ClaudeCode"], sources(keys=lower))
-        for name, answer in (("access denied", [1, "Zugriff verweigert."]), ("unexpected status", [2, ""])):
+        for name, answer, why in (("access denied", [1, "Zugriff verweigert."], "exit 1"),
+                                  ("unexpected status", [2, ""], "exit 2"),
+                                  ("timed out", [0, "", 2], "timed out")):
             with self.subTest(registry=name):
-                self.assertEqual([hkcu + "\\ClaudeCode (unreadable)"], sources(keys=dict(listing, **{hkcu: answer})))
+                self.assertEqual([hkcu + f"\\ClaudeCode (unreadable after 4 attempts: {why})"],
+                                 sources(keys=dict(listing, **{hkcu: answer})))
+        # WSL's bridge to Windows fails a call now and then (a live training step was refused by one); a read
+        # that recovers on a retry decides alone, and a policy key found on the retry still refuses.
+        transient = [[1, ""], listing[hkcu]]
+        self.assertEqual([], sources(keys=dict(listing, **{hkcu: transient})))
+        found_late = [[1, ""], [1, ""], [1, ""], [0, "\r\nHKEY_CURRENT_USER\\SOFTWARE\\Policies\\ClaudeCode\r\n"]]
+        self.assertEqual([hkcu + "\\ClaudeCode"], sources(keys=dict(listing, **{hkcu: found_late})))
         reg.unlink()
         self.assertEqual([], sources(), "without reg.exe Claude cannot read the registry either")
         with mock.patch.dict(os.environ, {"WSL_DISTRO_NAME": "Ubuntu"}):
@@ -1228,6 +1253,25 @@ class PeerTests(unittest.TestCase):
             self.assertEqual(0, code, "an unrestricted call is unaffected")
             self.assertEqual(1, found.call_count)
         self.assertFalse(self.calls.exists())
+
+    def test_the_cli_keywords_for_every_tool_are_not_tool_names(self):
+        for word in ("default", "all", "Read,ALL"):
+            with self.subTest(tools=word), self.assertRaises(SystemExit), redirect_stderr(io.StringIO()):
+                peer.peer_main(["claude", "--task-file", str(self.task), "--tools", word])
+        self.assertFalse(self.calls.exists())
+
+    def test_a_call_refused_before_it_starts_still_leaves_its_record(self):
+        record = self.base / "refused-call"
+        with mock.patch.object(peer, "_managed_claude_sources", return_value=["/etc/claude-code"]):
+            code, result, _ = self.invoke("--tools", "none", output=record)
+        self.assertNotEqual(0, code)
+        self.assertEqual(result, json.loads((record / "result.json").read_text()))
+        self.assertEqual((str(record), False), (result["evidence_directory"], result["provider_started"]))
+        # Another call's directory is never reused, even for a refusal.
+        (record / "result.json").write_text("another call")
+        with mock.patch.object(peer, "_managed_claude_sources", return_value=["/etc/claude-code"]):
+            self.invoke("--tools", "none", output=record)
+        self.assertEqual("another call", (record / "result.json").read_text())
 
     def test_attachments_are_typed_images_within_their_bounds(self):
         for media_type, body in self.images().items():

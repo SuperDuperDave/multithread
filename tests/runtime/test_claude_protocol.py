@@ -7,9 +7,11 @@ import io
 import json
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from contextlib import contextmanager, redirect_stderr
 from unittest import mock
@@ -963,6 +965,21 @@ class ClaudeProtocolTests(unittest.TestCase):
                 self.assertTrue(envelope["needs_attention"])
                 self.assertIn(why, envelope["message"])
                 self.assert_raw(envelope, directory)
+
+    def test_a_session_outside_its_registry_is_killed_at_once_and_keeps_no_partial_answer(self):
+        # It already holds the task when init arrives, so it gets no shutdown grace (found by three reviewers).
+        cases = {"wider registry at init": [{"emit": self.restricted(tools=["Bash"])}],
+                 "registry widened after text": [{"emit": self.restricted()}, {"emit": assistant("Partial words")},
+                                                 {"emit": self.restricted(tools=["Bash"])}]}
+        for name, frames in cases.items():
+            with self.subTest(case=name):
+                started = time.monotonic()
+                envelope, directory, process = self.run_native([{"read": 1}, *frames, {"sleep": 8}, {"emit": result()}],
+                                                               tools=[])
+                self.assertLess(time.monotonic() - started, 4, "no 5 s grace and 5 s TERM window")
+                self.assertEqual(-signal.SIGKILL, process.wait(timeout=5))
+                self.assertEqual(("uncertain", None), (envelope["state"], envelope["result"]))
+                self.assertNotIn("partial_result", envelope)
 
     def test_activity_outside_the_registry_fails_closed(self):
         tool_use = {"type": "assistant", "uuid": str(uuid.uuid4()), "session_id": SESSION, "parent_tool_use_id": None,
