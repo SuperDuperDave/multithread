@@ -1172,6 +1172,107 @@ def wake_main(argv=None, *, ledger=launcher_ledger):
     return _emit(wake_status(args, ledger) if args.status else wake(args, ledger), args.json)
 
 
+# --- signal --wake ---------------------------------------------------------------
+
+# Kinds that enter the recipient's inbox, so a woken session finds them pending.
+_DELIVERABLE = ("work.handoff", "work.blocked", "review.requested")
+
+
+def _receives(binding, agent, session):
+    """Whether this binding's recipient is exactly agent/session.
+
+    A Codex binding delivers to its conversation, whoever bound it; a Claude
+    Code binding delivers to the session that bound its own inbox.
+    """
+    if binding.get("state") not in ("active", "paused"):
+        return False
+    if binding.get("provider") == "codex":
+        return agent == "codex" and binding.get("thread") == session
+    return binding.get("bound_agent") == agent and binding.get("bound_session") == session
+
+
+def _expectation(binding):
+    if binding["provider"] == "codex":
+        return {"expect_generation": binding["generation"], "expect_provider": "codex",
+                "expect_thread": binding["thread"], "expect_bound_agent": None, "expect_bound_session": None}
+    return {"expect_generation": binding["generation"], "expect_provider": "claude", "expect_thread": None,
+            "expect_bound_agent": binding["bound_agent"], "expect_bound_session": binding["bound_session"]}
+
+
+def signal_wake(args, rest, ledger=launcher_ledger):
+    """Record one signal, then wake its exact recipient through that recipient's own binding."""
+    try:
+        agent, session = _actor(args)
+        if args.kind not in _DELIVERABLE:
+            raise ValidationError(f"--wake needs a kind that reaches an inbox ({', '.join(_DELIVERABLE)}); "
+                                  f"{args.kind} does not")
+        if args.target is None or args.target_session is None:
+            raise ValidationError("--wake needs --target and --target-session: only an exact recipient's own "
+                                  "binding is woken")
+        target_agent, target_session = canonical_agent(args.target), canonical_agent(args.target_session)
+    except ValidationError as exc:
+        return _outcome("NOT SENT", f"Nothing was recorded or sent: {exc}.", "Correct that and run this again.")
+    repo = Path(args.repo or os.getcwd()).absolute()
+    code, reply, problem = ledger(repo, "signal", args.kind, *rest, "--agent", agent, "--session", session,
+                                  "--target", target_agent, "--target-session", target_session)
+    if code is None:
+        return _outcome("UNCERTAIN", f"The ledger at {repo} didn't answer ({problem}); the signal may or may not be "
+                        "recorded. Nothing was woken.", "Read the ledger's newest events before sending again; an "
+                        "identical signal is recognized as a duplicate.")
+    if code != 0:
+        return _outcome("NOT SENT", f"The signal wasn't recorded in the ledger at {repo}: {problem}. Nothing was "
+                        "sent.", _ledger_next(code, repo, "run this again"))
+    event = reply["event"]
+    seq = event["seq"]
+    recorded = {"seq": seq, "id": event["id"], "duplicate": bool(reply.get("duplicate")), "target": event["target"]}
+    later = (f"The recipient sees signal {seq} at its next prompt; to wake it now, run multithread wake <role> "
+             f"--ref {seq} for a role bound to that session.")
+    code, shown, problem = ledger(repo, "wake-ledger", "show")
+    if code != 0:
+        return _outcome("NOT SENT", f"Recorded signal {seq}, but this ledger's bindings couldn't be read "
+                        f"({problem}), so no wake was sent.", later, signal=recorded)
+    bindings = sorted((binding for binding in shown.get("bindings", []) if isinstance(binding, dict)
+                       and _receives(binding, target_agent, target_session)), key=lambda binding: binding["role"])
+    active = [binding for binding in bindings if binding["state"] == "active"]
+    if not active:
+        paused = ", ".join(binding["role"] for binding in bindings)
+        why = (f"that session's binding ({paused}) is paused" if paused
+               else "no role in this ledger is bound to that session")
+        return _outcome("NOT SENT", f"Recorded signal {seq} for {target_agent} {target_session}, but {why}, so no "
+                        "wake was sent.", later, signal=recorded)
+    binding = active[0]
+    wake_args = argparse.Namespace(repo=str(repo), steer=args.steer, agent=agent, session=session,
+                                   role=binding["role"], ref=str(seq), message_id=None, dry_run=False,
+                                   sender_repo=None, sender_role=None, codex=args.codex, **_expectation(binding))
+    result = wake(wake_args, ledger)
+    result["happened"] = f"Recorded signal {seq}. " + result["happened"]
+    result["signal"] = recorded
+    if len(active) > 1:
+        result["also_bound"] = [other["role"] for other in active[1:]]
+    return result
+
+
+def signal_wake_main(argv=None, *, ledger=launcher_ledger):
+    parser = argparse.ArgumentParser(prog="multithread signal --wake", allow_abbrev=False, description=(
+        "Record one signal, then wake its exact recipient when that session holds a role binding in the same "
+        "ledger. The wake's actual outcome is reported, never assumed; an unbound recipient is reported as not "
+        "woken. Every other option is the signal's own. Exit 0 woken, 3 already sent, 4 not woken (the signal "
+        "may still be recorded: see signal.seq), 5 uncertain."))
+    parser.add_argument("kind")
+    parser.add_argument("--wake", action="store_true", required=True)
+    parser.add_argument("--steer", action="store_true",
+                        help="fold into a Codex recipient's running turn; Claude Code has no separate steer")
+    parser.add_argument("--agent")
+    parser.add_argument("--session")
+    parser.add_argument("--target")
+    parser.add_argument("--target-session")
+    parser.add_argument("--codex", help="absolute Codex executable for codex queue; default: PATH")
+    parser.add_argument("--repo", help="checkout whose ledger records the signal and holds the binding")
+    parser.add_argument("--json", action="store_true", help="one JSON object with the same outcome")
+    args, rest = parser.parse_known_args(argv)
+    return _emit(signal_wake(args, rest, ledger), args.json)
+
+
 # --- bind ------------------------------------------------------------------------
 
 def _coverage(ledger, thread, cwd):

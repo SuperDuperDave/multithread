@@ -94,6 +94,10 @@ def build_parser() -> argparse.ArgumentParser:
     signal.add_argument("--evidence-sha256")
     signal.add_argument("--resource")
     signal.add_argument("--reason")
+    signal.add_argument("--wake", action="store_true",
+                        help="then wake --target/--target-session through its own role binding in this ledger "
+                             "(handoff, blocked or review kinds); reports the wake's actual outcome. "
+                             "--steer folds into a running Codex turn")
 
     claim = commands.add_parser("claim", help="atomically claim a scarce resource")
     claim.add_argument("resource", help="namespace:name, for example refinement:inbox")
@@ -400,6 +404,8 @@ def _dispatch(store: RelayStore, args: argparse.Namespace) -> Any:
     if args.command == "emit":
         return store.emit(_read_json_object(sys.stdin.buffer))
     if args.command == "signal":
+        if args.wake:
+            raise ValidationError("signal --wake runs through the installed multithread command")
         agent, session = _actor(args)
         target = canonical_target(args.target)
         if args.target_session is not None:

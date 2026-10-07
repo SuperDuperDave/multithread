@@ -1810,6 +1810,119 @@ class ClaudeTests(WakeCase):
                           f"{bound['seq']}, by claude:self at {bound['recorded_at']})"], out.splitlines())
 
 
+class SignalWakeTests(ClaudeTests):
+    ARTIFACT = "sha256:" + "a" * 64
+
+    def signal_wake(self, *extra, target=("claude", "self"), kind="work.handoff"):
+        code, out = self.run_helper(wake.signal_wake_main, kind, "--wake", "--agent", "codex", "--session", "sol",
+                                    "--target", target[0], "--target-session", target[1],
+                                    "--summary", "synthetic handoff", "--artifact", self.ARTIFACT,
+                                    "--codex", str(self.codex), "--json", *extra)
+        result = json.loads(out)
+        self.assertEqual(code, result["exit_code"])
+        return result
+
+    def signals(self):
+        return self.events("work.handoff")
+
+    def test_records_then_delivers_to_the_exact_claude_session(self):
+        self.bind_inbox()
+        result = self.signal_wake()
+        seq = self.signals()[-1]["seq"]
+        self.assertEqual("DELIVERED TO INBOX", result["status"])
+        self.assertEqual({"seq": seq, "id": self.signals()[-1]["id"], "duplicate": False,
+                          "target": json.dumps(["claude", "self"], separators=(",", ":"))}, result["signal"])
+        self.assertTrue(result["happened"].startswith(f"Recorded signal {seq}. The Claude Code inbox"))
+        attempt = self.events("wake.attempted")[-1]
+        self.assertEqual((str(seq), "reviewer"), (attempt["meta"]["ref"], attempt["meta"]["role"]))
+        self.assertEqual("delivered", self.conclusion()["outcome"])
+        self.assertIn(f"ledger sequence {seq} in {self.repo}", json.dumps(self.received()[0]))
+
+    def test_records_then_queues_or_steers_the_bound_codex_conversation(self):
+        self.bound()
+        result = self.signal_wake(target=("codex", THREAD))
+        self.assertEqual("QUEUED", result["status"])
+        self.assertEqual(str(result["signal"]["seq"]), self.events("wake.attempted")[-1]["meta"]["ref"])
+        self.live()
+        # Another handoff needs its own artifact: the ledger refuses a reused id with different content.
+        result = self.signal_wake("--steer", "--summary", "news for the running turn",
+                                  "--artifact", "sha256:" + "b" * 64, target=("codex", THREAD))
+        self.assertEqual("STEERED", result["status"])
+
+    def test_a_session_without_a_binding_is_recorded_but_not_woken(self):
+        self.bind_inbox()
+        result = self.signal_wake(target=("claude", "someone-else"))
+        self.assertEqual(("NOT SENT", 4), (result["status"], result["exit_code"]))
+        seq = self.signals()[-1]["seq"]
+        self.assertEqual(seq, result["signal"]["seq"])
+        self.assertIn("no role in this ledger is bound to that session, so no wake was sent", result["happened"])
+        self.assertIn(f"--ref {seq}", result["next"])
+        self.assertEqual([], self.events("wake.attempted"))
+        self.assertEqual([], self.inbox.lines)
+
+    def test_a_paused_binding_is_recorded_but_not_woken(self):
+        self.bind_inbox()
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(0, core_cli.main(["--repo", str(self.repo), "--home", str(self.home), "pause",
+                                               "reviewer", "--agent", "claude", "--session", "self"]))
+        result = self.signal_wake()
+        self.assertEqual("NOT SENT", result["status"])
+        self.assertIn("that session's binding (reviewer) is paused", result["happened"])
+        self.assertEqual(1, len(self.signals()))
+        self.assertEqual([], self.events("wake.attempted"))
+
+    def test_refuses_before_recording_what_it_could_not_wake(self):
+        self.bind_inbox()
+        for extra, kind, target, why in (
+                ((), "work.intent", ("claude", "self"), "work.intent does not"),
+                ((), "work.handoff", ("claude", ""), "--wake needs --target and --target-session")):
+            with self.subTest(why=why):
+                argv = [kind, "--wake", "--agent", "codex", "--session", "sol", "--target", target[0],
+                        "--summary", "s", "--artifact", self.ARTIFACT, "--work-id", "w", "--json"]
+                if target[1]:
+                    argv += ["--target-session", target[1]]
+                code, out = self.run_helper(wake.signal_wake_main, *argv)
+                result = json.loads(out)
+                self.assertEqual(("NOT SENT", 4), (result["status"], code))
+                self.assertIn(why, result["happened"])
+        self.assertEqual([], self.events("work.handoff") + self.events("work.intent"))
+        self.assertEqual([], self.events("wake.attempted"))
+
+    def test_the_ledger_refusing_the_signal_wakes_nothing(self):
+        self.bind_inbox()
+        code, out = self.run_helper(wake.signal_wake_main, "work.handoff", "--wake", "--agent", "codex",
+                                    "--session", "sol", "--target", "claude", "--target-session", "self",
+                                    "--summary", "no artifact", "--json")
+        result = json.loads(out)
+        self.assertEqual(("NOT SENT", 4), (result["status"], code))
+        self.assertIn("The signal wasn't recorded", result["happened"])
+        self.assertEqual([], self.signals())
+        self.assertEqual([], self.events("wake.attempted"))
+
+    def test_running_it_again_records_and_wakes_once(self):
+        self.bind_inbox()
+        first = self.signal_wake()
+        again = self.signal_wake()
+        self.assertEqual(("ALREADY SENT", 3), (again["status"], again["exit_code"]))
+        self.assertEqual((first["signal"]["seq"], True), (again["signal"]["seq"], again["signal"]["duplicate"]))
+        self.assertEqual(1, len(self.signals()))
+        self.assertEqual(1, len(self.received()))
+
+    def test_installed_dispatcher_routes_only_signal_with_wake(self):
+        argv = ["work.handoff", "--wake", "--summary", "s", "--target", "claude", "--target-session", "x"]
+        with mock.patch("relay_runtime.wake.signal_wake_main", return_value=4) as helper:
+            self.assertEqual(4, runtime_cli.main(["--repo", "/srv/checkout", "--json", "signal", *argv]))
+        helper.assert_called_once_with([*argv, "--repo", "/srv/checkout", "--json"])
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = core_cli.main(["--repo", str(self.repo), "--home", str(self.home), "signal", "work.handoff",
+                                  "--wake", "--agent", "a", "--session", "s", "--summary", "s",
+                                  "--artifact", self.ARTIFACT])
+        self.assertNotEqual(0, code)
+        self.assertIn("signal --wake runs through the installed multithread command", err.getvalue())
+        self.assertEqual([], self.signals())
+
+
 class BindTests(WakeCase):
     def test_paused_role_stays_paused_through_refresh_and_authorized_handover(self):
         self.bound()
