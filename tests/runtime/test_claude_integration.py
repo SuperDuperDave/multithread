@@ -21,7 +21,7 @@ class ClaudeIntegrationTests(unittest.TestCase):
     executable = staticmethod(fixture.CodexProtocolTests.executable)
     configure = fixture.CodexProtocolTests.configure
 
-    def invoke(self, steps, *, update=False, closure_fault=False, progress_only=False):
+    def invoke(self, steps, *, update=False, closure_fault=False, progress_only=False, restricted=False):
         hook = shlex.join([str(self.relay), '--repo', str(self.repo), 'provider-hook', '--client', 'claude'])
         hooks = {event: [{'hooks': [{'type': 'command', 'command': hook, 'timeout': 3}]}]
                  for event in ('SessionStart', 'UserPromptSubmit', 'PostToolUse', 'Stop', 'SessionEnd')}
@@ -52,7 +52,7 @@ class ClaudeIntegrationTests(unittest.TestCase):
                 finally:
                     files.release()
 
-        arguments = ['claude', '--stream-progress' if progress_only else '--live-input',
+        arguments = ['claude', *(['--tools', 'none'] if restricted else ['--stream-progress' if progress_only else '--live-input']),
                      '--repo', str(self.repo), '--multithread', str(self.relay),
                      '--provider', str(self.provider), '--task-file', str(self.task),
                      '--output-dir', str(directory), '--timeout', '2', '--json']
@@ -188,3 +188,33 @@ class ClaudeIntegrationTests(unittest.TestCase):
         self.assertTrue(value['needs_attention'])
         self.assertIn('server_cleanup', value)
         self.assertEqual('shutdown_timeout', value['caller_stop_reason'])
+
+
+class RestrictedCallTests(ClaudeIntegrationTests):
+    """--tools end to end: no hook settings reach the session, and only a clean stream returns."""
+
+    def restricted_steps(self, *after):
+        return [{'read': 1}, {'emit': protocol.ClaudeProtocolTests.restricted()}, {'emit': protocol.result()}, *after]
+
+    def test_a_clean_restricted_stream_returns_without_hook_settings(self):
+        code, value, _ = self.invoke(self.restricted_steps(), restricted=True)
+        self.assertEqual((0, 'returned'), (code, value['state']), value)
+        self.assertEqual([], value['provider_tools']['reported'])
+        argv = json.loads(self.receipt.read_text())['argv']
+        self.assertNotIn('--settings', argv)
+        for flag in ('--restricted', '--strict-mcp-config', '--disable-slash-commands'):
+            self.assertIn(flag, argv)
+        self.assertEqual('', argv[argv.index('--tools') + 1])
+        self.assertIn('--tools', value['follow_up_preparation']['argv_prefix'])
+
+    def test_a_registry_change_after_the_result_revokes_it_and_exits_nonzero(self):
+        import shutil
+        late = protocol.ClaudeProtocolTests.restricted(tools=['Bash'])
+        for name, after in (('late registry', [{'emit': late}]), ('late malformed record', [{'raw': b'{broken\n'.hex()}])):
+            with self.subTest(case=name):
+                shutil.rmtree(self.base / 'stream-evidence', ignore_errors=True)
+                code, value, _ = self.invoke(self.restricted_steps(*after), restricted=True)
+                self.assertNotEqual(0, code)
+                self.assertEqual('uncertain', value['state'])
+                self.assertIsNone(value['result'])
+                self.assertNotIn('follow_up_preparation', value)

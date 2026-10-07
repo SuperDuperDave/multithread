@@ -31,6 +31,12 @@ _MAX_UUIDS = 64
 _MAX_TEXT = 64 * 1024
 _MAX_PARTIAL = 64 * 1024
 _MAX_CONTROLS = 4096
+# Restricted sessions are accepted only from reviewed Claude Code versions, whose
+# remaining built-in surfaces are known. Subagents need a tool no restricted call offers.
+_REVIEWED_RESTRICTED = {
+    "2.1.292": {"plugins": frozenset({"cc-plugin-agents-md", "cc-plugin-telemetry", "cc-plugin-plugin-authoring"}),
+                "agents": frozenset({"claude", "Explore", "general-purpose", "Plan", "statusline-setup"})},
+}
 _ERROR_SUBTYPES = ("error_max_turns", "error_during_execution", "error_max_budget_usd",
                    "error_max_structured_output_retries")
 
@@ -50,6 +56,7 @@ class _Driver:
         self.attachments = list(attachments)
         self.attached = {item["sha256"] for item in self.attachments}
         self.tools = tools
+        self.revoked = False
         self.repo = repo
         self.envelope = envelope
         self.requested = envelope.get("requested_session_id") or resume
@@ -252,6 +259,9 @@ class _Driver:
         if value.get("parent_tool_use_id") is not None:
             self.subagent_frames += 1
             self.progress("subagent_frame")
+            if self.tools is not None:
+                raise ProtocolError("A subagent ran in a restricted call; its tools are outside the requested "
+                                    "registry, so this call fails closed. Inspect retained output.")
             return False
         session = value.get("session_id")
         if value.get("type") in ("assistant", "user", "result") and session is None:
@@ -308,18 +318,33 @@ class _Driver:
             self.control.set_target(session, None)
 
     def registry(self, value):
-        """Record the tool registry the session reports; anything but the requested one fails closed."""
-        tools, servers = value.get("tools"), value.get("mcp_servers")
-        names = (sorted(tools) if isinstance(tools, list) and len(tools) <= 256
-                 and all(identity(name) for name in tools) else None)
-        mcp = ([server.get("name") if isinstance(server, dict) else server for server in servers]
-               if isinstance(servers, list) and len(servers) <= 64 else None)
-        self.envelope["provider_tools"] = {"requested": self.tools, "reported": names,
-                                           "mcp_servers": mcp, "source": "claude_system_init"}
-        if names is None or mcp is None:
-            raise ProtocolError("Native initialization did not report its tool registry; this call fails closed. "
+        """Record what the session reports it can do; anything outside the reviewed set fails closed."""
+        def names(field, key=None):
+            items = value.get(field)
+            if not isinstance(items, list) or len(items) > 256:
+                return None
+            items = [item.get(key) if key and isinstance(item, dict) else item for item in items]
+            return sorted(items) if all(identity(item) for item in items) else None
+        version = value.get("claude_code_version")
+        plugins = value.get("plugins")
+        surfaces = {"reported": names("tools"), "mcp_servers": names("mcp_servers", "name"),
+                    "slash_commands": names("slash_commands"), "skills": names("skills"),
+                    "plugins": names("plugins", "name"), "agents": names("agents")}
+        self.envelope["provider_tools"] = {"requested": self.tools, **surfaces,
+                                           "claude_code_version": version if identity(version) else None,
+                                           "source": "claude_system_init"}
+        reviewed = _REVIEWED_RESTRICTED.get(version) if identity(version) else None
+        if reviewed is None:
+            raise ProtocolError(f"Claude Code {version if identity(version) else '(unreported)'} is not a reviewed version "
+                                "for restricted calls; this call fails closed. Inspect retained output.")
+        if any(surface is None for surface in surfaces.values()):
+            raise ProtocolError("Native initialization did not report its whole tool registry; this call fails closed. "
                                 "Inspect retained output.")
-        if names != self.tools or mcp:
+        builtin = isinstance(plugins, list) and all(isinstance(item, dict) and item.get("path") == "builtin"
+                                                    for item in plugins)
+        if (surfaces["reported"] != self.tools or surfaces["mcp_servers"] or surfaces["slash_commands"]
+                or surfaces["skills"] or not builtin or not set(surfaces["plugins"]) <= reviewed["plugins"]
+                or not set(surfaces["agents"]) <= reviewed["agents"]):
             raise ProtocolError("The native tool registry differs from the requested one; this call fails closed. "
                                 "Inspect retained output.")
 
@@ -373,6 +398,9 @@ class _Driver:
                 text.append(block["text"])
             if block["type"] == "tool_use":
                 self.tool_requests += 1
+                if self.tools is not None and block.get("name") not in self.tools:
+                    raise ProtocolError("The session requested a tool outside the requested registry; this call "
+                                        "fails closed. Inspect retained output.")
         self.assistant_messages += 1
         self.progress("assistant_message")
         joined = "".join(text)
@@ -523,11 +551,21 @@ class _Driver:
 
     def problem(self, message):
         self.had_problem = True
+        if self.tools is not None:
+            # A restricted call returns a result only from a stream observed cleanly to its end:
+            # any fault, even after the result and during cleanup, revokes it.
+            self.revoked = True
+            self.outcome_recorded = False
         if not self.outcome_recorded:
             self.envelope.update(state="uncertain", result=None)
         self.envelope.update(needs_attention=True, message=message)
 
     def finish(self):
+        if self.revoked:
+            return
+        if self.tools is not None and self.envelope.get("provider_tools", {}).get("source") != "claude_system_init":
+            raise ProtocolError("The session never reported its tool registry; this call fails closed. "
+                                "Inspect retained output.")
         if not self.results:
             raise ProtocolError("Native output ended without a validated main session result; work may have occurred.")
         last = self.last_related

@@ -911,31 +911,65 @@ class ClaudeProtocolTests(unittest.TestCase):
 
     # --- requested tool registry and attached images ---------------------
 
+    @staticmethod
+    def restricted(**changes):
+        frame = init(claude_code_version="2.1.292", tools=[], mcp_servers=[], slash_commands=[], skills=[],
+                     plugins=[{"name": "cc-plugin-telemetry", "path": "builtin", "source": "cc-plugin-telemetry@builtin"}],
+                     agents=["claude", "Explore"])
+        frame.update(changes)
+        return frame
+
     def test_the_reported_tool_registry_is_recorded_when_it_matches(self):
         for tools in ([], ["Glob", "Read"]):
             with self.subTest(tools=tools):
                 envelope, directory, _ = self.run_native(
-                    [{"read": 1}, {"emit": init(tools=list(reversed(tools)))}, {"emit": result()}], tools=tools)
+                    [{"read": 1}, {"emit": self.restricted(tools=list(reversed(tools)))}, {"emit": result()}],
+                    tools=tools)
                 self.assertEqual("returned", envelope["state"])
-                self.assertEqual({"requested": tools, "reported": tools, "mcp_servers": [],
-                                  "source": "claude_system_init"}, envelope["provider_tools"])
+                self.assertEqual({"requested": tools, "reported": tools, "mcp_servers": [], "slash_commands": [],
+                                  "skills": [], "plugins": ["cc-plugin-telemetry"], "agents": ["Explore", "claude"],
+                                  "claude_code_version": "2.1.292", "source": "claude_system_init"},
+                                 envelope["provider_tools"])
                 self.assert_raw(envelope, directory)
 
-    def test_a_missing_or_different_registry_fails_closed(self):
-        for name, frame, why in (
-                ("extra tool", init(tools=["Bash", "Read"]), "differs from the requested one"),
-                ("mcp server", init(tools=["Read"], mcp_servers=[{"name": "mail", "status": "connected"}]),
-                 "differs from the requested one"),
-                ("unreported", init(tools=None), "did not report its tool registry")):
+    def test_anything_outside_the_reviewed_registry_fails_closed_at_initialization(self):
+        cases = {
+            "extra tool": ({"tools": ["Bash", "Read"]}, "differs from the requested one"),
+            "mcp server": ({"mcp_servers": [{"name": "mail", "status": "connected"}]}, "differs from the requested one"),
+            "slash command": ({"slash_commands": ["compact"]}, "differs from the requested one"),
+            "skill": ({"skills": ["deep-research"]}, "differs from the requested one"),
+            "installed plugin": ({"plugins": [{"name": "mail", "path": "/home/x/.claude/plugins/mail"}]},
+                                 "differs from the requested one"),
+            "unknown agent": ({"agents": ["claude", "mailer"]}, "differs from the requested one"),
+            "unreported tools": ({"tools": None}, "did not report its whole tool registry"),
+            "unreported agents": ({"agents": None}, "did not report its whole tool registry"),
+            "unreviewed version": ({"claude_code_version": "99.0.0"}, "Claude Code 99.0.0 is not a reviewed version"),
+            "no version": ({"claude_code_version": None}, "Claude Code (unreported) is not a reviewed version"),
+        }
+        for name, (changes, why) in cases.items():
             with self.subTest(case=name):
                 envelope, directory, _ = self.run_native(
-                    [{"read": 1}, {"emit": frame}, {"emit": result()}, {"sleep": 0.2}], tools=["Read"])
+                    [{"read": 1}, {"emit": self.restricted(**changes)}, {"emit": result()}, {"sleep": 0.2}],
+                    tools=["Read"] if name == "extra tool" else [])
                 self.assertEqual("uncertain", envelope["state"])
                 self.assertIsNone(envelope["result"])
                 self.assertTrue(envelope["needs_attention"])
                 self.assertIn(why, envelope["message"])
-                self.assertEqual(["Read"], envelope["provider_tools"]["requested"])
                 self.assert_raw(envelope, directory)
+
+    def test_activity_outside_the_registry_fails_closed(self):
+        tool_use = {"type": "assistant", "uuid": str(uuid.uuid4()), "session_id": SESSION, "parent_tool_use_id": None,
+                    "message": {"id": "msg_tool", "role": "assistant", "model": "fixture",
+                                "content": [{"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {}}]}}
+        for name, frame, why in (("tool outside registry", tool_use, "requested a tool outside the requested registry"),
+                                 ("subagent", assistant("sub", parent="toolu_1"), "A subagent ran in a restricted call")):
+            with self.subTest(case=name):
+                envelope, directory, _ = self.run_native(
+                    [{"read": 1}, {"emit": self.restricted()}, {"emit": frame}, {"emit": result()}, {"sleep": 0.2}],
+                    tools=[])
+                self.assertEqual("uncertain", envelope["state"])
+                self.assertIsNone(envelope["result"])
+                self.assertIn(why, envelope["message"])
 
     def test_attached_images_travel_as_base64_blocks_and_their_echo_is_kept_by_reference(self):
         body = b"\x89PNG\r\n\x1a\n" + os.urandom(8 * 1024)
@@ -948,7 +982,7 @@ class ClaudeProtocolTests(unittest.TestCase):
                     {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": encoded}},
                     {"type": "text", "text": self.task}]}}
         envelope, directory, _ = self.run_native(
-            [{"read": 1}, {"emit": init()}, {"emit": echo}, {"emit": result()}],
+            [{"read": 1}, {"emit": self.restricted()}, {"emit": echo}, {"emit": result()}],
             attachments=[attachment], tools=[])
         self.assertEqual("returned", envelope["state"])
         sent = self.submitted()[0]["message"]["content"]

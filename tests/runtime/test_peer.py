@@ -1129,43 +1129,90 @@ class PeerTests(unittest.TestCase):
         config.assert_not_called()
 
 
-    def test_tools_and_attachments_run_restricted_in_stream_mode(self):
+    @staticmethod
+    def images():
+        """Small structurally complete images of each accepted type, built here (artificial content)."""
+        import struct, zlib
+        def chunk(kind, data):
+            return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xffffffff)
+        png = (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0))
+               + chunk(b"IDAT", zlib.compress(b"\x00\xff\x00\x00")) + chunk(b"IEND", b""))
+        gif = b"GIF89a" + struct.pack("<HH", 1, 1) + b"\x00\x00\x00" + b"\x2c" + b"\x00" * 9 + b"\x02\x02D\x01\x00\x3b"
+        webp_body = b"WEBP" + b"VP8L" + struct.pack("<I", 5) + b"\x2f\x00\x00\x00\x00\x00"
+        webp = b"RIFF" + struct.pack("<I", len(webp_body)) + webp_body
+        jpeg = (b"\xff\xd8" + b"\xff\xc0" + struct.pack(">H", 11) + b"\x08\x00\x01\x00\x01\x01\x01\x11\x00"
+                + b"\xff\xda" + struct.pack(">H", 8) + b"\x01\x01\x00\x00\x3f\x00" + b"\x00\x00" + b"\xff\xd9")
+        return {"image/png": png, "image/gif": gif, "image/webp": webp, "image/jpeg": jpeg}
+
+    def test_tools_and_attachments_run_restricted_in_stream_mode_without_hook_settings(self):
         image = self.base / "card.png"
-        image.write_bytes(b"\x89PNG\r\n\x1a\n" + b"pixels")
+        image.write_bytes(self.images()["image/png"])
+        self.configure_hook(shlex.join([str(self.relay), "--repo", str(self.repo), "provider-hook", "--client", "claude"]))
+        code, dry, _ = self.invoke("--dry-run")
+        self.assertIn("--settings", dry["argv"])
         code, dry, _ = self.invoke("--tools", "none", "--attach", str(image), "--dry-run")
         self.assertEqual(0, code)
         argv = dry["argv"]
-        self.assertEqual(["--tools", "", "--restricted", "--strict-mcp-config"],
-                         argv[argv.index("--tools"):argv.index("--tools") + 4])
+        self.assertNotIn("--settings", argv)
+        self.assertEqual(["--tools", "", "--restricted", "--strict-mcp-config", "--disable-slash-commands"],
+                         argv[argv.index("--tools"):argv.index("--tools") + 5])
         self.assertEqual("stream-json", argv[argv.index("--input-format") + 1])
         self.assertEqual({"requested": [], "reported": None, "mcp_servers": None, "source": "not_observed"},
                          dry["provider_tools"])
-        self.assertEqual([{"path": str(image), "media_type": "image/png", "bytes": 14,
+        self.assertEqual([{"path": str(image), "media_type": "image/png", "bytes": image.stat().st_size,
                            "sha256": hashlib.sha256(image.read_bytes()).hexdigest()}], dry["attachments"])
         code, dry, _ = self.invoke("--tools", "Read,Glob", "--dry-run")
         self.assertEqual("Glob,Read", dry["argv"][dry["argv"].index("--tools") + 1])
         self.assertFalse(self.calls.exists())
 
-    def test_unusable_attachments_are_refused_before_launch(self):
+    def test_managed_settings_refuse_a_restricted_call_before_launch(self):
+        managed = self.base / "managed-claude"
+        managed.mkdir()
+        with mock.patch.object(peer, "_MANAGED_CLAUDE_SETTINGS", {peer.platform.system(): managed}):
+            code, result, _ = self.invoke("--tools", "none")
+            self.assertNotEqual(0, code)
+            self.assertEqual(("unavailable", False), (result["state"], result["provider_started"]))
+            self.assertIn("Managed Claude settings exist", result["message"])
+            code, dry, _ = self.invoke("--dry-run")
+            self.assertEqual(0, code, "an unrestricted call is unaffected")
+        self.assertFalse(self.calls.exists())
+
+    def test_attachments_are_complete_images_within_their_bounds(self):
+        for media_type, body in self.images().items():
+            with self.subTest(accepted=media_type):
+                path = self.base / ("ok." + media_type.split("/")[1])
+                path.write_bytes(body)
+                code, dry, _ = self.invoke("--attach", str(path), "--dry-run")
+                self.assertEqual((0, media_type), (code, dry["attachments"][0]["media_type"]))
         text = self.base / "notes.txt"
         text.write_text("not an image")
-        image = self.base / "card.png"
-        image.write_bytes(b"\x89PNG\r\n\x1a\n" + b"x" * 64)
         link = self.base / "link.png"
-        link.symlink_to(image)
-        for path, why in ((text, "is not a PNG, JPEG, GIF or WebP image"), (link, "could not be opened"),
-                          (self.base / "absent.png", "could not be opened")):
-            with self.subTest(path=path.name):
+        link.symlink_to(self.base / "ok.png")
+        forged = {"signature only": b"\x89PNG\r\n\x1a\n", "gif then text": b"GIF89a then some text",
+                  "webp then text": b"RIFF0000WEBP then text"}
+        cases = [(text, "is not a complete PNG, JPEG, GIF or WebP image"), (link, "could not be opened"),
+                 (self.base / "absent.png", "could not be opened")]
+        for name, body in forged.items():
+            path = self.base / (name.replace(" ", "-") + ".img")
+            path.write_bytes(body)
+            cases.append((path, "is not a complete PNG, JPEG, GIF or WebP image"))
+        for path, why in cases:
+            with self.subTest(refused=path.name):
                 code, result, _ = self.invoke("--attach", str(path))
                 self.assertNotEqual(0, code)
                 self.assertEqual(("unavailable", False), (result["state"], result["provider_started"]))
                 self.assertIn(why, result["message"])
+        png = self.base / "ok.png"
+        code, result, _ = self.invoke(*[argument for _ in range(peer._MAX_ATTACHMENTS + 1) for argument in ("--attach", str(png))])
+        self.assertIn(f"At most {peer._MAX_ATTACHMENTS} images", result["message"])
         with mock.patch.object(peer, "_MAX_ATTACHMENT", 16):
-            code, result, _ = self.invoke("--attach", str(image))
-        self.assertIn("exceeds", result["message"])
+            self.assertIn("exceeds", self.invoke("--attach", str(png))[1]["message"])
+        with mock.patch.object(peer, "_MAX_ATTACHMENTS_TOTAL", png.stat().st_size + 1):
+            self.assertIn("in total", self.invoke("--attach", str(png), "--attach", str(png))[1]["message"])
         self.assertFalse(self.calls.exists())
-        with self.assertRaises(SystemExit), redirect_stderr(io.StringIO()):
-            peer.peer_main(["claude", "--task-file", str(self.task), "--tools", "Read,Read"])
+        for tools in ("Read,Read", "Agent", "Read,Task"):
+            with self.subTest(tools=tools), self.assertRaises(SystemExit), redirect_stderr(io.StringIO()):
+                peer.peer_main(["claude", "--task-file", str(self.task), "--tools", tools])
 
 class RepositoryRoutingTests(unittest.TestCase):
     def test_conflicting_selections_refuse_before_alias_or_native_work(self):

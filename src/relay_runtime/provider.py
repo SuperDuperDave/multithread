@@ -437,9 +437,39 @@ def _task(path):
 _MAX_ATTACHMENTS = 20
 _MAX_ATTACHMENT = 5 * 1024 * 1024
 _MAX_ATTACHMENTS_TOTAL = 10 * 1024 * 1024
-_IMAGE_MAGIC = ((b"\x89PNG\r\n\x1a\n", "image/png"), (b"\xff\xd8\xff", "image/jpeg"),
-                (b"GIF87a", "image/gif"), (b"GIF89a", "image/gif"))
 _TOOL_NAME = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,63}")
+# A subagent runs with tools this call cannot see, so a restricted call cannot offer one.
+_SUBAGENT_TOOLS = frozenset({"Agent", "Task"})
+# Settings an administrator manages stay in force under --restricted, hooks included.
+_MANAGED_CLAUDE_SETTINGS = {"Linux": Path("/etc/claude-code"),
+                            "Darwin": Path("/Library/Application Support/ClaudeCode")}
+
+
+def _image_type(body):
+    """The media type of a structurally plausible PNG, JPEG, GIF or WebP file, else None."""
+    if body.startswith(b"\x89PNG\r\n\x1a\n"):
+        width, height = int.from_bytes(body[16:20], "big"), int.from_bytes(body[20:24], "big")
+        whole = body[8:16] == b"\x00\x00\x00\rIHDR" and body.endswith(b"IEND\xaeB`\x82")
+        return "image/png" if whole and width and height else None
+    if body[:6] in (b"GIF87a", b"GIF89a"):
+        width, height = int.from_bytes(body[6:8], "little"), int.from_bytes(body[8:10], "little")
+        return "image/gif" if len(body) > 13 and width and height and body.endswith(b"\x3b") else None
+    if body[:4] == b"RIFF" and body[8:12] == b"WEBP":
+        whole = int.from_bytes(body[4:8], "little") == len(body) - 8
+        return "image/webp" if whole and body[12:16] in (b"VP8 ", b"VP8L", b"VP8X") else None
+    if body.startswith(b"\xff\xd8") and body.endswith(b"\xff\xd9"):
+        # Walk the marker segments to the scan; a frame header must come first.
+        index, framed = 2, False
+        while index + 4 <= len(body) and body[index] == 0xFF:
+            marker, length = body[index + 1], int.from_bytes(body[index + 2:index + 4], "big")
+            if marker == 0xDA:
+                return "image/jpeg" if framed and length >= 2 else None
+            if length < 2:
+                return None
+            framed = framed or marker in (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF)
+            index += 2 + length
+        return None
+    return None
 
 
 def _tools(value):
@@ -449,6 +479,8 @@ def _tools(value):
     names = [name.strip() for name in value.split(",")]
     if not names or any(not _TOOL_NAME.fullmatch(name) for name in names) or len(set(names)) != len(names):
         raise argparse.ArgumentTypeError("--tools takes none or distinct built-in tool names, for example Read,Grep")
+    if _SUBAGENT_TOOLS & set(names):
+        raise argparse.ArgumentTypeError("--tools cannot include a subagent tool (Agent or Task): its tools are outside the call's registry")
     return sorted(names)
 
 
@@ -468,10 +500,9 @@ def _attachments(paths):
             body = stream.read(_MAX_ATTACHMENT + 1)
         if len(body) > _MAX_ATTACHMENT:
             raise LaunchError(f"Attachment {path} exceeds {_MAX_ATTACHMENT // (1024 * 1024)} MiB.")
-        media_type = next((kind for magic, kind in _IMAGE_MAGIC if body.startswith(magic)),
-                          "image/webp" if body[:4] == b"RIFF" and body[8:12] == b"WEBP" else None)
+        media_type = _image_type(body)
         if media_type is None:
-            raise LaunchError(f"Attachment {path} is not a PNG, JPEG, GIF or WebP image.")
+            raise LaunchError(f"Attachment {path} is not a complete PNG, JPEG, GIF or WebP image.")
         total += len(body)
         if total > _MAX_ATTACHMENTS_TOTAL:
             raise LaunchError(f"Attachments exceed {_MAX_ATTACHMENTS_TOTAL // (1024 * 1024)} MiB in total.")
@@ -860,9 +891,10 @@ def peer_main(argv=None, *, report_entry=None):
                         + "; Codex accepts an effort its model advertises. The provider decides what it actually uses")
     parser.add_argument("--live-input", action="store_true", help="enable Claude session input while this call runs; queued input may start later turns within the call timeout. Codex always exposes exact-turn input")
     parser.add_argument("--stream-progress", action="store_true", help="use Claude's native event stream for content-free progress observations, without enabling live input; the default remains final JSON")
-    parser.add_argument("--tools", type=_tools, help="Claude only: give the session exactly these built-in tools (none, or names such as Read,Grep), "
-                        "in restricted mode with no settings-file tools, hooks or MCP servers beyond Multithread's own hooks. The session's "
-                        "reported registry is recorded; a missing or different one returns no result")
+    parser.add_argument("--tools", type=_tools, help="Claude only: give the session exactly these built-in tools (none, or names such as Read,Grep; "
+                        "no subagent tools), in restricted mode with no settings files, hooks, MCP servers, slash commands or skills. "
+                        "Refused when managed Claude settings exist. The session's reported registry, version and surfaces are recorded; "
+                        "anything outside the reviewed set, or activity outside the registry, returns no result")
     parser.add_argument("--attach", action="append", default=[], metavar="IMAGE",
                         help="Claude only: attach a PNG, JPEG, GIF or WebP file to the task as an image; repeatable "
                              f"(at most {_MAX_ATTACHMENTS}, {_MAX_ATTACHMENT // (1024 * 1024)} MiB each, {_MAX_ATTACHMENTS_TOTAL // (1024 * 1024)} MiB in total)")
@@ -976,8 +1008,14 @@ def _run_peer(args, interruption):
                                        for item in attachments]
         stage = "relay_configuration"
         plan = prepare(args.client, args.repo, args.relay, args.provider)
+        managed = _MANAGED_CLAUDE_SETTINGS.get(platform.system())
+        if args.tools is not None and managed is not None and managed.exists():
+            raise LaunchError(f"Managed Claude settings exist at {managed}; they stay in force under --restricted, "
+                              "hooks included, so a --tools call cannot establish its registry. No provider was started.")
         if args.client == "claude":
-            native = [*plan["argv"], "--print", "--output-format",
+            # A restricted call carries no settings of its own: hooks would run outside its registry.
+            entry = plan["argv"][:1] if args.tools is not None else plan["argv"]
+            native = [*entry, "--print", "--output-format",
                       "stream-json" if streaming else "json", "--permission-prompts", "none"]
             if streaming:
                 native.extend(["--verbose", "--input-format", "stream-json", "--replay-user-messages"])
@@ -988,7 +1026,8 @@ def _run_peer(args, interruption):
             if args.effort is not None:
                 native.extend(["--effort", args.effort])
             if args.tools is not None:
-                native.extend(["--tools", ",".join(args.tools), "--restricted", "--strict-mcp-config"])
+                native.extend(["--tools", ",".join(args.tools), "--restricted", "--strict-mcp-config",
+                               "--disable-slash-commands"])
             native.extend(["--resume" if args.resume else "--session-id", session])
         else:
             native = [*plan["argv"], "app-server", "--listen", "stdio://"]
@@ -1166,6 +1205,9 @@ def _run_peer(args, interruption):
                     code = 1
         if streaming and envelope["state"] == "returned":
             code = 1 if "evidence_recording" in envelope else 0
+        if envelope.get("state") != "returned" and code == 0:
+            # A verification that failed during cleanup revoked the result.
+            code = 1
         if "control_fault" in envelope:
             envelope["needs_attention"] = True
             code = 1
