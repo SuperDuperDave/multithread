@@ -13,6 +13,8 @@ import re
 
 
 MAX_OUTPUT = 16 * 1024 * 1024
+# One record awaiting its retained form; bounds memory when retention is per record.
+MAX_RECORD = 64 * 1024 * 1024
 
 _VERSION_NUMBER = r"(?:0|[1-9][0-9]{0,5})"
 _PROVIDER_VERSION = re.compile(
@@ -203,14 +205,26 @@ def decode(body):
 
 
 class Observation:
-    """Keep the bounded reader alive while the caller stops its owned process."""
+    """Keep the bounded reader alive while the caller stops its owned process.
+
+    stdout.json is the raw output prefix. A driver may set ``retain`` to give a
+    complete record a smaller retained form, such as a payload the provider has
+    already saved and the driver has verified. Each record is then written in
+    that form before it is delivered, under the same bound, and the whole
+    observed stream is still measured as native_output.
+    """
 
     def __init__(self, process, directory, envelope):
         self.process = process
         self.envelope = envelope
         self.driver = None
+        self.retain = None
         self.digest = hashlib.sha256()
         self.observed = 0
+        self.native_digest = hashlib.sha256()
+        self.native_observed = 0
+        self.retained_by_reference = 0
+        self.deferred = False
         self.truncated = False
         self.buffer = bytearray()
         self.searched = 0
@@ -221,18 +235,48 @@ class Observation:
         self.output = os.fdopen(fd, "wb")
         os.set_blocking(process.stdout.fileno(), False)
 
+    def keep(self, data):
+        """Write within the bound; True while the retained output is complete."""
+        part = data[:MAX_OUTPUT + 1 - self.observed]
+        if part:
+            self.output.write(part)
+            self.output.flush()
+            self.digest.update(part)
+            self.observed += len(part)
+        self.truncated = self.observed > MAX_OUTPUT
+        return not self.truncated
+
+    def settle_deferred(self):
+        """An unfinished record has no retained form; keep its bytes raw, within the bound."""
+        if self.deferred:
+            self.deferred = False
+            self.keep(bytes(self.buffer))
+
     def read(self):
         if self.eof or self.truncated:
             return False
+        records = self.retain is not None and self.interpret and self.driver is not None
+        if not records:
+            self.settle_deferred()
+            if self.truncated:
+                return False
+        limit = (MAX_RECORD + 1 - len(self.buffer)) if records else (MAX_OUTPUT + 1 - self.observed)
         try:
-            data = os.read(self.process.stdout.fileno(), min(65536, MAX_OUTPUT + 1 - self.observed))
+            data = os.read(self.process.stdout.fileno(), min(65536, max(1, limit)))
         except BlockingIOError:
             return False
         if not data:
             self.eof = True
             if self.buffer and self.interpret:
+                self.settle_deferred()
+                if self.truncated:
+                    raise ProtocolError("Native output exceeded its bound; inspect the retained prefix before continuing.")
                 raise ProtocolError("Native output ended with an incomplete JSONL record; inspect retained output.")
             return False
+        self.native_digest.update(data)
+        self.native_observed += len(data)
+        if records:
+            return self.read_records(data)
         self.output.write(data)
         self.output.flush()
         self.digest.update(data)
@@ -267,8 +311,48 @@ class Observation:
                 self.searched -= consumed
         return True
 
+    def read_records(self, data):
+        """Write each complete record's retained form, then deliver the record itself."""
+        self.deferred = True
+        self.buffer.extend(data)
+        consumed = 0
+        try:
+            while True:
+                newline = self.buffer.find(b"\n", self.searched)
+                if newline < 0:
+                    self.searched = len(self.buffer)
+                    if len(self.buffer) - consumed > MAX_RECORD:
+                        raise ProtocolError("A native record exceeded its bound; inspect retained output before continuing.")
+                    break
+                line = bytes(self.buffer[consumed:newline])
+                kept = line
+                if line.strip():
+                    try:
+                        kept = self.retain(line)
+                    except Exception:  # the raw record is always valid evidence
+                        kept = line
+                    if kept != line:
+                        self.retained_by_reference += 1
+                complete = self.keep(kept + b"\n")
+                consumed = newline + 1
+                self.searched = consumed
+                if not complete:
+                    # The bound precedes delivery, as for raw output.
+                    raise ProtocolError("Native output exceeded its bound; inspect the retained prefix before continuing.")
+                if line.strip():
+                    previous_session = self.driver.session
+                    self.driver.message(line)
+                    if previous_session is None and self.driver.session is not None:
+                        os.fsync(self.output.fileno())
+        finally:
+            if consumed:
+                del self.buffer[:consumed]
+                self.searched -= consumed
+        return True
+
     def fault(self, message):
         self.interpret = False
+        self.settle_deferred()
         self.buffer.clear()
         self.searched = 0
         if self.driver is not None:
@@ -300,6 +384,11 @@ class Observation:
     def snapshot(self):
         self.envelope["stdout_observation"] = {"bytes": self.observed, "sha256": self.digest.hexdigest(),
                                                "truncated": self.truncated}
+        if self.retained_by_reference:
+            # stdout.json is no longer the raw stream; describe what was observed.
+            self.envelope["native_output"] = {"bytes": self.native_observed,
+                                              "sha256": self.native_digest.hexdigest(),
+                                              "records_retained_by_reference": self.retained_by_reference}
         if self.driver is not None:
             self.driver.preserve(resolve_pending=False)
 
@@ -308,6 +397,7 @@ class Observation:
             return
         try:
             self.drain()
+            self.settle_deferred()
             self.output.flush()
             os.fsync(self.output.fileno())
             self.snapshot()

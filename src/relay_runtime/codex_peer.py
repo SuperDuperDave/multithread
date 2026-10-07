@@ -6,12 +6,16 @@ acceptance never substitutes for a durable Multithread acknowledgement. A model
 or effort the caller requested travels with the turn; Codex decides what it uses.
 """
 
+import base64
+import binascii
+import hashlib
 import json
 import os
 from pathlib import Path
 import selectors
 import shlex
 import signal
+import stat
 import subprocess
 import time
 
@@ -33,6 +37,37 @@ _CLIENT_INFO = {"name": "multithread", "title": "Multithread", "version": "0.4.1
 _HOOK_EVENTS = ("sessionStart", "userPromptSubmit", "postToolUse", "stop", "sessionEnd", "interrupt")
 # Statuses a person resolves in Codex's /hooks review; any other is configuration.
 _REVIEWABLE = frozenset({"untrusted", "modified", "disabled"})
+# Codex reports each generated image inline as base64 beside the file it saved.
+_MAX_IMAGES = 64
+
+
+def _saved_file(path, digest, size):
+    """Compare Codex's saved image with its inline payload; never copy the file."""
+    if (not isinstance(path, str) or not os.path.isabs(path) or len(path) > 4096
+            or any(ord(character) < 32 or ord(character) == 127 for character in path)):
+        return "not_reported"
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except FileNotFoundError:
+        return "missing"
+    except OSError:
+        return "unreadable"
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size != size:
+            return "differs"
+        observed, read = hashlib.sha256(), 0
+        while read <= size:
+            chunk = os.read(fd, 1024 * 1024)
+            if not chunk:
+                break
+            observed.update(chunk)
+            read += len(chunk)
+        return "matches" if read == size and observed.hexdigest() == digest else "differs"
+    except OSError:
+        return "unreadable"
+    finally:
+        os.close(fd)
 
 
 def _multithread_hook(command, launcher):
@@ -713,6 +748,55 @@ class _Driver:
                     usage.get("modelContextWindow"), self.envelope, "model_context_window", integer=True)
             measurement_scope(self.envelope, "usage_scope", "native_thread_last_and_total", USAGE_SCOPES)
 
+    def retain(self, body):
+        """Retain an image record by reference when its payload is byte-identical to the saved file.
+
+        Anything unverified stays inline and counts toward the output bound.
+        """
+        if len(body) < 1024 or b'"imageGeneration"' not in body:
+            return body
+        try:
+            value = decode(body)
+        except _ProtocolError:
+            return body
+        params = value.get("params")
+        if not isinstance(params, dict):
+            return body
+        items = [params.get("item")]
+        turn = params.get("turn")
+        if isinstance(turn, dict) and isinstance(turn.get("items"), list):
+            items.extend(turn["items"])
+        referenced = False
+        for item in items:
+            if (not isinstance(item, dict) or item.get("type") != "imageGeneration"
+                    or not isinstance(item.get("result"), str) or not item["result"]):
+                continue
+            try:
+                payload = base64.b64decode(item["result"], validate=True)
+            except (binascii.Error, ValueError):
+                continue
+            digest = hashlib.sha256(payload).hexdigest()
+            saved = _saved_file(item.get("savedPath"), digest, len(payload))
+            self.image(item, digest, len(payload), saved)
+            if saved == "matches":
+                item["result"] = {"omitted": "image_base64", "sha256": digest, "bytes": len(payload)}
+                referenced = True
+        if not referenced:
+            return body
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+    def image(self, item, digest, size, saved):
+        images = self.envelope.setdefault("generated_images", [])
+        identifier = item.get("id") if _identity(item.get("id")) else None
+        if any(image["item_id"] == identifier and image["sha256"] == digest for image in images):
+            return
+        if len(images) >= _MAX_IMAGES:
+            self.envelope["generated_images_truncated"] = True
+            return
+        images.append({"item_id": identifier, "sha256": digest, "bytes": size,
+                       "saved_path": item["savedPath"] if saved != "not_reported" else None,
+                       "saved_file": saved, "retained": "reference" if saved == "matches" else "inline"})
+
     def message(self, body):
         value = decode(body)
         if "id" in value and (type(value["id"]) not in (int, str)
@@ -812,6 +896,7 @@ def run(process, task: bytes, repo: str, resume: str | None, directory: Path,
     owned_observer = observer is None
     observation = observer if observer is not None else Observation(process, directory, envelope)
     observation.driver = driver
+    observation.retain = driver.retain
     try:
         with selectors.DefaultSelector() as selector:
             os.set_blocking(process.stdin.fileno(), False)

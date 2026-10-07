@@ -17,7 +17,7 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
-from relay_runtime import codex_peer, provider as peer
+from relay_runtime import codex_peer, native_io, provider as peer
 from relay_runtime.native_io import ProtocolError
 
 THREAD = "10000000-0000-4000-8000-000000000001"
@@ -177,6 +177,15 @@ def item(text=ANSWER, *, phase="final_answer", thread=THREAD, turn=TURN, kind="a
     native = {"type": kind, "id": identifier, "text": text, "phase": phase}
     if kind == "reasoning":
         native = {"type": "reasoning", "id": "fixture-reasoning", "summary": [text], "content": []}
+    return {"method": "item/completed", "params": {"threadId": thread, "turnId": turn, "item": native}}
+
+
+def image(payload, saved_path, *, identifier="fixture-image", thread=THREAD, turn=TURN):
+    """A completed Codex image item: the whole image inline, beside the file Codex saved."""
+    import base64
+    native = {"type": "imageGeneration", "id": identifier, "status": "completed",
+              "revisedPrompt": "fixture prompt 雪", "result": base64.b64encode(payload).decode("ascii"),
+              "transparentBackground": True, "failure": None, "savedPath": saved_path}
     return {"method": "item/completed", "params": {"threadId": thread, "turnId": turn, "item": native}}
 
 
@@ -1424,6 +1433,96 @@ class CodexProtocolTests(unittest.TestCase):
         self.assertNotIn("result", response)
         self.assertTrue(result["needs_attention"])
 
+
+    # --- generated images -------------------------------------------------
+
+    def saved_images(self, count, size):
+        folder = self.base / "generated_images"
+        folder.mkdir(exist_ok=True)
+        images = []
+        for index in range(count):
+            payload = os.urandom(size)
+            path = folder / f"image-{index}.png"
+            path.write_bytes(payload)
+            images.append((payload, path))
+        return images
+
+    def test_images_matching_their_saved_files_are_retained_by_reference_within_the_bound(self):
+        images = self.saved_images(3, 120 * 1024)
+        events = [image(payload, str(path), identifier=f"image-{index}")
+                  for index, (payload, path) in enumerate(images)]
+        self.configure(events=[*events, item(), completed()])
+        # Inline, these three exceed the bound (about 480 KiB of base64 against 256 KiB).
+        with mock.patch.object(native_io, "MAX_OUTPUT", 256 * 1024):
+            code, result, directory = self.invoke()
+        self.assertEqual(0, code, result)
+        self.assertEqual("returned", result["state"])
+        self.assertEqual(ANSWER, result["result"])
+        self.assertFalse(result["needs_attention"])
+        self.assertEqual([{"item_id": f"image-{index}", "sha256": hashlib.sha256(payload).hexdigest(),
+                           "bytes": len(payload), "saved_path": str(path), "saved_file": "matches",
+                           "retained": "reference"} for index, (payload, path) in enumerate(images)],
+                         result["generated_images"])
+        raw = (directory / "stdout.json").read_bytes()
+        self.assertEqual({"bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest(), "truncated": False},
+                         result["stdout_observation"])
+        self.assertLess(len(raw), 256 * 1024)
+        self.assertGreater(result["native_output"]["bytes"], 3 * 160 * 1024)
+        self.assertEqual(3, result["native_output"]["records_retained_by_reference"])
+        records = [json.loads(line) for line in raw.splitlines() if line.strip()]
+        retained = [record["params"]["item"] for record in records
+                    if record.get("params", {}).get("item", {}).get("type") == "imageGeneration"]
+        self.assertEqual([{"omitted": "image_base64", "sha256": hashlib.sha256(payload).hexdigest(),
+                           "bytes": len(payload)} for payload, _ in images],
+                         [item["result"] for item in retained])
+        # Everything but the payload is retained as Codex sent it.
+        self.assertEqual([str(path) for _, path in images], [item["savedPath"] for item in retained])
+        self.assertEqual("fixture prompt 雪", retained[0]["revisedPrompt"])
+
+    def test_an_unverified_image_stays_inline(self):
+        (payload, path), (other, other_path) = self.saved_images(2, 4096)
+        link = self.base / "generated_images" / "link.png"
+        link.symlink_to(path)
+        cases = {"missing": str(self.base / "absent.png"), "differs": str(other_path),
+                 "unreadable": str(link), "not_reported": None}
+        for expected, saved in cases.items():
+            with self.subTest(saved_file=expected):
+                self.configure(events=[image(payload, saved), item(), completed()])
+                code, result, directory = self.invoke()
+                self.assertEqual(0, code, result)
+                self.assertEqual("returned", result["state"])
+                self.assertEqual([{"item_id": "fixture-image", "sha256": hashlib.sha256(payload).hexdigest(),
+                                   "bytes": len(payload), "saved_path": saved, "saved_file": expected,
+                                   "retained": "inline"}], result["generated_images"])
+                self.assertNotIn("native_output", result)
+                raw = (directory / "stdout.json").read_bytes()
+                self.assertEqual(hashlib.sha256(raw).hexdigest(), result["stdout_observation"]["sha256"])
+                self.assertIn(json.dumps(image(payload, saved)["params"]["item"]["result"]).encode(), raw)
+
+    def test_inline_images_still_meet_the_bound_and_stop_before_delivery(self):
+        images = self.saved_images(3, 120 * 1024)
+        events = [image(payload, str(self.base / f"absent-{index}.png"), identifier=f"image-{index}")
+                  for index, (payload, _) in enumerate(images)]
+        self.configure(events=[*events, item(), completed()])
+        with mock.patch.object(native_io, "MAX_OUTPUT", 256 * 1024):
+            result = self.assert_attention(self.invoke())
+        self.assertIn("Native output exceeded its bound", result["message"])
+        self.assertTrue(result["stdout_observation"]["truncated"])
+        self.assertEqual(256 * 1024 + 1, result["stdout_observation"]["bytes"])
+        self.assertIsNone(result["result"])
+        # The record that crossed the bound was observed but never delivered or retained whole.
+        self.assertEqual(["image-0", "image-1"], [image["item_id"] for image in result["generated_images"]])
+        self.assertNotIn("partial_result", result)
+
+    def test_one_record_beyond_its_memory_bound_is_uncertain(self):
+        self.configure(oversized_line=2 * 1024 * 1024)
+        with mock.patch.object(native_io, "MAX_RECORD", 1024 * 1024):
+            result = self.assert_attention(self.invoke("--timeout", "15"))
+        self.assertIn("A native record exceeded its bound", result["message"])
+        # Interpretation stops; the whole record is still retained raw, under the output bound.
+        raw = (self.base / f"evidence-{self.count}" / "stdout.json").read_bytes()
+        self.assertFalse(result["stdout_observation"]["truncated"])
+        self.assertTrue(raw.endswith(b"\n{" + b"x" * (2 * 1024 * 1024)))
 
 if __name__ == "__main__":
     unittest.main()
