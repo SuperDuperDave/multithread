@@ -25,6 +25,7 @@ import sys
 import tempfile
 import time
 import tomllib
+import unicodedata
 import uuid
 from . import account_launcher, hook_argv, hooks as user_hooks
 from .enrollment import NotEnrolled
@@ -448,19 +449,37 @@ _MANAGED_CLAUDE_SETTINGS = {"Linux": Path("/etc/claude-code"),
 _SERVER_MANAGED_CLAUDE = ("remote-settings.json", "policy-limits.json")
 _WSL_CLAUDE_POLICY = Path("/mnt/c/Program Files/ClaudeCode")
 _WSL_REG = Path("/mnt/c/Windows/System32/reg.exe")
-_WSL_POLICY_KEYS = ("HKLM\\SOFTWARE\\Policies\\ClaudeCode", "HKCU\\SOFTWARE\\Policies\\ClaudeCode")
+_WSL_POLICY_PARENTS = ("HKLM\\SOFTWARE\\Policies", "HKCU\\SOFTWARE\\Policies")
 _RESTRICTED_STOPS = ("caller_stop_reason", "server_cleanup", "owned_process_cleanup", "stdout_completion",
-                     "evidence_recording", "control_fault")
+                     "evidence_recording", "control_fault", "unavailable_stage")
 
 
 def _is_wsl():
-    try:
-        return "microsoft" in Path("/proc/sys/kernel/osrelease").read_text().lower()
-    except OSError:
-        return False
+    """WSL as Claude Code recognizes it: its environment variables or its kernel's name."""
+    if os.environ.get("WSL_DISTRO_NAME") or os.environ.get("WSL_INTEROP"):
+        return True
+    for path in ("/proc/version", "/proc/sys/kernel/osrelease"):
+        try:
+            text = Path(path).read_text().lower()
+        except OSError:
+            continue
+        if "microsoft" in text or "wsl" in text:
+            return True
+    return False
 
 
-def _managed_claude_sources():
+def _claude_config_home(cwd):
+    """The configuration directory Claude Code starting in cwd will read."""
+    value = os.environ.get("CLAUDE_CONFIG_DIR")
+    if value is None:
+        return Path.home() / ".claude"
+    if not value:
+        raise LaunchError("CLAUDE_CONFIG_DIR is set but empty, so the configuration a restricted call would read is "
+                          "ambiguous. Unset it or name a directory. No provider was started.")
+    return Path(cwd) / unicodedata.normalize("NFC", value)
+
+
+def _managed_claude_sources(cwd):
     """Managed Claude settings this machine would apply to a restricted call: a best-effort preflight.
 
     Present, or unreadable, sources are returned; an empty list means none was found.
@@ -469,30 +488,33 @@ def _managed_claude_sources():
     machine = _MANAGED_CLAUDE_SETTINGS.get(platform.system())
     if machine is not None and machine.exists():
         found.append(str(machine))
-    home = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
+    home = _claude_config_home(cwd)
     found.extend(str(home / name) for name in _SERVER_MANAGED_CLAUDE if (home / name).exists())
     if _is_wsl():
         if _WSL_CLAUDE_POLICY.exists():
             found.append(str(_WSL_CLAUDE_POLICY))
         if _WSL_REG.exists():
-            for key in _WSL_POLICY_KEYS:
+            for parent in _WSL_POLICY_PARENTS:
+                # List the parent's subkeys: key paths are not localized, unlike reg.exe's messages.
                 try:
-                    answer = subprocess.run([str(_WSL_REG), "query", key], stdin=subprocess.DEVNULL,
+                    answer = subprocess.run([str(_WSL_REG), "query", parent], stdin=subprocess.DEVNULL,
                                             capture_output=True, timeout=15, check=False)
                 except (OSError, subprocess.TimeoutExpired):
-                    found.append(key + " (unreadable)")
+                    found.append(parent + "\\ClaudeCode (unreadable)")
                     continue
-                said = answer.stdout.decode("utf-8", "replace") + answer.stderr.decode("utf-8", "replace")
-                if answer.returncode == 0:
-                    found.append(key)
-                elif "unable to find" not in said:
-                    found.append(key + " (unreadable)")
+                if answer.returncode != 0:
+                    found.append(parent + "\\ClaudeCode (unreadable)")
+                    continue
+                # reg.exe prints full hive names (HKEY_LOCAL_MACHINE\\...), so match the path below the hive.
+                listed = answer.stdout.decode("utf-8", "replace").splitlines()
+                if any(line.strip().lower().endswith("\\software\\policies\\claudecode") for line in listed):
+                    found.append(parent + "\\ClaudeCode")
     return found
 
 
-def _restricted_end_clean(observer, envelope):
-    """A restricted result stands only on a normal, fully observed and verified stream end."""
-    return (observer is not None and observer.eof and observer.interpret and not observer.truncated
+def _restricted_end_clean(observer, envelope, completed):
+    """A restricted result stands only on a positively observed normal end, fully observed and verified."""
+    return (completed and observer is not None and observer.eof and observer.interpret and not observer.truncated
             and envelope.get("process_exit_code") == 0 and not any(key in envelope for key in _RESTRICTED_STOPS))
 
 
@@ -1029,6 +1051,7 @@ def _run_peer(args, interruption):
     plan = None
     process = None
     observer = None
+    completed = False  # set only when the provider's stream ended normally and was fully awaited
     control = None
     code = 1
     stage = "task_read"
@@ -1048,7 +1071,7 @@ def _run_peer(args, interruption):
                                        for item in attachments]
         stage = "relay_configuration"
         plan = prepare(args.client, args.repo, args.relay, args.provider)
-        managed = _managed_claude_sources() if args.tools is not None else []
+        managed = _managed_claude_sources(plan["repo"]) if args.tools is not None else []
         if managed:
             raise LaunchError("Managed Claude settings were found (" + ", ".join(managed) + "); they stay in force under "
                               "--restricted, hooks included, so a --tools call cannot establish its registry. No provider was started.")
@@ -1175,6 +1198,7 @@ def _run_peer(args, interruption):
                         grace = (max(0, args.timeout - (time.monotonic() - started))
                                  if args.client == "claude" and observer.interpret else 5)
                         _wait(process, grace, observer, feedback)
+                        completed = True
                     except subprocess.TimeoutExpired:
                         interruption["stopping"] = True
                         envelope["caller_stop_reason"] = "shutdown_timeout"
@@ -1265,7 +1289,7 @@ def _run_peer(args, interruption):
                 envelope["needs_attention"] = True
                 code = code or 1
     if (getattr(args, "tools", None) is not None and envelope.get("state") == "returned"
-            and not _restricted_end_clean(observer, envelope)):
+            and not _restricted_end_clean(observer, envelope, completed)):
         # Every path ends here, cleanup included: no other branch can let a restricted result stand.
         envelope.update(state="uncertain", result=None, needs_attention=True,
                         message="A restricted call returns a result only when its stream reached a normal end and was "

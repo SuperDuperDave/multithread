@@ -240,3 +240,19 @@ class RestrictedCallTests(ClaudeIntegrationTests):
         self.assertNotEqual(0, code)
         self.assertEqual(('uncertain', None), (value['state'], value['result']))
         self.assertNotIn('follow_up_preparation', value)
+
+    def test_an_error_after_the_result_withholds_it_even_when_cleanup_ends_cleanly(self):
+        import shutil
+        shutil.rmtree(self.base / 'stream-evidence', ignore_errors=True)
+        original = peer._wait
+        calls = []
+        def failing(*arguments, **options):
+            calls.append(1)
+            if len(calls) == 1:
+                raise OSError('synthetic wait failure')
+            return original(*arguments, **options)
+        with mock.patch.object(peer, '_wait', side_effect=failing):
+            code, value, _ = self.invoke(self.restricted_steps(), restricted=True)
+        self.assertNotEqual(0, code)
+        self.assertEqual(('uncertain', None), (value['state'], value['result']))
+        self.assertIn('unavailable_stage', value)

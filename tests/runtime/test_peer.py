@@ -1170,31 +1170,49 @@ class PeerTests(unittest.TestCase):
         home.mkdir()
         reg = self.base / "reg.exe"
         answers = self.base / "reg-answers.json"
-        reg.write_text(f"#!{sys.executable}\nimport json,sys\na=json.load(open({str(answers)!r}))[sys.argv[2]]\n"
-                       "sys.stderr.write(a[1]); sys.exit(a[0])\n")
+        reg.write_text(f"#!{sys.executable}\nimport json,sys,time\na=json.load(open({str(answers)!r}))[sys.argv[2]]\n"
+                       "time.sleep(a[2] if len(a) > 2 else 0); sys.stdout.write(a[1]); sys.exit(a[0])\n")
         reg.chmod(0o700)
-        absent = [1, "ERROR: The system was unable to find the specified registry key or value."]
-        def sources(*, wsl=True, keys=None):
-            answers.write_text(json.dumps(keys or {key: absent for key in peer._WSL_POLICY_KEYS}))
+        hklm, hkcu = peer._WSL_POLICY_PARENTS
+        listing = {hklm: [0, "\r\nHKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\Microsoft\r\n"],
+                   hkcu: [0, "\r\nHKEY_CURRENT_USER\\SOFTWARE\\Policies\\Microsoft\r\n"]}
+        def sources(*, wsl=True, keys=None, environ=None, cwd=None):
+            answers.write_text(json.dumps(keys or listing))
             with (mock.patch.object(peer, "_MANAGED_CLAUDE_SETTINGS", {peer.platform.system(): machine}),
                   mock.patch.object(peer, "_WSL_CLAUDE_POLICY", policy), mock.patch.object(peer, "_WSL_REG", reg),
                   mock.patch.object(peer, "_is_wsl", return_value=wsl),
-                  mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(home)})):
-                return peer._managed_claude_sources()
+                  mock.patch.dict(os.environ, environ or {"CLAUDE_CONFIG_DIR": str(home)})):
+                return peer._managed_claude_sources(cwd or self.repo)
         self.assertEqual([], sources())
         machine.mkdir()
         self.assertEqual([str(machine)], sources())
         machine.rmdir()
-        (home / "remote-settings.json").write_text("{}")
-        self.assertEqual([str(home / "remote-settings.json")], sources())
-        (home / "remote-settings.json").unlink()
+        for name in ("remote-settings.json", "policy-limits.json"):
+            (home / name).write_text("{}")
+            self.assertEqual([str(home / name)], sources())
+            (home / name).unlink()
+        # A relative directory is Claude's, resolved from where Claude starts; names are NFC as Claude reads them.
+        (self.repo / "cfg\u00e9").mkdir()
+        (self.repo / "cfg\u00e9" / "remote-settings.json").write_text("{}")
+        self.assertEqual([str(self.repo / "cfg\u00e9" / "remote-settings.json")],
+                         sources(environ={"CLAUDE_CONFIG_DIR": "cfge\u0301"}))
+        with self.assertRaises(peer.LaunchError):
+            sources(environ={"CLAUDE_CONFIG_DIR": ""})
         policy.mkdir()
         self.assertEqual([str(policy)], sources())
         self.assertEqual([], sources(wsl=False), "the Windows chain applies only under WSL")
         policy.rmdir()
-        hklm, hkcu = peer._WSL_POLICY_KEYS
-        self.assertEqual([hklm], sources(keys={hklm: [0, ""], hkcu: absent}))
-        self.assertEqual([hkcu + " (unreadable)"], sources(keys={hklm: absent, hkcu: [1, "Access is denied."]}))
+        present = dict(listing, **{hklm: [0, "\r\nHKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\ClaudeCode\r\n"]})
+        self.assertEqual([hklm + "\\ClaudeCode"], sources(keys=present))
+        lower = dict(listing, **{hkcu: [0, "\r\nHKEY_CURRENT_USER\\Software\\Policies\\claudecode\r\n"]})
+        self.assertEqual([hkcu + "\\ClaudeCode"], sources(keys=lower))
+        for name, answer in (("access denied", [1, "Zugriff verweigert."]), ("unexpected status", [2, ""])):
+            with self.subTest(registry=name):
+                self.assertEqual([hkcu + "\\ClaudeCode (unreadable)"], sources(keys=dict(listing, **{hkcu: answer})))
+        reg.unlink()
+        self.assertEqual([], sources(), "without reg.exe Claude cannot read the registry either")
+        with mock.patch.dict(os.environ, {"WSL_DISTRO_NAME": "Ubuntu"}):
+            self.assertTrue(peer._is_wsl())
         with mock.patch.object(peer, "_managed_claude_sources", return_value=["/etc/claude-code"]) as found:
             code, result, _ = self.invoke("--tools", "none")
             self.assertNotEqual(0, code)
