@@ -21,10 +21,11 @@ DIGEST = "b" * 64
 REPORT = {
     "schema": 1, "provider": "claude", "binary_path": "/opt/claude/9.9.9", "binary_sha256": DIGEST,
     "version": "9.9.9", "surface_sha256": "c" * 64, "plugins": ["cc-plugin-telemetry"], "agents": ["claude", "Explore"],
-    "control_fired": ["project-hook", "local-hook", "mcp-server"], "restricted_fired": [], "verdict": "pass",
-    "reasons": [], "model": "fixture",
-    "control": {"exit": 0, "fired": ["local-hook", "mcp-server", "project-hook"]},
-    "restricted": {"exit": 0, "version": "9.9.9", "tools": [], "mcp_servers": [], "fired": [], "answered": True},
+    "control_fired": ["project-hook", "local-hook", "mcp-server", "tool-hook"], "restricted_fired": [],
+    "verdict": "pass", "reasons": [], "model": "fixture",
+    "control": {"exit": 0, "attempted": True, "fired": ["local-hook", "mcp-server", "project-hook", "tool-hook"]},
+    "restricted": {"exit": 0, "version": "9.9.9", "tools": ["Read"], "mcp_servers": [], "fired": [], "answered": True,
+                   "attempted": True, "leaked": False},
 }
 
 
@@ -55,7 +56,7 @@ class ProviderReviewTests(unittest.TestCase):
         self.assertEqual(("provider.reviewed", "claude", "reviewer-1"), (event["kind"], event["agent"], event["session"]))
         self.assertEqual({"provider": "claude", "binary_sha256": DIGEST, "version": "9.9.9", "surface_sha256": "c" * 64,
                           "plugins": "cc-plugin-telemetry", "agents": "Explore,claude",
-                          "control_fired": "local-hook,mcp-server,project-hook", "restricted_fired": "none"},
+                          "control_fired": "local-hook,mcp-server,project-hook,tool-hook", "restricted_fired": "none"},
                          event["meta"])
         digest = hashlib.sha256(canonical_json(REPORT).encode()).hexdigest()
         self.assertEqual(f"sha256:{digest}", event["artifact"], "the report itself is the evidence")
@@ -67,6 +68,11 @@ class ProviderReviewTests(unittest.TestCase):
             "silent control": ({"control_fired": ["project-hook", "local-hook"],
                                 "control": {"exit": 0, "fired": ["local-hook", "project-hook"]}},
                                "control fired every canary"),
+            "no tool canary": ({"control_fired": ["project-hook", "local-hook", "mcp-server"],
+                                "control": {"exit": 0, "fired": ["local-hook", "mcp-server", "project-hook"]}},
+                               "control fired every canary"),
+            "outside read": ({"restricted": {**REPORT["restricted"], "leaked": True}}, "agree with its own runs"),
+            "no attempt": ({"restricted": {**REPORT["restricted"], "attempted": False}}, "agree with its own runs"),
             "restricted fired": ({"restricted_fired": ["mcp-server"],
                                   "restricted": {**REPORT["restricted"], "fired": ["mcp-server"]}}, "fired no canary"),
             "other provider": ({"provider": "codex"}, "claude only"),
@@ -78,7 +84,8 @@ class ProviderReviewTests(unittest.TestCase):
             "contradicted control": ({"control": {"exit": 0, "fired": []}}, "agree with its own runs"),
             "contradicted restricted": ({"restricted": {**REPORT["restricted"], "fired": ["mcp-server"]}},
                                         "agree with its own runs"),
-            "restricted tools": ({"restricted": {**REPORT["restricted"], "tools": ["Bash"]}}, "agree with its own runs"),
+            "restricted tools": ({"restricted": {**REPORT["restricted"], "tools": ["Bash", "Read"]}},
+                                 "agree with its own runs"),
             "unanswered": ({"restricted": {**REPORT["restricted"], "answered": False}}, "agree with its own runs"),
             "reasons kept": ({"reasons": ["the binary changed during its review"]}, "agree with its own runs"),
             "no runs": ({"control": None}, "agree with its own runs"),

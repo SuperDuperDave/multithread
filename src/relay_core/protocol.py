@@ -920,8 +920,10 @@ def _validate_semantics(
             )
 
 
-#: Every canary a review plants; a review is recorded only when its control fired all of them.
-PROVIDER_REVIEW_CANARIES = "local-hook,mcp-server,project-hook"
+#: Every canary a review plants; a review is recorded only when its control fired all of them. Reviews
+#: recorded before the tool canary stay valid events; calls no longer accept them.
+PROVIDER_REVIEW_CANARIES = "local-hook,mcp-server,project-hook,tool-hook"
+_EARLIER_REVIEW_CANARIES = "local-hook,mcp-server,project-hook"
 _NAMES_RE = re.compile(r"^(?:none|[A-Za-z0-9][A-Za-z0-9._@-]{0,79}(?:,[A-Za-z0-9][A-Za-z0-9._@-]{0,79}){0,63})$")
 
 
@@ -940,7 +942,7 @@ def _validate_provider_review(meta: Mapping[str, Any]) -> None:
     for key in ("plugins", "agents"):
         if not isinstance(meta[key], str) or _NAMES_RE.fullmatch(meta[key]) is None:
             raise ValidationError(f"{key} must be comma-separated names or none")
-    if meta["control_fired"] != PROVIDER_REVIEW_CANARIES:
+    if meta["control_fired"] not in (PROVIDER_REVIEW_CANARIES, _EARLIER_REVIEW_CANARIES):
         raise ValidationError("a provider review is recorded only when its control fired every canary")
     if meta["restricted_fired"] != "none":
         raise ValidationError("a provider review is recorded only when its restricted call fired no canary")

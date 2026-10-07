@@ -33,21 +33,30 @@ if args == ["--version"]:
 if args == ["--help"]:
     print(HELP_TEXT); raise SystemExit(0)
 restricted = "--restricted" in args
-sys.stdin.readline()
+text = json.loads(sys.stdin.readline())["message"]["content"][0]["text"]
+target = text.split("read the file ")[1].split(" and reply")[0]
+attempts = spec.get("attempts", True)
 if (not restricted and spec.get("control_fires", True)) or (restricted and spec.get("restricted_fires")):
     for name in (".claude/settings.json", ".claude/settings.local.json"):
-        for groups in json.loads(pathlib.Path(name).read_text()).get("hooks", {}).values():
+        for event, groups in json.loads(pathlib.Path(name).read_text()).get("hooks", {}).items():
             for group in groups:
                 for hook in group["hooks"]:
-                    subprocess.run(hook["command"], shell=True, check=False)
+                    if event != "PreToolUse" or attempts:
+                        subprocess.run(hook["command"], shell=True, check=False)
     for server in json.loads(pathlib.Path(".mcp.json").read_text())["mcpServers"].values():
         subprocess.run([server["command"], *[a.replace("sleep 20", "true") for a in server["args"]]], check=False)
 print(json.dumps({"type": "system", "subtype": "init", "claude_code_version": spec.get("reported", spec["version"]),
-                  "tools": [] if restricted else ["mcp__mail__send"],
+                  "tools": ["Read"] if restricted else ["Read", "mcp__mail__send"],
                   "mcp_servers": [] if restricted else [{"name": "canary", "status": "connected"}],
                   "plugins": [{"name": p} for p in spec.get("plugins", ["cc-plugin-telemetry"])],
                   "agents": spec.get("agents", ["claude"])}))
-print(json.dumps({"type": "result", "result": "ready", "is_error": False}))
+if attempts:
+    print(json.dumps({"type": "assistant", "message": {"content": [
+        {"type": "tool_use", "id": "toolu_1", "name": "Read", "input": {"file_path": target}}]}}))
+    readable = not restricted or spec.get("leaks")
+    print(json.dumps({"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "toolu_1",
+                      "content": pathlib.Path(target).read_text() if readable else "denied"}]}}))
+print(json.dumps({"type": "result", "result": "done", "is_error": False}))
 '''
 
 
@@ -92,6 +101,8 @@ class ReviewTests(unittest.TestCase):
             "version mismatch": ({"reported": "9.9.10"}, "reported version differs"),
             "new plugin": ({"plugins": ["cc-plugin-telemetry", "cc-plugin-mail"]}, "no hand review covered"),
             "new agent": ({"agents": ["claude", "mailer"]}, "no hand review covered"),
+            "no tool attempt": ({"attempts": False}, "did not attempt the Read tool"),
+            "outside read": ({"leaks": True}, "read a file outside its working directory"),
         }
         for name, (changes, why) in cases.items():
             with self.subTest(case=name):
@@ -120,17 +131,20 @@ class ReviewTests(unittest.TestCase):
         surface = claude_review.BUILT_IN["0" * 64]["surface_sha256"]
         def answer(**changes):
             meta = {"binary_sha256": digest, "version": "9.9.9", "surface_sha256": surface, "plugins": "none",
-                    "agents": "claude", **changes}
+                    "agents": "claude", "control_fired": "local-hook,mcp-server,project-hook,tool-hook", **changes}
             launcher.write_text("#!/bin/sh\necho '" + json.dumps({"reviews": [{"seq": 7, "meta": meta}]}) + "'\n")
             launcher.chmod(0o755)
         answer()
         self.assertEqual({"version": "9.9.9", "surface_sha256": surface, "plugins": [], "agents": ["claude"],
                           "source": "ledger:7"}, claude_review.reviewed(digest, launcher, self.base))
         # A record admits nothing a hand review did not cover, however it was written.
-        for changes in ({"surface_sha256": "c" * 64}, {"agents": "claude,mailer"}, {"plugins": "cc-plugin-mail"}):
+        for changes, why in (({"surface_sha256": "c" * 64}, "no hand review covered"),
+                             ({"agents": "claude,mailer"}, "no hand review covered"),
+                             ({"plugins": "cc-plugin-mail"}, "no hand review covered"),
+                             ({"control_fired": "local-hook,mcp-server,project-hook"}, "predates the tool canary")):
             with self.subTest(record=changes):
                 answer(**changes)
-                with self.assertRaisesRegex(claude_review.ReviewError, "no hand review covered"):
+                with self.assertRaisesRegex(claude_review.ReviewError, why):
                     claude_review.reviewed(digest, launcher, self.base)
         answer()
         self.assertIsNone(claude_review.reviewed("d" * 64, launcher, self.base))

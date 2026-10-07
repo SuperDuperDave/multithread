@@ -24,6 +24,7 @@ from .protocol import (
     BusyError,
     ConflictError,
     DECISION_ROLLOUT_FENCE,
+    PROVIDER_REVIEW_CANARIES,
     Event,
     RelayError,
     StateError,
@@ -1116,10 +1117,13 @@ class RelayStore:
         if (report.get("reasons") != [] or not isinstance(control, Mapping) or not isinstance(restricted, Mapping)
                 or sorted(control.get("fired") or []) != sorted(listed["control_fired"])
                 or sorted(restricted.get("fired") or []) != sorted(listed["restricted_fired"])
-                or restricted.get("tools") != [] or restricted.get("mcp_servers") != []
+                or restricted.get("tools") != ["Read"] or restricted.get("mcp_servers") != []
+                or restricted.get("attempted") is not True or restricted.get("leaked") is not False
                 or restricted.get("version") != report.get("version") or restricted.get("exit") != 0
                 or restricted.get("answered") is not True):
             raise ValidationError("a provider review report must agree with its own runs")
+        if sorted(listed["control_fired"]) != PROVIDER_REVIEW_CANARIES.split(","):
+            raise ValidationError("a provider review is recorded only when its control fired every canary")
         joined = {key: ",".join(sorted(value)) or "none" for key, value in listed.items()}
         meta = {"provider": report.get("provider"), "binary_sha256": report.get("binary_sha256"),
                 "version": report.get("version"), "surface_sha256": report.get("surface_sha256"), **joined}
