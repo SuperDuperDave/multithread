@@ -218,3 +218,25 @@ class RestrictedCallTests(ClaudeIntegrationTests):
                 self.assertEqual('uncertain', value['state'])
                 self.assertIsNone(value['result'])
                 self.assertNotIn('follow_up_preparation', value)
+
+    def test_cleanup_that_does_not_end_normally_withholds_the_result(self):
+        import shutil
+        shutil.rmtree(self.base / 'stream-evidence', ignore_errors=True)
+        code, value, _ = self.invoke(self.restricted_steps({'sleep': 6}), restricted=True)
+        self.assertNotEqual(0, code)
+        self.assertEqual(('uncertain', None), (value['state'], value['result']))
+        self.assertEqual('shutdown_timeout', value['caller_stop_reason'])
+        self.assertIn('result is withheld', value['message'])
+        original = peer._wait
+        calls = []
+        def interrupted(*arguments, **options):
+            calls.append(1)
+            if len(calls) == 1:
+                raise KeyboardInterrupt
+            return original(*arguments, **options)
+        shutil.rmtree(self.base / 'stream-evidence', ignore_errors=True)
+        with mock.patch.object(peer, '_wait', side_effect=interrupted):
+            code, value, _ = self.invoke(self.restricted_steps({'sleep': 1}), restricted=True)
+        self.assertNotEqual(0, code)
+        self.assertEqual(('uncertain', None), (value['state'], value['result']))
+        self.assertNotIn('follow_up_preparation', value)

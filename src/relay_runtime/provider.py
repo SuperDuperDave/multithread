@@ -441,34 +441,74 @@ _TOOL_NAME = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,63}")
 # A subagent runs with tools this call cannot see, so a restricted call cannot offer one.
 _SUBAGENT_TOOLS = frozenset({"Agent", "Task"})
 # Settings an administrator manages stay in force under --restricted, hooks included.
+# Sources as Claude Code 2.1.292 reads them: the machine directory, the cached
+# server-managed settings, and under WSL the Windows policy chain.
 _MANAGED_CLAUDE_SETTINGS = {"Linux": Path("/etc/claude-code"),
                             "Darwin": Path("/Library/Application Support/ClaudeCode")}
+_SERVER_MANAGED_CLAUDE = ("remote-settings.json", "policy-limits.json")
+_WSL_CLAUDE_POLICY = Path("/mnt/c/Program Files/ClaudeCode")
+_WSL_REG = Path("/mnt/c/Windows/System32/reg.exe")
+_WSL_POLICY_KEYS = ("HKLM\\SOFTWARE\\Policies\\ClaudeCode", "HKCU\\SOFTWARE\\Policies\\ClaudeCode")
+_RESTRICTED_STOPS = ("caller_stop_reason", "server_cleanup", "owned_process_cleanup", "stdout_completion",
+                     "evidence_recording", "control_fault")
+
+
+def _is_wsl():
+    try:
+        return "microsoft" in Path("/proc/sys/kernel/osrelease").read_text().lower()
+    except OSError:
+        return False
+
+
+def _managed_claude_sources():
+    """Managed Claude settings this machine would apply to a restricted call: a best-effort preflight.
+
+    Present, or unreadable, sources are returned; an empty list means none was found.
+    """
+    found = []
+    machine = _MANAGED_CLAUDE_SETTINGS.get(platform.system())
+    if machine is not None and machine.exists():
+        found.append(str(machine))
+    home = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
+    found.extend(str(home / name) for name in _SERVER_MANAGED_CLAUDE if (home / name).exists())
+    if _is_wsl():
+        if _WSL_CLAUDE_POLICY.exists():
+            found.append(str(_WSL_CLAUDE_POLICY))
+        if _WSL_REG.exists():
+            for key in _WSL_POLICY_KEYS:
+                try:
+                    answer = subprocess.run([str(_WSL_REG), "query", key], stdin=subprocess.DEVNULL,
+                                            capture_output=True, timeout=15, check=False)
+                except (OSError, subprocess.TimeoutExpired):
+                    found.append(key + " (unreadable)")
+                    continue
+                said = answer.stdout.decode("utf-8", "replace") + answer.stderr.decode("utf-8", "replace")
+                if answer.returncode == 0:
+                    found.append(key)
+                elif "unable to find" not in said:
+                    found.append(key + " (unreadable)")
+    return found
+
+
+def _restricted_end_clean(observer, envelope):
+    """A restricted result stands only on a normal, fully observed and verified stream end."""
+    return (observer is not None and observer.eof and observer.interpret and not observer.truncated
+            and envelope.get("process_exit_code") == 0 and not any(key in envelope for key in _RESTRICTED_STOPS))
 
 
 def _image_type(body):
-    """The media type of a structurally plausible PNG, JPEG, GIF or WebP file, else None."""
-    if body.startswith(b"\x89PNG\r\n\x1a\n"):
-        width, height = int.from_bytes(body[16:20], "big"), int.from_bytes(body[20:24], "big")
-        whole = body[8:16] == b"\x00\x00\x00\rIHDR" and body.endswith(b"IEND\xaeB`\x82")
-        return "image/png" if whole and width and height else None
-    if body[:6] in (b"GIF87a", b"GIF89a"):
-        width, height = int.from_bytes(body[6:8], "little"), int.from_bytes(body[8:10], "little")
-        return "image/gif" if len(body) > 13 and width and height and body.endswith(b"\x3b") else None
-    if body[:4] == b"RIFF" and body[8:12] == b"WEBP":
-        whole = int.from_bytes(body[4:8], "little") == len(body) - 8
-        return "image/webp" if whole and body[12:16] in (b"VP8 ", b"VP8L", b"VP8X") else None
-    if body.startswith(b"\xff\xd8") and body.endswith(b"\xff\xd9"):
-        # Walk the marker segments to the scan; a frame header must come first.
-        index, framed = 2, False
-        while index + 4 <= len(body) and body[index] == 0xFF:
-            marker, length = body[index + 1], int.from_bytes(body[index + 2:index + 4], "big")
-            if marker == 0xDA:
-                return "image/jpeg" if framed and length >= 2 else None
-            if length < 2:
-                return None
-            framed = framed or marker in (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF)
-            index += 2 + length
-        return None
+    """The media type when the file starts as a PNG, JPEG, GIF or WebP image: a type check, not a decoder.
+
+    The provider decodes the image; a malformed one fails there, outside this call's trust boundary.
+    """
+    if body.startswith(b"\x89PNG\r\n\x1a\n") and body[12:16] == b"IHDR":
+        return "image/png"
+    if body[:6] in (b"GIF87a", b"GIF89a") and len(body) > 13:
+        return "image/gif"
+    if body[:4] == b"RIFF" and body[8:12] == b"WEBP" and body[12:16] in (b"VP8 ", b"VP8L", b"VP8X"):
+        return "image/webp"
+    if body.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
     return None
 
 
@@ -502,7 +542,7 @@ def _attachments(paths):
             raise LaunchError(f"Attachment {path} exceeds {_MAX_ATTACHMENT // (1024 * 1024)} MiB.")
         media_type = _image_type(body)
         if media_type is None:
-            raise LaunchError(f"Attachment {path} is not a complete PNG, JPEG, GIF or WebP image.")
+            raise LaunchError(f"Attachment {path} is not a PNG, JPEG, GIF or WebP image.")
         total += len(body)
         if total > _MAX_ATTACHMENTS_TOTAL:
             raise LaunchError(f"Attachments exceed {_MAX_ATTACHMENTS_TOTAL // (1024 * 1024)} MiB in total.")
@@ -1008,10 +1048,10 @@ def _run_peer(args, interruption):
                                        for item in attachments]
         stage = "relay_configuration"
         plan = prepare(args.client, args.repo, args.relay, args.provider)
-        managed = _MANAGED_CLAUDE_SETTINGS.get(platform.system())
-        if args.tools is not None and managed is not None and managed.exists():
-            raise LaunchError(f"Managed Claude settings exist at {managed}; they stay in force under --restricted, "
-                              "hooks included, so a --tools call cannot establish its registry. No provider was started.")
+        managed = _managed_claude_sources() if args.tools is not None else []
+        if managed:
+            raise LaunchError("Managed Claude settings were found (" + ", ".join(managed) + "); they stay in force under "
+                              "--restricted, hooks included, so a --tools call cannot establish its registry. No provider was started.")
         if args.client == "claude":
             # A restricted call carries no settings of its own: hooks would run outside its registry.
             entry = plan["argv"][:1] if args.tools is not None else plan["argv"]
@@ -1224,6 +1264,13 @@ def _run_peer(args, interruption):
             except OSError:
                 envelope["needs_attention"] = True
                 code = code or 1
+    if (getattr(args, "tools", None) is not None and envelope.get("state") == "returned"
+            and not _restricted_end_clean(observer, envelope)):
+        # Every path ends here, cleanup included: no other branch can let a restricted result stand.
+        envelope.update(state="uncertain", result=None, needs_attention=True,
+                        message="A restricted call returns a result only when its stream reached a normal end and was "
+                                "verified to it; this one did not, so its result is withheld. Inspect retained output.")
+        code = 1
     preparation = _follow_up_preparation(args, plan, envelope) if code == 0 else None
     if preparation is not None:
         envelope["follow_up_preparation"] = preparation

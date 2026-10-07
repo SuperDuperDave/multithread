@@ -941,6 +941,8 @@ class ClaudeProtocolTests(unittest.TestCase):
             "installed plugin": ({"plugins": [{"name": "mail", "path": "/home/x/.claude/plugins/mail"}]},
                                  "differs from the requested one"),
             "unknown agent": ({"agents": ["claude", "mailer"]}, "differs from the requested one"),
+            "contradictory plugin source": ({"plugins": [{"name": "cc-plugin-telemetry", "path": "builtin",
+                                                          "source": "attacker@inline"}]}, "differs from the requested one"),
             "unreported tools": ({"tools": None}, "did not report its whole tool registry"),
             "unreported agents": ({"agents": None}, "did not report its whole tool registry"),
             "unreviewed version": ({"claude_code_version": "99.0.0"}, "Claude Code 99.0.0 is not a reviewed version"),

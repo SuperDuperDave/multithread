@@ -1166,18 +1166,46 @@ class PeerTests(unittest.TestCase):
         self.assertFalse(self.calls.exists())
 
     def test_managed_settings_refuse_a_restricted_call_before_launch(self):
-        managed = self.base / "managed-claude"
-        managed.mkdir()
-        with mock.patch.object(peer, "_MANAGED_CLAUDE_SETTINGS", {peer.platform.system(): managed}):
+        machine, home, policy = self.base / "machine", self.base / "claude-home", self.base / "ClaudeCode"
+        home.mkdir()
+        reg = self.base / "reg.exe"
+        answers = self.base / "reg-answers.json"
+        reg.write_text(f"#!{sys.executable}\nimport json,sys\na=json.load(open({str(answers)!r}))[sys.argv[2]]\n"
+                       "sys.stderr.write(a[1]); sys.exit(a[0])\n")
+        reg.chmod(0o700)
+        absent = [1, "ERROR: The system was unable to find the specified registry key or value."]
+        def sources(*, wsl=True, keys=None):
+            answers.write_text(json.dumps(keys or {key: absent for key in peer._WSL_POLICY_KEYS}))
+            with (mock.patch.object(peer, "_MANAGED_CLAUDE_SETTINGS", {peer.platform.system(): machine}),
+                  mock.patch.object(peer, "_WSL_CLAUDE_POLICY", policy), mock.patch.object(peer, "_WSL_REG", reg),
+                  mock.patch.object(peer, "_is_wsl", return_value=wsl),
+                  mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(home)})):
+                return peer._managed_claude_sources()
+        self.assertEqual([], sources())
+        machine.mkdir()
+        self.assertEqual([str(machine)], sources())
+        machine.rmdir()
+        (home / "remote-settings.json").write_text("{}")
+        self.assertEqual([str(home / "remote-settings.json")], sources())
+        (home / "remote-settings.json").unlink()
+        policy.mkdir()
+        self.assertEqual([str(policy)], sources())
+        self.assertEqual([], sources(wsl=False), "the Windows chain applies only under WSL")
+        policy.rmdir()
+        hklm, hkcu = peer._WSL_POLICY_KEYS
+        self.assertEqual([hklm], sources(keys={hklm: [0, ""], hkcu: absent}))
+        self.assertEqual([hkcu + " (unreadable)"], sources(keys={hklm: absent, hkcu: [1, "Access is denied."]}))
+        with mock.patch.object(peer, "_managed_claude_sources", return_value=["/etc/claude-code"]) as found:
             code, result, _ = self.invoke("--tools", "none")
             self.assertNotEqual(0, code)
             self.assertEqual(("unavailable", False), (result["state"], result["provider_started"]))
-            self.assertIn("Managed Claude settings exist", result["message"])
-            code, dry, _ = self.invoke("--dry-run")
+            self.assertIn("Managed Claude settings were found (/etc/claude-code)", result["message"])
+            code, _, _ = self.invoke("--dry-run")
             self.assertEqual(0, code, "an unrestricted call is unaffected")
+            self.assertEqual(1, found.call_count)
         self.assertFalse(self.calls.exists())
 
-    def test_attachments_are_complete_images_within_their_bounds(self):
+    def test_attachments_are_typed_images_within_their_bounds(self):
         for media_type, body in self.images().items():
             with self.subTest(accepted=media_type):
                 path = self.base / ("ok." + media_type.split("/")[1])
@@ -1188,14 +1216,17 @@ class PeerTests(unittest.TestCase):
         text.write_text("not an image")
         link = self.base / "link.png"
         link.symlink_to(self.base / "ok.png")
-        forged = {"signature only": b"\x89PNG\r\n\x1a\n", "gif then text": b"GIF89a then some text",
-                  "webp then text": b"RIFF0000WEBP then text"}
-        cases = [(text, "is not a complete PNG, JPEG, GIF or WebP image"), (link, "could not be opened"),
+        # A type check, not a decoder: legal JPEG fill bytes pass; signature-only or mislabelled files do not.
+        padded = self.base / "padded.jpg"
+        padded.write_bytes(b"\xff\xd8\xff" + self.images()["image/jpeg"][2:])
+        self.assertEqual("image/jpeg", self.invoke("--attach", str(padded), "--dry-run")[1]["attachments"][0]["media_type"])
+        forged = {"signature only": b"\x89PNG\r\n\x1a\n", "webp then text": b"RIFF0000WEBP then text"}
+        cases = [(text, "is not a PNG, JPEG, GIF or WebP image"), (link, "could not be opened"),
                  (self.base / "absent.png", "could not be opened")]
         for name, body in forged.items():
             path = self.base / (name.replace(" ", "-") + ".img")
             path.write_bytes(body)
-            cases.append((path, "is not a complete PNG, JPEG, GIF or WebP image"))
+            cases.append((path, "is not a PNG, JPEG, GIF or WebP image"))
         for path, why in cases:
             with self.subTest(refused=path.name):
                 code, result, _ = self.invoke("--attach", str(path))

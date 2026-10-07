@@ -340,8 +340,9 @@ class _Driver:
         if any(surface is None for surface in surfaces.values()):
             raise ProtocolError("Native initialization did not report its whole tool registry; this call fails closed. "
                                 "Inspect retained output.")
-        builtin = isinstance(plugins, list) and all(isinstance(item, dict) and item.get("path") == "builtin"
-                                                    for item in plugins)
+        builtin = isinstance(plugins, list) and all(
+            isinstance(item, dict) and item.get("path") == "builtin" and item.get("source") == f"{item.get('name')}@builtin"
+            for item in plugins)
         if (surfaces["reported"] != self.tools or surfaces["mcp_servers"] or surfaces["slash_commands"]
                 or surfaces["skills"] or not builtin or not set(surfaces["plugins"]) <= reviewed["plugins"]
                 or not set(surfaces["agents"]) <= reviewed["agents"]):
