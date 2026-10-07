@@ -789,6 +789,34 @@ def _sync_directory(directory):
         os.close(parent)
 
 
+def _record_refusal(target, envelope):
+    """A call refused before it started still leaves its record where the caller reads it.
+
+    The directory is created here and written through one descriptor, so a path swapped in after creation is
+    never followed; an existing directory belongs to another call and is never reused.
+    """
+    try:
+        target.mkdir(mode=0o700)
+        fd = os.open(target, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError:
+        return
+    try:
+        info = os.fstat(fd)
+        if info.st_uid != os.getuid() or os.listdir(fd):
+            return
+        envelope["evidence_directory"] = str(target)
+        body = json.dumps(envelope, ensure_ascii=True, sort_keys=True).encode("utf-8")
+        out = os.open("result.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=fd)
+        with os.fdopen(out, "wb") as stream:
+            stream.write(body)
+            stream.flush()
+            os.fsync(stream.fileno())
+    except OSError:
+        envelope.pop("evidence_directory", None)
+    finally:
+        os.close(fd)
+
+
 def _atomic_record(directory, name, value, *, sync_directory=False):
     """Publish a complete private JSON file; a torn write leaves the old file."""
     fd, temporary = tempfile.mkstemp(prefix=".receipt-", dir=directory)
@@ -1544,14 +1572,7 @@ def _run_peer(args, interruption):
     if preparation is not None:
         envelope["follow_up_preparation"] = preparation
     if directory is None and getattr(args, "output_dir", None) is not None and not getattr(args, "dry_run", False):
-        # A call refused before it started still leaves its record where the caller reads it; an existing
-        # directory belongs to another call and is never reused.
-        try:
-            args.output_dir.absolute().mkdir(mode=0o700)
-            directory = args.output_dir.absolute()
-            envelope["evidence_directory"] = str(directory)
-        except OSError:
-            pass
+        _record_refusal(args.output_dir.absolute(), envelope)
     if directory is not None:
         try:
             _atomic_record(directory, "result.json", envelope)

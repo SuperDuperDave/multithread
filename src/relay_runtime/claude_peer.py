@@ -324,8 +324,12 @@ class _Driver:
         """A restricted session doing what its call did not allow: it already holds the task, so it is killed
         now rather than given the ordinary shutdown grace, and nothing it wrote is kept as a partial answer."""
         self.registry_failed = True
+        self.envelope.pop("partial_result", None)
         try:
-            os.killpg(self.process.pid, signal.SIGKILL)  # the provider leads its own session
+            # The provider leads its own session; once the leader is reaped its group ID may be reused, so only
+            # an unreaped leader's group is signalled (the ordinary cleanup handles what remains).
+            if self.process.returncode is None and self.process.poll() is None:
+                os.killpg(self.process.pid, signal.SIGKILL)
         except (ProcessLookupError, PermissionError, AttributeError, TypeError):
             pass
         return ProtocolError(message)

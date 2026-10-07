@@ -1254,6 +1254,40 @@ class PeerTests(unittest.TestCase):
             self.assertEqual(1, found.call_count)
         self.assertFalse(self.calls.exists())
 
+    def test_a_refusal_record_never_follows_a_directory_swapped_after_creation(self):
+        other = self.base / "another-call"
+        other.mkdir()
+        (other / "result.json").write_text("another call")
+        record = self.base / "refused-call"
+        real_mkdir = Path.mkdir
+        def swap(path, *arguments, **options):
+            real_mkdir(path, *arguments, **options)
+            if path == record:  # an actor controlling the parent replaces it before the record is written
+                path.rmdir()
+                path.symlink_to(other, target_is_directory=True)
+        with (mock.patch.object(peer, "_managed_claude_sources", return_value=["/etc/claude-code"]),
+              mock.patch.object(Path, "mkdir", swap)):
+            code, result, _ = self.invoke("--tools", "none", output=record)
+        self.assertNotEqual(0, code)
+        self.assertEqual("another call", (other / "result.json").read_text())
+        self.assertIsNone(result["evidence_directory"])
+
+    def test_a_late_fault_drops_a_stored_partial_and_never_signals_a_reaped_group(self):
+        from relay_runtime import claude_peer
+        for name, returncode, polled, signalled in (("live leader", None, None, True),
+                                                    ("reaped leader", 0, 0, False),
+                                                    ("exited, not yet reaped", None, 0, False)):
+            with self.subTest(case=name):
+                process = mock.Mock(pid=424242, returncode=returncode)
+                process.poll.return_value = polled
+                envelope = {"partial_result": "words written before the fault"}
+                driver = claude_peer._Driver(process, b"task", str(self.repo), None, envelope, 1, None, tools=[])
+                with mock.patch.object(claude_peer.os, "killpg") as killpg:
+                    error = driver.fault("outside the registry")
+                self.assertIsInstance(error, claude_peer.ProtocolError)
+                self.assertNotIn("partial_result", envelope)
+                self.assertEqual(signalled, killpg.called)
+
     def test_the_cli_keywords_for_every_tool_are_not_tool_names(self):
         for word in ("default", "all", "Read,ALL"):
             with self.subTest(tools=word), self.assertRaises(SystemExit), redirect_stderr(io.StringIO()):
