@@ -47,6 +47,7 @@ INTERNAL_EVENT_KINDS = frozenset(
         "decision.requested",
         "decision.responded",
         "delivery.acknowledged",
+        "provider.reviewed",
         *WAKE_BINDING_KINDS,
         *WAKE_ATTEMPT_KINDS,
     }
@@ -187,6 +188,10 @@ _META_KEYS: dict[str, frozenset[str]] = {
     ),
     "friction.observed": frozenset(
         {"fingerprint", "category", "cost_seconds", "position", "proposal"}
+    ),
+    "provider.reviewed": frozenset(
+        {"provider", "binary_sha256", "version", "surface_sha256", "plugins", "agents",
+         "control_fired", "restricted_fired"}
     ),
     "ratchet.decided": frozenset(
         {"fingerprint", "mode", "home", "verify_when"}
@@ -673,6 +678,8 @@ def normalize_event(raw: Mapping[str, Any], *, internal: bool = False) -> Event:
             raise ValidationError("receipt artifact contains an unsafe path segment")
     if kind in {"work.handoff", "review.requested"} and artifact is None:
         raise ValidationError(f"{kind} requires an immutable artifact")
+    if kind == "provider.reviewed" and (artifact is None or not artifact.startswith("sha256:")):
+        raise ValidationError("provider review requires its report as a sha256 artifact")
     if kind in {"decision.requested", "decision.responded"}:
         if work_id is None:
             raise ValidationError(f"{kind} requires work_id")
@@ -834,6 +841,8 @@ def _validate_semantics(
         canonical_resource(_required_string("resource", meta.get("resource")))
     elif kind.startswith("wake."):
         _validate_wake(kind, meta)
+    elif kind == "provider.reviewed":
+        _validate_provider_review(meta)
     elif kind == "delivery.acknowledged":
         signal_seq = meta.get("signal_seq")
         if (
@@ -909,6 +918,32 @@ def _validate_semantics(
             raise ValidationError(
                 "decision choice is allowed only for choice resolution"
             )
+
+
+#: Every canary a review plants; a review is recorded only when its control fired all of them.
+PROVIDER_REVIEW_CANARIES = "local-hook,mcp-server,project-hook"
+_NAMES_RE = re.compile(r"^(?:none|[A-Za-z0-9][A-Za-z0-9._@-]{0,79}(?:,[A-Za-z0-9][A-Za-z0-9._@-]{0,79}){0,63})$")
+
+
+def _validate_provider_review(meta: Mapping[str, Any]) -> None:
+    """A passing review of one exact provider binary for restricted calls, with its evidence."""
+    missing = sorted(_META_KEYS["provider.reviewed"] - set(meta))
+    if missing:
+        raise ValidationError(f"provider review requires {', '.join(missing)}")
+    if meta["provider"] != "claude":
+        raise ValidationError("provider review covers claude only")
+    for key in ("binary_sha256", "surface_sha256"):
+        if not isinstance(meta[key], str) or re.fullmatch(r"[0-9a-f]{64}", meta[key]) is None:
+            raise ValidationError(f"{key} must be a lowercase SHA-256 digest")
+    if not isinstance(meta["version"], str) or re.fullmatch(r"\d{1,4}\.\d{1,4}\.\d{1,6}", meta["version"]) is None:
+        raise ValidationError("provider review version must be MAJOR.MINOR.PATCH")
+    for key in ("plugins", "agents"):
+        if not isinstance(meta[key], str) or _NAMES_RE.fullmatch(meta[key]) is None:
+            raise ValidationError(f"{key} must be comma-separated names or none")
+    if meta["control_fired"] != PROVIDER_REVIEW_CANARIES:
+        raise ValidationError("a provider review is recorded only when its control fired every canary")
+    if meta["restricted_fired"] != "none":
+        raise ValidationError("a provider review is recorded only when its restricted call fired no canary")
 
 
 def _normalize_meta(

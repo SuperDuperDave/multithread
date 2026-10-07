@@ -21,7 +21,8 @@ class ClaudeIntegrationTests(unittest.TestCase):
     executable = staticmethod(fixture.CodexProtocolTests.executable)
     configure = fixture.CodexProtocolTests.configure
 
-    def invoke(self, steps, *, update=False, closure_fault=False, progress_only=False, restricted=False):
+    def plan_claude(self):
+        """The relay's Claude plan and the native stand-in."""
         hook = shlex.join([str(self.relay), '--repo', str(self.repo), 'provider-hook', '--client', 'claude'])
         hooks = {event: [{'hooks': [{'type': 'command', 'command': hook, 'timeout': 3}]}]
                  for event in ('SessionStart', 'UserPromptSubmit', 'PostToolUse', 'Stop', 'SessionEnd')}
@@ -33,6 +34,9 @@ class ClaudeIntegrationTests(unittest.TestCase):
         constants = {'SPEC_PATH': str(self.specification), 'RECEIPT_PATH': str(self.receipt),
                      'REQUESTS_PATH': str(self.requests)}
         self.executable(self.provider, ''.join(f'{key} = {value!r}\n' for key, value in constants.items()) + source)
+
+    def invoke(self, steps, *, update=False, closure_fault=False, progress_only=False, restricted=False):
+        self.plan_claude()
         self.specification.write_text(json.dumps(steps))
         directory = self.base / 'stream-evidence'
         message = self.base / 'message.txt'
@@ -192,6 +196,51 @@ class ClaudeIntegrationTests(unittest.TestCase):
 
 class RestrictedCallTests(ClaudeIntegrationTests):
     """--tools end to end: no hook settings reach the session, and only a clean stream returns."""
+
+    def setUp(self):
+        super().setUp()
+        self.review = mock.patch("relay_runtime.claude_review.reviewed", return_value=protocol.REVIEWED)
+        self.found = self.review.start()
+        self.addCleanup(self.review.stop)
+
+    def test_only_an_exact_reviewed_binary_runs_restricted_and_it_must_not_change(self):
+        import shutil
+        code, value, _ = self.invoke(self.restricted_steps(), restricted=True)
+        self.assertEqual((0, 'returned'), (code, value['state']), value)
+        digest = __import__('hashlib').sha256(self.provider.read_bytes()).hexdigest()
+        self.assertEqual({'binary_path': os.path.realpath(self.provider), 'binary_sha256': digest,
+                          'version': '2.1.292', 'source': 'built_in'}, value['provider_review'])
+        self.assertEqual(digest, self.found.call_args.args[0], 'looked up by content, not by name')
+        argv = json.loads(self.receipt.read_text())['argv']
+        self.assertEqual(os.path.realpath(self.provider), argv[0], 'the hashed file is the one executed')
+        shutil.rmtree(self.base / 'stream-evidence', ignore_errors=True)
+        with mock.patch('relay_runtime.claude_review.binary_changed', return_value=True):
+            code, value, _ = self.invoke(self.restricted_steps(), restricted=True)
+        self.assertNotEqual(0, code)
+        self.assertEqual(('uncertain', None, True), (value['state'], value['result'], value['provider_binary_changed']))
+
+    def test_an_unreviewed_or_unknowable_binary_starts_nothing(self):
+        from relay_runtime import claude_review
+        for name, effect, why in (
+                ('unreviewed', None, 'has no recorded review for restricted calls'),
+                ('unreadable reviews', claude_review.ReviewError('reviews could not be read.'), 'could not be read')):
+            with self.subTest(case=name):
+                self.plan_claude()
+                self.found.return_value, self.found.side_effect = effect, (effect if name != 'unreviewed' else None)
+                output = io.StringIO()
+                with redirect_stdout(output), redirect_stderr(io.StringIO()), \
+                        mock.patch.dict(os.environ, self.environment, clear=True):
+                    code = peer.peer_main(['claude', '--tools', 'none', '--repo', str(self.repo),
+                                           '--multithread', str(self.relay), '--provider', str(self.provider),
+                                           '--task-file', str(self.task), '--json'])
+                value = json.loads(output.getvalue())
+                self.assertNotEqual(0, code)
+                self.assertEqual(('unavailable', False, 'provider_review'),
+                                 (value['state'], value['provider_started'], value['unavailable_stage']))
+                self.assertIn(why, value['message'])
+                if name == 'unreviewed':
+                    self.assertIn(shlex.join(['--repo', str(self.repo), 'peer', 'review-claude', '--provider',
+                                              os.path.realpath(self.provider)]), value['message'])
 
     def restricted_steps(self, *after):
         return [{'read': 1}, {'emit': protocol.ClaudeProtocolTests.restricted()}, {'emit': protocol.result()}, *after]

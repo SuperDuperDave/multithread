@@ -31,12 +31,6 @@ _MAX_UUIDS = 64
 _MAX_TEXT = 64 * 1024
 _MAX_PARTIAL = 64 * 1024
 _MAX_CONTROLS = 4096
-# Restricted sessions are accepted only from reviewed Claude Code versions, whose
-# remaining built-in surfaces are known. Subagents need a tool no restricted call offers.
-_REVIEWED_RESTRICTED = {
-    "2.1.292": {"plugins": frozenset({"cc-plugin-agents-md", "cc-plugin-telemetry", "cc-plugin-plugin-authoring"}),
-                "agents": frozenset({"claude", "Explore", "general-purpose", "Plan", "statusline-setup"})},
-}
 _ERROR_SUBTYPES = ("error_max_turns", "error_during_execution", "error_max_budget_usd",
                    "error_max_structured_output_retries")
 
@@ -50,12 +44,16 @@ def _canonical(value):
 
 
 class _Driver:
-    def __init__(self, process, task, repo, resume, envelope, timeout, control, attachments=(), tools=None):
+    def __init__(self, process, task, repo, resume, envelope, timeout, control, attachments=(), tools=None,
+                 reviewed=None):
         self.process = process
         self.task = task.decode("utf-8")
         self.attachments = list(attachments)
         self.attached = {item["sha256"] for item in self.attachments}
         self.tools = tools
+        # The review admitting this exact binary: its version and remaining built-in surfaces are known.
+        # Subagents need a tool no restricted call offers.
+        self.reviewed = reviewed
         self.revoked = False
         self.repo = repo
         self.envelope = envelope
@@ -333,10 +331,10 @@ class _Driver:
         self.envelope["provider_tools"] = {"requested": self.tools, **surfaces,
                                            "claude_code_version": version if identity(version) else None,
                                            "source": "claude_system_init"}
-        reviewed = _REVIEWED_RESTRICTED.get(version) if identity(version) else None
-        if reviewed is None:
-            raise ProtocolError(f"Claude Code {version if identity(version) else '(unreported)'} is not a reviewed version "
-                                "for restricted calls; this call fails closed. Inspect retained output.")
+        reviewed = self.reviewed
+        if reviewed is None or not identity(version) or version != reviewed.get("version"):
+            raise ProtocolError(f"Claude Code reported {version if identity(version) else '(no version)'}, not the reviewed "
+                                "binary's version; this call fails closed. Inspect retained output.")
         if any(surface is None for surface in surfaces.values()):
             raise ProtocolError("Native initialization did not report its whole tool registry; this call fails closed. "
                                 "Inspect retained output.")
@@ -344,8 +342,8 @@ class _Driver:
             isinstance(item, dict) and item.get("path") == "builtin" and item.get("source") == f"{item.get('name')}@builtin"
             for item in plugins)
         if (surfaces["reported"] != self.tools or surfaces["mcp_servers"] or surfaces["slash_commands"]
-                or surfaces["skills"] or not builtin or not set(surfaces["plugins"]) <= reviewed["plugins"]
-                or not set(surfaces["agents"]) <= reviewed["agents"]):
+                or surfaces["skills"] or not builtin or not set(surfaces["plugins"]) <= set(reviewed["plugins"])
+                or not set(surfaces["agents"]) <= set(reviewed["agents"])):
             raise ProtocolError("The native tool registry differs from the requested one; this call fails closed. "
                                 "Inspect retained output.")
 
@@ -605,9 +603,9 @@ class _Driver:
 
 def run(process, task: bytes, repo: str, resume: str | None, directory: Path,
         envelope: dict, timeout: float, control=None, observer=None, feedback=None,
-        attachments=(), tools=None) -> None:
+        attachments=(), tools=None, reviewed=None) -> None:
     """Observe one native streaming session separately from the caller's cleanup."""
-    driver = _Driver(process, task, repo, resume, envelope, timeout, control, attachments, tools)
+    driver = _Driver(process, task, repo, resume, envelope, timeout, control, attachments, tools, reviewed)
     owned_observer = observer is None
     observation = observer if observer is not None else Observation(process, directory, envelope)
     observation.driver = driver

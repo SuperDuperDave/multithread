@@ -229,6 +229,17 @@ def build_parser() -> argparse.ArgumentParser:
     acknowledge.add_argument("seq", type=int)
     _add_actor(acknowledge)
 
+    review = commands.add_parser(
+        "provider-review", help="record or read reviews of exact provider binaries for restricted peer calls"
+    )
+    review_actions = review.add_subparsers(dest="review_action", required=True)
+    record = review_actions.add_parser(
+        "record", help="append one passing review report (JSON on stdin) written by 'peer review-claude'"
+    )
+    _add_actor(record)
+    show = review_actions.add_parser("show", help="recorded passing reviews of one binary")
+    show.add_argument("--binary-sha256", required=True)
+
     events = commands.add_parser("events", help="read the immutable event stream")
     events.add_argument("--after", type=int, default=0)
     events.add_argument("--limit", type=int, default=100)
@@ -403,6 +414,11 @@ def main(argv: Sequence[str] | None = None) -> int:
 def _dispatch(store: RelayStore, args: argparse.Namespace) -> Any:
     if args.command == "emit":
         return store.emit(_read_json_object(sys.stdin.buffer))
+    if args.command == "provider-review":
+        if args.review_action == "show":
+            return {"reviews": store.provider_reviews(args.binary_sha256)}
+        agent, session = _actor(args)
+        return store.provider_review(_read_json_object(sys.stdin.buffer), agent=agent, session=session)
     if args.command == "signal":
         if args.wake:
             raise ValidationError("signal --wake runs through the installed multithread command")

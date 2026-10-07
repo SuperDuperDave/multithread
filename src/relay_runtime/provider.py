@@ -451,7 +451,7 @@ _SERVER_MANAGED_CLAUDE = ("remote-settings.json", "policy-limits.json")
 _WSL_CLAUDE_POLICY = Path("/mnt/c/Program Files/ClaudeCode")
 _WSL_REG = Path("/mnt/c/Windows/System32/reg.exe")
 _WSL_POLICY_PARENTS = ("HKLM\\SOFTWARE\\Policies", "HKCU\\SOFTWARE\\Policies")
-_RESTRICTED_STOPS = ("caller_stop_reason", "server_cleanup", "owned_process_cleanup", "stdout_completion",
+_RESTRICTED_STOPS = ("provider_binary_changed", "caller_stop_reason", "server_cleanup", "owned_process_cleanup", "stdout_completion",
                      "evidence_recording", "control_fault", "unavailable_stage")
 
 
@@ -1088,6 +1088,9 @@ def peer_main(argv=None, *, report_entry=None):
     if raw and raw[0] == "packet":
         from .review_packet import packet_main
         return packet_main(raw[1:])
+    if raw and raw[0] == "review-claude":
+        from .claude_review import review_main
+        return review_main(raw[1:], account_launcher())
     parser = argparse.ArgumentParser(prog="multithread peer", description="Call a native provider and return its observed result to the initiating task.",
                                      epilog="For an existing call: peer report --call-dir PATH [--json] gives a read-only summary; peer packet --help freezes a scoped review diff; peer control --help covers live input.")
     parser.add_argument("client", choices=("claude", "codex"))
@@ -1233,9 +1236,27 @@ def _run_peer(args, interruption):
         if managed:
             raise LaunchError("Managed Claude settings were found (" + ", ".join(managed) + "); they stay in force under "
                               "--restricted, hooks included, so a --tools call cannot establish its registry. No provider was started.")
+        identity = reviewed = None
+        if args.tools is not None:
+            # A restricted call runs only an exact binary whose restricted behaviour was reviewed, by resolved path.
+            from . import claude_review
+            stage = "provider_review"
+            try:
+                identity = claude_review.binary_identity(plan["argv"][0])
+                reviewed = claude_review.reviewed(identity[1], args.relay or account_launcher(), plan["repo"])
+            except claude_review.ReviewError as exc:
+                raise LaunchError(f"{exc} No provider was started.") from None
+            if reviewed is None:
+                review = [str(args.relay or account_launcher()), "--repo", plan["repo"], "peer", "review-claude",
+                          "--provider", identity[0]]
+                raise LaunchError(f"Claude Code at {identity[0]} (sha256 {identity[1][:12]}…) has no recorded review for "
+                                  "restricted calls in this checkout; this call fails closed. Review it with: "
+                                  + _display_text(shlex.join(review)) + " --agent AGENT --session SESSION")
+            envelope["provider_review"] = {"binary_path": identity[0], "binary_sha256": identity[1],
+                                           "version": reviewed["version"], "source": reviewed["source"]}
         if args.client == "claude":
             # A restricted call carries no settings of its own: hooks would run outside its registry.
-            entry = plan["argv"][:1] if args.tools is not None else plan["argv"]
+            entry = [identity[0]] if args.tools is not None else plan["argv"]
             native = [*entry, "--print", "--output-format",
                       "stream-json" if streaming else "json", "--permission-prompts", "none"]
             if streaming:
@@ -1354,7 +1375,7 @@ def _run_peer(args, interruption):
                                feedback=feedback,
                                **({"expected_hook": plan["relay_plan"]["hook_command"],
                                    "hook_file": plan["hooks"]["file"]} if args.client == "codex" else
-                                  {"attachments": attachments, "tools": args.tools}))
+                                  {"attachments": attachments, "tools": args.tools, "reviewed": reviewed}))
                     # EOF is the ordinary end of this owned stdio server.
                     # Retain a valid returned turn even if server shutdown
                     # needs cleanup; shutdown is not a second provider turn.
@@ -1456,6 +1477,11 @@ def _run_peer(args, interruption):
             except OSError:
                 envelope["needs_attention"] = True
                 code = code or 1
+    if getattr(args, "tools", None) is not None and envelope.get("provider_review") is not None:
+        from . import claude_review
+        if claude_review.binary_changed(envelope["provider_review"]["binary_path"],
+                                         envelope["provider_review"]["binary_sha256"]):
+            envelope["provider_binary_changed"] = True
     if (getattr(args, "tools", None) is not None and envelope.get("state") == "returned"
             and not _restricted_end_clean(observer, envelope, completed)):
         # Every path ends here, cleanup included: no other branch can let a restricted result stand.
@@ -1603,8 +1629,8 @@ def _report_projection(record):
             producer_status = "unavailable"
     call["producer_runtime_identity"] = producer_status
     call["unavailable_stage"] = (record.get("unavailable_stage") if record.get("unavailable_stage") in
-                                  ("task_read", "relay_configuration", "evidence_setup", "provider_spawn",
-                                   "provider_call", "result_read") else "unknown")
+                                  ("task_read", "relay_configuration", "provider_review", "read_scope", "evidence_setup",
+                                   "provider_spawn", "provider_call", "result_read") else "unknown")
     identities = {key: record.get(key) for key in
                   ("session_id", "requested_session_id", "observed_session_id")}
     if any(value is not None and (not isinstance(value, str) or not value) for value in identities.values()):

@@ -17,7 +17,10 @@ import uuid
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
-from relay_runtime import claude_peer, native_io, provider
+from relay_runtime import claude_peer, claude_review, native_io, provider
+
+#: The hand-reviewed binary's record, as a restricted call receives it.
+REVIEWED = {**next(iter(claude_review.BUILT_IN.values())), "source": "built_in"}
 
 SESSION = "10000000-0000-4000-8000-000000000001"
 OTHER_SESSION = "20000000-0000-4000-8000-000000000002"
@@ -202,7 +205,8 @@ class ClaudeProtocolTests(unittest.TestCase):
             capture_envelope.append(envelope)
         body = (task if task is not None else self.task).encode("utf-8")
         claude_peer.run(process, body, str(self.repo), resume, directory, envelope,
-                        timeout, control=control, feedback=feedback, attachments=attachments, tools=tools)
+                        timeout, control=control, feedback=feedback, attachments=attachments, tools=tools,
+                        reviewed=REVIEWED if tools is not None else None)
         return envelope, directory, process
 
     def submitted(self):
@@ -945,8 +949,8 @@ class ClaudeProtocolTests(unittest.TestCase):
                                                           "source": "attacker@inline"}]}, "differs from the requested one"),
             "unreported tools": ({"tools": None}, "did not report its whole tool registry"),
             "unreported agents": ({"agents": None}, "did not report its whole tool registry"),
-            "unreviewed version": ({"claude_code_version": "99.0.0"}, "Claude Code 99.0.0 is not a reviewed version"),
-            "no version": ({"claude_code_version": None}, "Claude Code (unreported) is not a reviewed version"),
+            "unreviewed version": ({"claude_code_version": "99.0.0"}, "Claude Code reported 99.0.0, not the reviewed binary's version"),
+            "no version": ({"claude_code_version": None}, "Claude Code reported (no version), not the reviewed binary's version"),
         }
         for name, (changes, why) in cases.items():
             with self.subTest(case=name):

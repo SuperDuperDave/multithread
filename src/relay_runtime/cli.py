@@ -88,6 +88,7 @@ def _readonly(args):
         return args.provider_payload["hook_event_name"] in {"UserPromptSubmit", "PostToolUse"}
     return args.command in {"status", "brief", "inbox", "roles", "events", "doctor", "channel-pending", "provider-config"} or (
         args.command == "ratchet" and args.ratchet_command == "review") or (
+        args.command == "provider-review" and args.review_action == "show") or (
         args.command == "wake-ledger" and args.wake_action in {"show", "observed", "plan", "history"})
 
 

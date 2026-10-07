@@ -32,6 +32,7 @@ from .protocol import (
     WAKE_CONCLUSIONS,
     WAKE_REQUESTS,
     canonical_agent,
+    canonical_json,
     session_target,
     canonical_decision_id,
     canonical_decision_option,
@@ -1097,6 +1098,38 @@ class RelayStore:
                 **receipt,
                 "acknowledgement": acknowledgement,
             }
+
+    def provider_review(self, report: Mapping[str, Any], *, agent: str, session: str) -> dict[str, Any]:
+        """Append one passing review of an exact provider binary, attributed to its reviewer.
+
+        The report is the review's own output; its canonical digest is the event's artifact. Only a pass whose
+        control fired every canary and whose restricted call fired none can be recorded.
+        """
+        if report.get("schema") != 1 or report.get("verdict") != "pass":
+            raise ValidationError("only a passing schema-1 provider review can be recorded")
+        names = lambda key: report.get(key) if isinstance(report.get(key), list) else None
+        listed = {key: names(key) for key in ("plugins", "agents", "control_fired", "restricted_fired")}
+        if any(value is None or not all(isinstance(item, str) for item in value) for value in listed.values()):
+            raise ValidationError("provider review lists must be arrays of names")
+        joined = {key: ",".join(sorted(value)) or "none" for key, value in listed.items()}
+        meta = {"provider": report.get("provider"), "binary_sha256": report.get("binary_sha256"),
+                "version": report.get("version"), "surface_sha256": report.get("surface_sha256"), **joined}
+        digest = hashlib.sha256(canonical_json(report).encode("utf-8")).hexdigest()
+        event = normalize_event({"kind": "provider.reviewed", "agent": agent, "session": session,
+                                 "summary": f"Claude Code {meta['version']} reviewed for restricted peer calls: pass",
+                                 "artifact": f"sha256:{digest}", "meta": meta}, internal=True)
+        with self._transaction():
+            seq, duplicate = self._insert_event(event)
+        return self._event_receipt(seq, duplicate)
+
+    def provider_reviews(self, binary_sha256: str) -> list[dict[str, Any]]:
+        """Every recorded passing review of one exact binary, oldest first."""
+        rows = self._execute(
+            "SELECT * FROM events WHERE kind = 'provider.reviewed' "
+            "AND json_extract(meta_json, '$.binary_sha256') = ? ORDER BY seq LIMIT 50",
+            (binary_sha256,),
+        ).fetchall()
+        return [self._event_row(row) for row in rows]
 
     def acknowledge(
         self,
