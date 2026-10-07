@@ -291,8 +291,8 @@ class CodexProtocolTests(unittest.TestCase):
     def confinement(result):
         """The read-scope arguments the call records for itself."""
         scope = result["read_scope"]
-        entries = [json.dumps(root) + ' = "read"' for root in [":minimal", *scope["roots"]]]
-        entries += [json.dumps(os.path.join(scope["roots"][0], path)) + ' = "none"' for path in scope["hidden"]]
+        entries = [peer._toml_path(root) + ' = "read"' for root in [":minimal", *scope["roots"]]]
+        entries += [peer._toml_path(os.path.join(scope["roots"][0], path)) + ' = "none"' for path in scope["hidden"]]
         hidden_instructions = ["-c", "project_doc_max_bytes=0"] if scope["project_instructions"] == "hidden" else []
         return ["-c", 'default_permissions="multithread-peer-read"',
                 "-c", "permissions.multithread-peer-read.filesystem={" + ", ".join(entries) + "}", *hidden_instructions]
@@ -1462,7 +1462,7 @@ class CodexProtocolTests(unittest.TestCase):
         code, result, directory = self.invoke("--read", str(named))
         self.assertEqual(0, code, result)
         checkout = os.path.realpath(self.repo)
-        self.assertEqual({"profile": "multithread-peer-read", "hidden": [], "project_instructions": "none",
+        self.assertEqual({"profile": "multithread-peer-read", "hidden": [], "ignored_links": [], "project_instructions": "none",
                           "roots": [checkout, os.path.join(checkout, ".git"), str(self.provider.parent),
                                     os.path.realpath(named)],
                           "verified": {"outside_file": "absent", "hidden_unreadable": 0,
@@ -1498,7 +1498,7 @@ class CodexProtocolTests(unittest.TestCase):
         self.assertEqual({"outside_file": "absent", "hidden_unreadable": 2, "escaping_links_unreadable": 2},
                          result["read_scope"]["verified"])
         checkout = os.path.realpath(self.repo)
-        self.assertIn(json.dumps(os.path.join(checkout, "_sessions")) + ' = "none"', self.confinement(result)[3])
+        self.assertIn(peer._toml_path(os.path.join(checkout, "_sessions")) + ' = "none"', self.confinement(result)[3])
         probed = self.probes()[0]["argv"][-4:]
         self.assertEqual([os.path.join(str(self.repo), name) for name in (".env", "_sessions", "POLICY.md", "REPORTING.md")],
                          probed)
@@ -1539,6 +1539,27 @@ class CodexProtocolTests(unittest.TestCase):
         self.assertNotEqual(0, code)
         self.assertIn("needs a canary outside the scope", result["message"])
         self.assertFalse(self.calls.exists(), "no Codex server started")
+
+    def test_paths_any_filename_allows_reach_the_profile_and_undecodable_ones_refuse(self):
+        import tomllib
+        for path in ("/a/b c", "/x/\U0001F600 \u00fc", '/q"uote\\back', "/ctl\x01\x7f\n"):
+            with self.subTest(path=path):
+                self.assertEqual(path, tomllib.loads("k = " + peer._toml_path(path))["k"])
+        with self.assertRaisesRegex(peer.LaunchError, "is not UTF-8"):
+            peer._toml_path("/bad" + b"\xff".decode("utf-8", "surrogateescape"))
+
+    def test_an_ignored_path_that_appears_during_the_call_is_reported(self):
+        (self.repo / ".gitignore").write_text("*.secret\nprivate/\n")
+        (self.repo / "private").mkdir()
+        scope = {"hidden": ["private"], "ignored_links": []}
+        (self.repo / "private" / "later.secret").write_text("inside a hidden folder\n")
+        self.assertEqual([], peer._late_ignored(self.repo, scope))
+        (self.repo / "late.secret").write_text("artificial\n")
+        self.assertEqual(["late.secret"], peer._late_ignored(self.repo, scope))
+        with mock.patch.object(peer, "_late_ignored", return_value=["late.secret"]):
+            code, result, _ = self.invoke()
+        self.assertEqual(["late.secret"], result["read_scope"]["late_ignored"])
+        self.assertTrue(result["needs_attention"])
 
     def test_only_the_outermost_hidden_path_is_mounted(self):
         # Git lists an untracked folder holding only ignored content beside the ignored folder inside it.

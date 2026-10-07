@@ -618,9 +618,27 @@ def _readable(scope, path):
     return any(inside(root) for root in scope["roots"]) and not any(inside(path) for path in hidden)
 
 
+def _toml_path(path):
+    """A TOML basic string for a path: UTF-8 as is, control characters escaped; undecodable names refuse."""
+    try:
+        path.encode("utf-8")
+    except UnicodeEncodeError:
+        raise LaunchError(f"The path {path.encode('utf-8', 'surrogateescape')!r} is not UTF-8, so a Codex peer's read "
+                          "scope cannot name it. No provider was started.") from None
+    return json.dumps(path, ensure_ascii=False).replace("\x7f", "\\u007f")
+
+
+def _late_ignored(repo, scope):
+    """Ignored paths that appeared after the scope was set and so were not hidden from the callee."""
+    listed = _git_lines(repo, "ls-files", "-z", "--others", "--ignored", "--exclude-standard", "--directory")
+    known = [*scope["hidden"], *scope.get("ignored_links", [])]
+    return [path for path in _outermost(path.rstrip("/") for path in listed or [])
+            if not any(path == old or path.startswith(old + "/") for old in known)][:50]
+
+
 def _codex_read_arguments(scope):
-    entries = [json.dumps(path) + ' = "read"' for path in [":minimal", *scope["roots"]]]
-    entries += [json.dumps(os.path.join(scope["roots"][0], path)) + ' = "none"' for path in scope["hidden"]]
+    entries = [_toml_path(path) + ' = "read"' for path in [":minimal", *scope["roots"]]]
+    entries += [_toml_path(os.path.join(scope["roots"][0], path)) + ' = "none"' for path in scope["hidden"]]
     arguments = ["-c", f'default_permissions="{_PEER_READ_PROFILE}"',
                  "-c", f"permissions.{_PEER_READ_PROFILE}.filesystem={{{', '.join(entries)}}}"]
     if scope["project_instructions"] == "hidden":
@@ -1276,6 +1294,7 @@ def _run_peer(args, interruption):
             scope = _codex_read_scope(plan["argv"][0], plan["repo"], args.read)
             confinement = _codex_read_arguments(scope)
             envelope["read_scope"] = {"profile": _PEER_READ_PROFILE, "roots": scope["roots"], "hidden": scope["hidden"],
+                                      "ignored_links": scope["linked"],
                                       "project_instructions": scope["project_instructions"],
                                       "verified": "not_checked"}
             native = [*plan["argv"], *confinement, "app-server", "--listen", "stdio://"]
@@ -1477,6 +1496,12 @@ def _run_peer(args, interruption):
             except OSError:
                 envelope["needs_attention"] = True
                 code = code or 1
+    if envelope.get("read_scope") is not None and envelope.get("provider_started"):
+        # The scope hid what Git ignored when it was set; a path ignored later stayed readable. Say so.
+        late = _late_ignored(plan["repo"], envelope["read_scope"])
+        if late:
+            envelope["read_scope"]["late_ignored"] = late
+            envelope["needs_attention"] = True
     if getattr(args, "tools", None) is not None and envelope.get("provider_review") is not None:
         from . import claude_review
         if claude_review.binary_changed(envelope["provider_review"]["binary_path"],

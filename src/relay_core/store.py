@@ -1111,6 +1111,15 @@ class RelayStore:
         listed = {key: names(key) for key in ("plugins", "agents", "control_fired", "restricted_fired")}
         if any(value is None or not all(isinstance(item, str) for item in value) for value in listed.values()):
             raise ValidationError("provider review lists must be arrays of names")
+        # The report must agree with itself: no reasons, and its own runs show what its lists declare.
+        control, restricted = report.get("control"), report.get("restricted")
+        if (report.get("reasons") != [] or not isinstance(control, Mapping) or not isinstance(restricted, Mapping)
+                or sorted(control.get("fired") or []) != sorted(listed["control_fired"])
+                or sorted(restricted.get("fired") or []) != sorted(listed["restricted_fired"])
+                or restricted.get("tools") != [] or restricted.get("mcp_servers") != []
+                or restricted.get("version") != report.get("version") or restricted.get("exit") != 0
+                or restricted.get("answered") is not True):
+            raise ValidationError("a provider review report must agree with its own runs")
         joined = {key: ",".join(sorted(value)) or "none" for key, value in listed.items()}
         meta = {"provider": report.get("provider"), "binary_sha256": report.get("binary_sha256"),
                 "version": report.get("version"), "surface_sha256": report.get("surface_sha256"), **joined}

@@ -117,12 +117,22 @@ class ReviewTests(unittest.TestCase):
     def test_recorded_reviews_are_read_through_the_launcher_and_unavailable_is_not_unreviewed(self):
         digest = "a" * 64
         launcher = self.base / "multithread"
-        answer = {"reviews": [{"seq": 7, "meta": {"binary_sha256": digest, "version": "9.9.9", "surface_sha256": "c" * 64,
-                                                  "plugins": "none", "agents": "Explore,claude"}}]}
-        launcher.write_text("#!/bin/sh\necho '" + json.dumps(answer) + "'\n")
-        launcher.chmod(0o755)
-        self.assertEqual({"version": "9.9.9", "surface_sha256": "c" * 64, "plugins": [], "agents": ["Explore", "claude"],
+        surface = claude_review.BUILT_IN["0" * 64]["surface_sha256"]
+        def answer(**changes):
+            meta = {"binary_sha256": digest, "version": "9.9.9", "surface_sha256": surface, "plugins": "none",
+                    "agents": "claude", **changes}
+            launcher.write_text("#!/bin/sh\necho '" + json.dumps({"reviews": [{"seq": 7, "meta": meta}]}) + "'\n")
+            launcher.chmod(0o755)
+        answer()
+        self.assertEqual({"version": "9.9.9", "surface_sha256": surface, "plugins": [], "agents": ["claude"],
                           "source": "ledger:7"}, claude_review.reviewed(digest, launcher, self.base))
+        # A record admits nothing a hand review did not cover, however it was written.
+        for changes in ({"surface_sha256": "c" * 64}, {"agents": "claude,mailer"}, {"plugins": "cc-plugin-mail"}):
+            with self.subTest(record=changes):
+                answer(**changes)
+                with self.assertRaisesRegex(claude_review.ReviewError, "no hand review covered"):
+                    claude_review.reviewed(digest, launcher, self.base)
+        answer()
         self.assertIsNone(claude_review.reviewed("d" * 64, launcher, self.base))
         launcher.write_text("#!/bin/sh\necho 'ledger unavailable' >&2\nexit 3\n")
         with self.assertRaisesRegex(claude_review.ReviewError, "could not be read"):

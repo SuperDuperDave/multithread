@@ -106,8 +106,15 @@ def reviewed(digest, launcher, repo):
         meta = event.get("meta") if isinstance(event, dict) else None
         if isinstance(meta, dict) and meta.get("binary_sha256") == digest:
             names = lambda key: [] if meta.get(key) == "none" else str(meta.get(key, "")).split(",")
-            return {"version": meta.get("version"), "surface_sha256": meta.get("surface_sha256"),
-                    "plugins": names("plugins"), "agents": names("agents"), "source": f"ledger:{event.get('seq')}"}
+            record = {"version": meta.get("version"), "surface_sha256": meta.get("surface_sha256"),
+                      "plugins": names("plugins"), "agents": names("agents"), "source": f"ledger:{event.get('seq')}"}
+            # A record admits nothing a hand review did not cover: a known surface, no new built-ins.
+            anchors = [entry for entry in BUILT_IN.values() if entry["surface_sha256"] == record["surface_sha256"]]
+            if not anchors or not (set(record["plugins"]) <= {p for a in anchors for p in a["plugins"]}
+                                   and set(record["agents"]) <= {g for a in anchors for g in a["agents"]}):
+                raise ReviewError(f"The recorded review ({record['source']}) claims a restricted surface or built-ins no "
+                                  "hand review covered.")
+            return record
     return None
 
 
@@ -142,15 +149,16 @@ def _canary_call(binary, out, model, restricted):
             frames.append(json.loads(line))
         except ValueError:
             pass
-    init = next((f for f in frames if f.get("type") == "system" and f.get("subtype") == "init"), {})
-    result = next((f for f in frames if f.get("type") == "result"), {})
+    inits = [f for f in frames if f.get("type") == "system" and f.get("subtype") == "init"]
+    results = [f for f in frames if f.get("type") == "result"]
+    init, result = (inits[0] if inits else {}), (results[0] if results else {})
     names = lambda field, key=None: sorted(item.get(key) if key and isinstance(item, dict) else item
                                            for item in init.get(field) or [])
     return {"exit": answer.returncode, "version": init.get("claude_code_version"),
             "tools": names("tools"), "mcp_servers": names("mcp_servers", "name"),
             "plugins": names("plugins", "name"), "agents": names("agents"),
             "fired": sorted(name for name, marker in markers.items() if marker.exists()),
-            "answered": bool(result.get("result")) and not result.get("is_error")}
+            "answered": bool(result.get("result")) and not result.get("is_error") and len(inits) == len(results) == 1}
 
 
 def review(provider, out, model=DEFAULT_MODEL):

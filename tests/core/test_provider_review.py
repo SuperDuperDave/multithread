@@ -23,6 +23,8 @@ REPORT = {
     "version": "9.9.9", "surface_sha256": "c" * 64, "plugins": ["cc-plugin-telemetry"], "agents": ["claude", "Explore"],
     "control_fired": ["project-hook", "local-hook", "mcp-server"], "restricted_fired": [], "verdict": "pass",
     "reasons": [], "model": "fixture",
+    "control": {"exit": 0, "fired": ["local-hook", "mcp-server", "project-hook"]},
+    "restricted": {"exit": 0, "version": "9.9.9", "tools": [], "mcp_servers": [], "fired": [], "answered": True},
 }
 
 
@@ -61,12 +63,25 @@ class ProviderReviewTests(unittest.TestCase):
     def test_only_a_pass_whose_control_fired_every_canary_and_restricted_none_is_recorded(self):
         cases = {
             "needs review": ({"verdict": "needs_review"}, "only a passing"),
-            "silent control": ({"control_fired": ["project-hook", "local-hook"]}, "control fired every canary"),
-            "restricted fired": ({"restricted_fired": ["mcp-server"]}, "fired no canary"),
+            # Self-consistent reports, so the protocol's own rule decides.
+            "silent control": ({"control_fired": ["project-hook", "local-hook"],
+                                "control": {"exit": 0, "fired": ["local-hook", "project-hook"]}},
+                               "control fired every canary"),
+            "restricted fired": ({"restricted_fired": ["mcp-server"],
+                                  "restricted": {**REPORT["restricted"], "fired": ["mcp-server"]}}, "fired no canary"),
             "other provider": ({"provider": "codex"}, "claude only"),
             "short digest": ({"binary_sha256": "abc"}, "SHA-256"),
-            "odd version": ({"version": "latest"}, "MAJOR.MINOR.PATCH"),
+            "odd version": ({"version": "latest", "restricted": {**REPORT["restricted"], "version": "latest"}},
+                            "MAJOR.MINOR.PATCH"),
             "names not a list": ({"agents": "claude"}, "arrays of names"),
+            # A claimed pass whose own runs say otherwise (found in Sol's pre-review).
+            "contradicted control": ({"control": {"exit": 0, "fired": []}}, "agree with its own runs"),
+            "contradicted restricted": ({"restricted": {**REPORT["restricted"], "fired": ["mcp-server"]}},
+                                        "agree with its own runs"),
+            "restricted tools": ({"restricted": {**REPORT["restricted"], "tools": ["Bash"]}}, "agree with its own runs"),
+            "unanswered": ({"restricted": {**REPORT["restricted"], "answered": False}}, "agree with its own runs"),
+            "reasons kept": ({"reasons": ["the binary changed during its review"]}, "agree with its own runs"),
+            "no runs": ({"control": None}, "agree with its own runs"),
         }
         with self.store() as store:
             for name, (change, why) in cases.items():
