@@ -981,6 +981,33 @@ class ClaudeProtocolTests(unittest.TestCase):
                 self.assertEqual(("uncertain", None), (envelope["state"], envelope["result"]))
                 self.assertNotIn("partial_result", envelope)
 
+    @staticmethod
+    def tool_frame(block_type="tool_use", name="Bash"):
+        return {"type": "assistant", "uuid": str(uuid.uuid4()), "session_id": SESSION, "parent_tool_use_id": None,
+                "message": {"id": "msg_tool", "role": "assistant", "model": "fixture",
+                            "content": [{"type": block_type, "id": "toolu_1", "name": name, "input": {}}]}}
+
+    def test_every_restricted_fault_kills_at_once(self):
+        # Faults outside the registry check took the ordinary grace before (independent Claude review, 0.4.23).
+        cases = {"cwd outside the checkout": [{"emit": self.restricted(cwd="/elsewhere", tools=["Bash"])}],
+                 "server tool block": [{"emit": self.restricted()}, {"emit": self.tool_frame("server_tool_use", "web_search")}],
+                 "mcp tool block": [{"emit": self.restricted()}, {"emit": self.tool_frame("mcp_tool_use", "send")}]}
+        for name, frames in cases.items():
+            with self.subTest(case=name):
+                started = time.monotonic()
+                envelope, _, process = self.run_native([{"read": 1}, *frames, {"sleep": 8}, {"emit": result()}], tools=[])
+                self.assertLess(time.monotonic() - started, 4)
+                self.assertEqual(-signal.SIGKILL, process.wait(timeout=5))
+                self.assertEqual(("uncertain", None), (envelope["state"], envelope["result"]))
+
+    def test_no_answer_text_survives_a_late_fault(self):
+        envelope, directory, _ = self.run_native(
+            [{"read": 1}, {"emit": self.restricted()}, {"emit": result("THE ANSWER TEXT")},
+             {"emit": self.tool_frame()}, {"sleep": 8}], tools=[])
+        self.assertEqual(("uncertain", None), (envelope["state"], envelope["result"]))
+        self.assertNotIn("THE ANSWER TEXT", json.dumps(envelope))
+        self.assertTrue(envelope["native_results"][0]["has_result_text"], "what happened stays visible, not what was said")
+
     def test_activity_outside_the_registry_fails_closed(self):
         tool_use = {"type": "assistant", "uuid": str(uuid.uuid4()), "session_id": SESSION, "parent_tool_use_id": None,
                     "message": {"id": "msg_tool", "role": "assistant", "model": "fixture",

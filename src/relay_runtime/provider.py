@@ -485,6 +485,7 @@ def _claude_config_home(cwd):
 # while one normally answers in 40 ms); a read that hangs or fails is retried after these pauses.
 _REG_BACKOFF = (0.2, 0.5, 1.0)
 _REG_TIMEOUT = 3
+_HIVES = {"HKLM": "HKEY_LOCAL_MACHINE", "HKCU": "HKEY_CURRENT_USER"}
 
 
 def _reg_query(parent):
@@ -504,9 +505,17 @@ def _reg_query(parent):
         except OSError as exc:
             failure = exc.strerror or type(exc).__name__
             continue
-        if answer.returncode == 0:
-            return answer.stdout.decode("utf-8", "replace").splitlines(), None
-        failure = f"exit {answer.returncode}"
+        if answer.returncode != 0:
+            failure = f"exit {answer.returncode}"
+            continue
+        # A listing counts only if it lists subkeys of this parent (value lines are indented); an empty or
+        # unrecognized answer is a failed read, retried, and refuses if it never recovers.
+        listed = answer.stdout.decode("utf-8", "replace").splitlines()
+        full = _HIVES[parent.split("\\", 1)[0]] + "\\" + parent.split("\\", 1)[1]
+        keys = [line.strip() for line in listed if line.strip() and not line[:1].isspace()]
+        if keys and all(key.lower().startswith(full.lower() + "\\") for key in keys):
+            return listed, None
+        failure = "no recognizable listing"
     return None, failure
 
 
@@ -800,20 +809,33 @@ def _record_refusal(target, envelope):
         fd = os.open(target, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     except OSError:
         return
+    message = envelope.get("message")
+    temporary = None
     try:
         info = os.fstat(fd)
         if info.st_uid != os.getuid() or os.listdir(fd):
             return
         envelope["evidence_directory"] = str(target)
+        envelope["message"] = ((message + " " if message else "") + f"This refusal's record is in {target}; "
+                               "a retry needs a new --output-dir.")
         body = json.dumps(envelope, ensure_ascii=True, sort_keys=True).encode("utf-8")
-        out = os.open("result.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=fd)
+        temporary = ".result.json.partial"
+        out = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=fd)
         with os.fdopen(out, "wb") as stream:
             stream.write(body)
             stream.flush()
             os.fsync(stream.fileno())
+        os.rename(temporary, "result.json", src_dir_fd=fd, dst_dir_fd=fd)
+        temporary = None
     except OSError:
         envelope.pop("evidence_directory", None)
+        envelope["message"] = message
     finally:
+        if temporary is not None:
+            try:
+                os.unlink(temporary, dir_fd=fd)
+            except OSError:
+                pass
         os.close(fd)
 
 

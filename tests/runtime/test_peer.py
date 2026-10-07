@@ -1236,6 +1236,12 @@ class PeerTests(unittest.TestCase):
                                  sources(keys=dict(listing, **{hkcu: answer})))
         # WSL's bridge to Windows fails a call now and then (a live training step was refused by one); a read
         # that recovers on a retry decides alone, and a policy key found on the retry still refuses.
+        # A success that lists nothing recognizable is a failed read, retried; it refuses if it never recovers.
+        for garbled in ([0, ""], [0, "\r\nERROR: something else\r\n"], [0, "\r\nHKEY_LOCAL_MACHINE\\SOFTWARE\\Other\r\n"]):
+            with self.subTest(listing=garbled[1]):
+                self.assertEqual([hkcu + "\\ClaudeCode (unreadable after 4 attempts: no recognizable listing)"],
+                                 sources(keys=dict(listing, **{hkcu: garbled})))
+        self.assertEqual([], sources(keys=dict(listing, **{hkcu: [[0, ""], listing[hkcu]]})))
         transient = [[1, ""], listing[hkcu]]
         self.assertEqual([], sources(keys=dict(listing, **{hkcu: transient})))
         found_late = [[1, ""], [1, ""], [1, ""], [0, "\r\nHKEY_CURRENT_USER\\SOFTWARE\\Policies\\ClaudeCode\r\n"]]
@@ -1282,10 +1288,12 @@ class PeerTests(unittest.TestCase):
                 process.poll.return_value = polled
                 envelope = {"partial_result": "words written before the fault"}
                 driver = claude_peer._Driver(process, b"task", str(self.repo), None, envelope, 1, None, tools=[])
+                driver.results = [{"result_excerpt": "THE ANSWER", "result_excerpt_truncated": False}]
                 with mock.patch.object(claude_peer.os, "killpg") as killpg:
-                    error = driver.fault("outside the registry")
-                self.assertIsInstance(error, claude_peer.ProtocolError)
+                    self.assertIsInstance(driver.fault("outside the registry"), claude_peer.ProtocolError)
+                    driver.problem("outside the registry")  # every fault of a restricted call ends here
                 self.assertNotIn("partial_result", envelope)
+                self.assertIsNone(driver.results[0]["result_excerpt"])
                 self.assertEqual(signalled, killpg.called)
 
     def test_the_cli_keywords_for_every_tool_are_not_tool_names(self):
@@ -1301,6 +1309,8 @@ class PeerTests(unittest.TestCase):
         self.assertNotEqual(0, code)
         self.assertEqual(result, json.loads((record / "result.json").read_text()))
         self.assertEqual((str(record), False), (result["evidence_directory"], result["provider_started"]))
+        self.assertIn(f"This refusal's record is in {record}; a retry needs a new --output-dir.", result["message"])
+        self.assertEqual(["result.json"], sorted(path.name for path in record.iterdir()))
         # Another call's directory is never reused, even for a refusal.
         (record / "result.json").write_text("another call")
         with mock.patch.object(peer, "_managed_claude_sources", return_value=["/etc/claude-code"]):

@@ -35,6 +35,8 @@ _MAX_UUIDS = 64
 _MAX_TEXT = 64 * 1024
 _MAX_PARTIAL = 64 * 1024
 _MAX_CONTROLS = 4096
+# What an assistant message may hold besides tool requests.
+_ANSWER_BLOCKS = frozenset({"text", "thinking", "redacted_thinking"})
 _ERROR_SUBTYPES = ("error_max_turns", "error_during_execution", "error_max_budget_usd",
                    "error_max_structured_output_retries")
 
@@ -321,10 +323,17 @@ class _Driver:
             self.control.set_target(session, None)
 
     def fault(self, message):
-        """A restricted session doing what its call did not allow: it already holds the task, so it is killed
-        now rather than given the ordinary shutdown grace, and nothing it wrote is kept as a partial answer."""
+        """A restricted session doing what its call did not allow; problem() stops it."""
+        self.registry_failed = True
+        return ProtocolError(message)
+
+    def stop_restricted(self):
+        """Every fault of a restricted call ends here: the session already holds the task, so it is killed now
+        rather than given the ordinary shutdown grace, and no answer text it wrote is kept anywhere."""
         self.registry_failed = True
         self.envelope.pop("partial_result", None)
+        for record in self.results:
+            record["result_excerpt"], record["result_excerpt_truncated"] = None, False
         try:
             # The provider leads its own session; once the leader is reaped its group ID may be reused, so only
             # an unreaped leader's group is signalled (the ordinary cleanup handles what remains).
@@ -332,7 +341,6 @@ class _Driver:
                 os.killpg(self.process.pid, signal.SIGKILL)
         except (ProcessLookupError, PermissionError, AttributeError, TypeError):
             pass
-        return ProtocolError(message)
 
     def registry(self, value):
         """Record what the session reports it can do; anything outside the reviewed set fails closed."""
@@ -414,9 +422,10 @@ class _Driver:
             # Reasoning and tool blocks are progress, not the turn's answer.
             if block["type"] == "text" and isinstance(block.get("text"), str):
                 text.append(block["text"])
-            if block["type"] == "tool_use":
+            if block["type"] not in _ANSWER_BLOCKS:
                 self.tool_requests += 1
-                if self.tools is not None and block.get("name") not in self.tools:
+                # Server and MCP tool blocks are tool requests too; a restricted call allows only its own tools.
+                if self.tools is not None and (block["type"] != "tool_use" or block.get("name") not in self.tools):
                     raise self.fault("The session requested a tool outside the requested registry; this call "
                                         "fails closed. Inspect retained output.")
         self.assistant_messages += 1
@@ -461,8 +470,8 @@ class _Driver:
                   "terminal_reason": value.get("terminal_reason") if identity(value.get("terminal_reason")) else None,
                   "duration_ms": measurements["provider_duration_ms"],
                   "has_result_text": isinstance(text, str),
-                  "result_excerpt": text[:2000] if isinstance(text, str) else None,
-                  "result_excerpt_truncated": isinstance(text, str) and len(text) > 2000,
+                  "result_excerpt": text[:2000] if isinstance(text, str) and not self.registry_failed else None,
+                  "result_excerpt_truncated": isinstance(text, str) and len(text) > 2000 and not self.registry_failed,
                   "usage_scope": "this native turn", "usage": measurements["usage"],
                   "cumulative_cost_usd": measurements["estimated_cost_usd"]}
         if observation.get("measurement_errors"):
@@ -574,6 +583,7 @@ class _Driver:
             # any fault, even after the result and during cleanup, revokes it.
             self.revoked = True
             self.outcome_recorded = False
+            self.stop_restricted()
         if not self.outcome_recorded:
             self.envelope.update(state="uncertain", result=None)
         self.envelope.update(needs_attention=True, message=message)
