@@ -55,6 +55,16 @@ SIGNAL_KINDS = tuple(
 )
 
 
+#: Spellings callers reach for, accepted as the command they mean.
+COMMAND_ALIASES = {"ack": "acknowledge", "role": "roles"}
+
+
+def parse(parser: argparse.ArgumentParser, argv: Sequence[str]) -> argparse.Namespace:
+    args = parser.parse_args(argv)
+    args.command = COMMAND_ALIASES.get(args.command, args.command)
+    return args
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="multithread",
@@ -74,7 +84,8 @@ def build_parser() -> argparse.ArgumentParser:
     signal = commands.add_parser("signal", help="emit a bounded work signal")
     signal.add_argument("kind", choices=SIGNAL_KINDS)
     _add_actor(signal)
-    signal.add_argument("--summary", required=True)
+    signal.add_argument("--summary", required=True,
+                        help="one line of at most 500 characters; put detail in the artifact")
     signal.add_argument("--work-id")
     signal.add_argument(
         "--target",
@@ -145,7 +156,8 @@ def build_parser() -> argparse.ArgumentParser:
     inbox.add_argument("--after", type=int, default=0, help="sequence cursor; starts oldest first")
     inbox.add_argument("--limit", type=int, default=BRIEF_DEFAULT_LIMIT)
 
-    roles = commands.add_parser("roles", help="show role holder, charter, scope and original-binding wake history")
+    roles = commands.add_parser("roles", aliases=["role"],
+                                help="show role holder, charter, scope and original-binding wake history")
     roles.add_argument("role", nargs="?")
     roles.add_argument("--history", action="store_true")
     roles.add_argument("--ref")
@@ -181,7 +193,8 @@ def build_parser() -> argparse.ArgumentParser:
     decision_request.add_argument("--decision-id", required=True)
     decision_request.add_argument("--work-id", required=True)
     decision_request.add_argument("--scope", required=True)
-    decision_request.add_argument("--summary", required=True)
+    decision_request.add_argument("--summary", required=True,
+                                  help="one line of at most 300 characters; put detail in the artifact")
     decision_request.add_argument("--artifact", required=True)
     decision_request.add_argument(
         "--authority-hint",
@@ -224,7 +237,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     acknowledge = commands.add_parser(
-        "acknowledge", help="append delivery acknowledgement for one inbox signal"
+        "acknowledge", aliases=["ack"], help="append delivery acknowledgement for one inbox signal"
     )
     acknowledge.add_argument("seq", type=int)
     _add_actor(acknowledge)
@@ -383,7 +396,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if "--json" in raw_argv:
         raw_argv = [item for item in raw_argv if item != "--json"]
         raw_argv.insert(0, "--json")
-    args = parser.parse_args(raw_argv)
+    args = parse(parser, raw_argv)
     if args.command == "hook":
         return _run_hook(args)
 

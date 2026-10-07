@@ -669,11 +669,11 @@ def main(argv=None, *, registry=None, command_alias_check=None):
     if boundary < len(raw) and raw[boundary] == "signal" and "--wake" in raw[boundary + 1:]:
         # Record-then-wake is a runtime helper: parse only the global prefix here.
         # The signal's own syntax is validated by the helper and then the ledger.
-        args = parser.parse_args(raw[:boundary] + ["wake"])
+        args = core_cli.parse(parser, raw[:boundary] + ["wake"])
         args.command, args.provider_args = "signal-wake", raw[boundary + 1:]
     else:
         helper = boundary < len(raw) and raw[boundary] in {"agent", "bind", "hooks", "setup", "update", "wake", "observe"}
-        args = parser.parse_args(raw[:boundary + 1] if helper else raw)
+        args = core_cli.parse(parser, raw[:boundary + 1] if helper else raw)
         if helper:
             args.provider_args = raw[boundary + 1:]
     # Provider settings live where the provider reads them; capture that before

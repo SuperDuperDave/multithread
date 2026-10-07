@@ -69,6 +69,7 @@ class ClaudeIntegrationTests(unittest.TestCase):
               mock.patch.object(control.CallControl, 'set_target', advertise)):
             code = peer.peer_main(arguments)
         value = json.loads(output.getvalue())
+        self.assertTrue((directory/'result.json').exists(), value.get('message'))  # a refusal names its reason
         self.assertEqual(value, json.loads((directory/'result.json').read_text()))
         self.assertIsNotNone(value['process_exit_code'])
         self.assertEqual('not_checked', value['workflow_completion'])

@@ -690,7 +690,8 @@ def normalize_event(raw: Mapping[str, Any], *, internal: bool = False) -> Event:
                 f"{kind} requires an immutable git:<40-hex> artifact"
             )
         if len(summary) > 300:
-            raise ValidationError(f"{kind} summary exceeds 300 characters")
+            raise ValidationError(f"{kind} summary exceeds 300 characters ({len(summary)} given, "
+                                  f"{len(summary) - 300} over)")
         expected_route = (
             ("claude", "codex")
             if kind == "decision.requested"
@@ -1018,7 +1019,7 @@ def _one_line(name: str, value: Any, maximum: int) -> str:
     if not text:
         raise ValidationError(f"{name} must not be empty")
     if len(text) > maximum:
-        raise ValidationError(f"{name} exceeds {maximum} characters")
+        raise ValidationError(f"{name} exceeds {maximum} characters ({len(text)} given, {len(text) - maximum} over)")
     if any(ch in text for ch in ("\x00", "\r", "\n")):
         raise ValidationError(f"{name} must be one line and contain no NUL")
     if any(unicodedata.category(ch) in {"Cc", "Cf"} for ch in text):

@@ -336,7 +336,11 @@ class _Directory:
         if (not stat.S_ISDIR(info.st_mode)
                 or info.st_uid not in (0, os.getuid())
                 or (self.account and info.st_uid != os.getuid())):
-            raise EnrollmentError("directory ancestry is not controlled by this account or root")
+            owner = "a non-directory" if not stat.S_ISDIR(info.st_mode) else f"owner uid {info.st_uid}"
+            raise EnrollmentError(
+                f"directory ancestry is not controlled by this account or root: {str(self.path)!r} has {owner}. "
+                "Inside a sandbox that remaps file ownership (Codex's does), run multithread through the host's "
+                "approved route outside it; otherwise the named directory must be owned by you or root.")
         if _unsafe_mode(self.path, info, self.private):
             raise UnsafeDirectory(self.path, stat.S_IMODE(info.st_mode), self.private)
 
