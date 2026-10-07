@@ -7,6 +7,7 @@ workflow completion. Provider configuration comes from the installed worker.
 """
 
 import argparse
+from collections import Counter
 from contextlib import contextmanager
 import hashlib
 import json
@@ -512,6 +513,157 @@ def _managed_claude_sources(cwd):
     return found
 
 
+# A Codex peer's tools may read only what the call names; nothing else of this account.
+_PEER_READ_PROFILE = "multithread-peer-read"
+_CANARY_PROBE_SECONDS = 30
+# One -c argument is bounded by the kernel (128 KiB); hidden paths beyond this budget collapse into their directory.
+_HIDDEN_BUDGET = 96 * 1024
+_CODEX_INSTRUCTIONS = ("AGENTS.override.md", "AGENTS.md")  # what Codex loads from a checkout's root
+
+
+def _git_lines(repo, *arguments):
+    try:
+        answer = subprocess.run(["git", "-C", str(repo), *arguments], stdin=subprocess.DEVNULL,
+                                capture_output=True, timeout=15, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if answer.returncode != 0:
+        return None
+    return [os.fsdecode(line) for line in answer.stdout.split(b"\0" if "-z" in arguments else b"\n") if line]
+
+
+def _hidden_paths(repo):
+    """What Git ignores in the checkout (private mounts, ledgers, local configuration), as relative paths.
+
+    Over-hiding is the safe direction: past the budget, the directory holding the most hidden paths is hidden whole.
+    """
+    listed = _git_lines(repo, "ls-files", "-z", "--others", "--ignored", "--exclude-standard", "--directory")
+    if listed is None:
+        raise LaunchError("Git could not list what this checkout ignores, so a Codex peer's read scope cannot hide "
+                          "it. No provider was started.")
+    hidden = _outermost(path.rstrip("/") for path in listed)
+    root = os.path.realpath(repo)
+    while sum(len(json.dumps(os.path.join(root, path))) + 12 for path in hidden) > _HIDDEN_BUDGET:
+        parents = Counter(os.path.dirname(path) for path in hidden if os.path.dirname(path))
+        if not parents:
+            raise LaunchError(f"This checkout ignores {len(hidden)} top-level paths, more than a Codex peer's read "
+                              "scope can hide. No provider was started.")
+        folder = max(parents, key=lambda name: (parents[name], name))
+        hidden = _outermost([*hidden, folder])
+    return hidden
+
+
+def _outermost(paths):
+    """Sorted paths without any that lie inside another: a hidden directory already hides what it holds, and the
+    sandbox cannot mount inside a path it has hidden."""
+    kept = []
+    for path in sorted(set(paths), key=lambda path: path.split("/")):  # a folder sorts directly before its contents
+        if not kept or not path.startswith(kept[-1] + "/"):
+            kept.append(path)
+    return sorted(kept)
+
+
+def _escaping_links(repo, roots, ignored):
+    """Symbolic links in the checkout whose targets lie outside every readable root, ignored or not."""
+    listed = _git_lines(repo, "ls-files", "-z", "--cached", "--others", "--exclude-standard") or []
+    escaping = []
+    for path in sorted({*listed, *ignored}):
+        absolute = os.path.join(repo, path)
+        if path in ignored or os.path.islink(absolute):
+            target = os.path.realpath(absolute)
+            if not any(target == root or target.startswith(root.rstrip("/") + "/") for root in roots):
+                escaping.append(path)
+    return escaping
+
+
+def _codex_read_scope(provider, repo, named):
+    """Readable roots for a Codex peer, and the checkout's Git-ignored paths it must not see.
+
+    The roots are the checkout, its Git store, Codex's own executable directory and named paths. Codex's sandbox
+    helper re-executes Codex, so its directory must be readable; its home, with credentials, is not.
+    """
+    common = _git_lines(repo, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    roots = [os.path.realpath(repo), os.path.realpath(common[0]) if common else None,
+             str(Path(os.path.realpath(provider)).parent)]
+    hidden = _hidden_paths(repo)
+    for path in named:
+        resolved = os.path.realpath(path)
+        if not os.path.isabs(path) or not os.path.exists(resolved):
+            raise LaunchError(f"--read {path} must be an existing absolute path. No provider was started.")
+        inside = os.path.relpath(resolved, roots[0])
+        if inside in hidden:
+            hidden.remove(inside)
+        elif any(inside.startswith(path + "/") for path in hidden):
+            raise LaunchError(f"--read {path} lies inside a path this checkout ignores, which a Codex peer cannot "
+                              "see; name that ignored path itself. No provider was started.")
+        roots.append(resolved)
+    roots = [root for index, root in enumerate(roots) if root and root not in roots[:index]]
+    # The sandbox hides a path by mounting over it, which it cannot do through a link. An ignored path reached
+    # through a link is unreadable when its target lies outside the scope, which the check proves; otherwise the
+    # target's own visibility governs it.
+    direct = [path for path in hidden if os.path.realpath(os.path.join(roots[0], path)) == os.path.join(roots[0], path)]
+    scope = {"roots": roots, "hidden": direct, "linked": [path for path in hidden if path not in direct]}
+    # Codex refuses to start a thread whose project instructions it may not read; private ones are left out.
+    names = [name for name in _CODEX_INSTRUCTIONS if os.path.lexists(os.path.join(roots[0], name))]
+    scope["project_instructions"] = ("hidden" if any(not _readable(scope, os.path.join(roots[0], name)) for name in names)
+                                     else "visible" if names else "none")
+    return scope
+
+
+def _readable(scope, path):
+    """Whether a path resolves inside the scope's readable roots and outside its hidden paths."""
+    target = os.path.realpath(path)
+    inside = lambda root: target == root or target.startswith(root.rstrip("/") + "/")
+    hidden = [os.path.join(scope["roots"][0], path) for path in [*scope["hidden"], *scope["linked"]]]
+    return any(inside(root) for root in scope["roots"]) and not any(inside(path) for path in hidden)
+
+
+def _codex_read_arguments(scope):
+    entries = [json.dumps(path) + ' = "read"' for path in [":minimal", *scope["roots"]]]
+    entries += [json.dumps(os.path.join(scope["roots"][0], path)) + ' = "none"' for path in scope["hidden"]]
+    arguments = ["-c", f'default_permissions="{_PEER_READ_PROFILE}"',
+                 "-c", f"permissions.{_PEER_READ_PROFILE}.filesystem={{{', '.join(entries)}}}"]
+    if scope["project_instructions"] == "hidden":
+        arguments += ["-c", "project_doc_max_bytes=0"]
+    return arguments
+
+
+def _verify_codex_read_scope(provider, repo, scope, arguments):
+    """Before any task, inside the same profile: a fresh file outside the scope does not exist, the checkout reads,
+    and neither its ignored paths nor its links leading outside the scope can be read. Returns what was probed."""
+    links = _escaping_links(repo, scope["roots"], scope["linked"])
+    # The canary goes where peer evidence already goes, never into the caller's home, and must lie outside the scope.
+    canary = Path(tempfile.mkdtemp(prefix=".multithread-peer-canary-"))
+    if _readable({**scope, "hidden": [], "linked": []}, canary):
+        canary.rmdir()
+        raise LaunchError(f"The read-scope check needs a canary outside the scope, but the temporary directory {canary.parent} "
+                          "is inside it. No provider was started.")
+    try:
+        (canary / "canary").write_text("outside the peer's read scope\n")
+        probe = ('test ! -e "$1" || { echo "an outside file exists: $1"; exit 1; }; '
+                 'test -r "$2" || { echo "the checkout is unreadable: $2"; exit 1; }; '
+                 'shift 2; for path do test ! -r "$path" || { echo "a hidden path is readable: $path"; exit 1; }; done')
+        unseen = [os.path.join(repo, path) for path in [*scope["hidden"], *links]]
+        try:
+            answer = subprocess.run([provider, *arguments, "sandbox", "--", "sh", "-c", probe, "probe",
+                                     str(canary / "canary"), str(repo), *unseen],
+                                    cwd=repo, stdin=subprocess.DEVNULL, capture_output=True,
+                                    timeout=_CANARY_PROBE_SECONDS, check=False)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise LaunchError("The read-scope check could not run (" + str(exc) + "), so this Codex peer was not "
+                              "started.") from None
+        if answer.returncode != 0:
+            reported = (answer.stdout.decode("utf-8", "replace").strip()
+                        or answer.stderr.decode("utf-8", "replace").strip()[-512:] or "no reason given")[:512]
+            raise LaunchError(f"The read-scope check failed inside this call's Codex profile ({reported}). "
+                              "No provider was started.")
+    finally:
+        for path in sorted(canary.glob("*")):
+            path.unlink()
+        canary.rmdir()
+    return {"outside_file": "absent", "hidden_unreadable": len(scope["hidden"]), "escaping_links_unreadable": len(links)}
+
+
 def _restricted_end_clean(observer, envelope, completed):
     """A restricted result stands only on a positively observed normal end, fully observed and verified."""
     return (completed and observer is not None and observer.eof and observer.interpret and not observer.truncated
@@ -957,6 +1109,10 @@ def peer_main(argv=None, *, report_entry=None):
                         "no subagent tools), in restricted mode with no settings files, hooks, MCP servers, slash commands or skills. "
                         "Refused when managed Claude settings exist. The session's reported registry, version and surfaces are recorded; "
                         "anything outside the reviewed set, or activity outside the registry, returns no result")
+    parser.add_argument("--read", action="append", default=[], metavar="PATH",
+                        help="Codex only: one more existing absolute path the peer's tools may read; repeatable. A Codex peer "
+                             "otherwise reads only the checkout without what Git ignores there, its Git store and Codex's own release, "
+                             "checked before launch")
     parser.add_argument("--attach", action="append", default=[], metavar="IMAGE",
                         help="Claude only: attach a PNG, JPEG, GIF or WebP file to the task as an image; repeatable "
                              f"(at most {_MAX_ATTACHMENTS}, {_MAX_ATTACHMENT // (1024 * 1024)} MiB each, {_MAX_ATTACHMENTS_TOTAL // (1024 * 1024)} MiB in total)")
@@ -972,6 +1128,8 @@ def peer_main(argv=None, *, report_entry=None):
         parser.error("Codex already uses native streaming; --stream-progress is a Claude option")
     if args.client == "codex" and (args.tools is not None or args.attach):
         parser.error("--tools and --attach are Claude options")
+    if args.client == "claude" and args.read:
+        parser.error("--read is a Codex option; a Claude peer's reads are confined by --tools")
     if args.client == "claude" and args.resume is not None:
         try:
             _session(args.resume)
@@ -1093,7 +1251,13 @@ def _run_peer(args, interruption):
                                "--disable-slash-commands"])
             native.extend(["--resume" if args.resume else "--session-id", session])
         else:
-            native = [*plan["argv"], "app-server", "--listen", "stdio://"]
+            stage = "read_scope"
+            scope = _codex_read_scope(plan["argv"][0], plan["repo"], args.read)
+            confinement = _codex_read_arguments(scope)
+            envelope["read_scope"] = {"profile": _PEER_READ_PROFILE, "roots": scope["roots"], "hidden": scope["hidden"],
+                                      "project_instructions": scope["project_instructions"],
+                                      "verified": "not_checked"}
+            native = [*plan["argv"], *confinement, "app-server", "--listen", "stdio://"]
         envelope["repo"] = plan["repo"]
         if args.dry_run:
             # Readiness starts a provider (Codex's hook listing), which a dry run never
@@ -1107,6 +1271,10 @@ def _run_peer(args, interruption):
                               "task_sha256": hashlib.sha256(task).hexdigest(),
                               "timeout_seconds": args.timeout}, sort_keys=True))
             return 0
+        if args.client == "codex":
+            stage = "read_scope"
+            envelope["read_scope"]["verified"] = _verify_codex_read_scope(plan["argv"][0], plan["repo"], scope,
+                                                                          confinement)
         stage = "evidence_setup"
         if args.output_dir is None:
             directory = Path(tempfile.mkdtemp(prefix="relay-peer-"))

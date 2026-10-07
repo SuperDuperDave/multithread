@@ -76,11 +76,13 @@ assert os.getcwd() == '/tmp/project'
 assert os.environ['HOME'] == '/tmp/foreign-home'
 assert not pathlib.Path('/source').exists() and not pathlib.Path('/bundle').exists()
 args = sys.argv[1:]
+if 'sandbox' in args:
+    raise SystemExit(0)  # the read-scope probe, answered as a confining sandbox
 client = 'codex' if 'app-server' in args else 'claude'
 if client == 'codex':
     hooks = {}
     for i, arg in enumerate(args):
-        if arg == '-c': hooks.update(tomllib.loads(args[i+1])['hooks'])
+        if arg == '-c': hooks.update(tomllib.loads(args[i+1]).get('hooks', {}))
     session, turn = 'native-codex-fixture', 'native-turn-fixture'
 else:
     assert args[args.index('--output-format')+1] == 'stream-json'
@@ -254,9 +256,10 @@ assert call(base + ["events"]) == events
 assert snapshot(settings) == before_settings and snapshot(foreign) == before_foreign
 assert snapshot(home / ".local/share/relay/enrollments") == before_registry
 assert call(base + ["peer", "report", "--call-dir", str(evidence)]) == report
-pathlib.Path('/tmp/fake-stream.py').write_text(stream_source)
-stream_provider = pathlib.Path('/tmp/fake-stream')
-stream_provider.write_text('#!/bin/sh\nexec /usr/bin/python3 -I -S -B /tmp/fake-stream.py "$@"\n')
+pathlib.Path('/tmp/fake-bin').mkdir()  # a provider's own directory is readable to its peer; keep it narrow
+pathlib.Path('/tmp/fake-bin/fake-stream.py').write_text(stream_source)
+stream_provider = pathlib.Path('/tmp/fake-bin/fake-stream')
+stream_provider.write_text('#!/bin/sh\nexec /usr/bin/python3 -I -S -B /tmp/fake-bin/fake-stream.py "$@"\n')
 stream_provider.chmod(0o700)
 for client in ('codex', 'claude'):
     directory = pathlib.Path('/tmp/stream-' + client)

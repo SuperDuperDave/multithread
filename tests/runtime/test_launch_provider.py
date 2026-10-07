@@ -536,6 +536,7 @@ class LaunchProviderTests(unittest.TestCase):
 
     def test_peer_codex_hook_names_the_account_entry_whatever_spelling_selects_it(self):
         relay, multithread = self.account_entries()
+        subprocess.run(["git", "init", "-q", str(self.repo)], check=True)  # a Codex peer's read scope needs Git
         task = self.base / "task.txt"
         task.write_text("Review.\n")
         expected = self.configuration("codex", multithread)
@@ -547,8 +548,10 @@ class LaunchProviderTests(unittest.TestCase):
                                      "--dry-run", "--json"])
         self.assertEqual(0, code, output.getvalue())
         value = json.loads(output.getvalue())
-        self.assertEqual([str(self.provider), *expected["native_arguments"], "app-server", "--listen", "stdio://"],
-                         value["argv"])
+        native = [str(self.provider), *expected["native_arguments"]]
+        self.assertEqual(native, value["argv"][:len(native)])
+        self.assertEqual(["-c", 'default_permissions="multithread-peer-read"'], value["argv"][len(native):len(native) + 2])
+        self.assertEqual(["app-server", "--listen", "stdio://"], value["argv"][-3:])
 
     def test_claude_hook_keeps_the_launcher_spelling_it_was_given(self):
         relay, multithread = self.account_entries()

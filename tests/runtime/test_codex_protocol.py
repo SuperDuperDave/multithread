@@ -54,6 +54,12 @@ SERVER = r'''
 import json, os, sys, time
 from pathlib import Path
 spec = json.loads(Path(SPEC_PATH).read_text())
+if 'sandbox' in sys.argv:
+    # The read-scope probe: record it, and answer as a confining (0) or leaking (1) sandbox.
+    with open(SPEC_PATH + '.sandbox', 'a') as stream:
+        stream.write(json.dumps({'argv': sys.argv, 'cwd': os.getcwd()}) + '\n')
+    sys.stdout.write(spec.get('sandbox_stdout', ''))
+    raise SystemExit(spec.get('sandbox_exit', 0))
 with open(CALLS_PATH, 'a') as stream:
     stream.write('call\n')
 Path(RECEIPT_PATH).write_text(json.dumps({
@@ -218,6 +224,7 @@ class CodexProtocolTests(unittest.TestCase):
         self.base = Path(temporary.name)
         self.repo = self.base / "checkout 雪 ;$(touch injected)"
         self.repo.mkdir()
+        subprocess.run(["git", "init", "-q", str(self.repo)], check=True)
         self.relay = self.base / "relay entry"
         # Codex accepts only the account launcher; this fixture stands in for it.
         launcher = mock.patch.object(peer, "account_launcher", return_value=self.relay)
@@ -280,6 +287,16 @@ class CodexProtocolTests(unittest.TestCase):
         self.last_diagnostic = stderr.getvalue()
         return code, json.loads(stdout.getvalue()), directory
 
+    @staticmethod
+    def confinement(result):
+        """The read-scope arguments the call records for itself."""
+        scope = result["read_scope"]
+        entries = [json.dumps(root) + ' = "read"' for root in [":minimal", *scope["roots"]]]
+        entries += [json.dumps(os.path.join(scope["roots"][0], path)) + ' = "none"' for path in scope["hidden"]]
+        hidden_instructions = ["-c", "project_doc_max_bytes=0"] if scope["project_instructions"] == "hidden" else []
+        return ["-c", 'default_permissions="multithread-peer-read"',
+                "-c", "permissions.multithread-peer-read.filesystem={" + ", ".join(entries) + "}", *hidden_instructions]
+
     def recorded_requests(self):
         return [json.loads(line) for line in self.requests.read_text().splitlines()]
 
@@ -311,7 +328,7 @@ class CodexProtocolTests(unittest.TestCase):
         self.assertEqual("not_checked", result["relay_acknowledgement"])
         self.assertEqual("not_checked", result["workflow_completion"])
         receipt = json.loads(self.receipt.read_text())
-        self.assertEqual([str(self.provider), *self.native_arguments, "app-server", "--listen", "stdio://"], receipt["argv"])
+        self.assertEqual([str(self.provider), *self.native_arguments, *self.confinement(result), "app-server", "--listen", "stdio://"], receipt["argv"])
         self.assertEqual(self.environment, receipt["env"])
         self.assertEqual(str(self.repo), receipt["cwd"])
         requests = self.recorded_requests()
@@ -647,7 +664,7 @@ class CodexProtocolTests(unittest.TestCase):
         self.assertEqual((MODEL, EFFORT, "unknown"),
                          (dry["requested_model"], dry["requested_effort"], dry["effective_effort"]))
         # Both settings travel in the turn request, never as native arguments.
-        self.assertEqual([str(self.provider), *self.native_arguments, "app-server", "--listen", "stdio://"],
+        self.assertEqual([str(self.provider), *self.native_arguments, *self.confinement(dry), "app-server", "--listen", "stdio://"],
                          dry["argv"])
         self.assertFalse(self.calls.exists())
         # Claude keeps its own list; neither provider takes an option-like or spaced name.
@@ -798,7 +815,7 @@ class CodexProtocolTests(unittest.TestCase):
             self.assertEqual("ready", result["hook_readiness"]["state"])
             receipt = json.loads(self.receipt.read_text())
             # No invocation copy beside the user hooks: each event runs once.
-            self.assertEqual([str(self.provider), "app-server", "--listen", "stdio://"], receipt["argv"])
+            self.assertEqual([str(self.provider), *self.confinement(result), "app-server", "--listen", "stdio://"], receipt["argv"])
             self.configure(hook_updates={**user, "trustStatus": "untrusted"})
             code, result, _ = self.invoke()
             self.assertNotEqual(0, code)
@@ -1433,6 +1450,135 @@ class CodexProtocolTests(unittest.TestCase):
         self.assertNotIn("result", response)
         self.assertTrue(result["needs_attention"])
 
+
+    # --- read scope -------------------------------------------------------
+
+    def probes(self):
+        return [json.loads(line) for line in Path(str(self.specification) + ".sandbox").read_text().splitlines()]
+
+    def test_a_codex_peer_reads_only_its_checkout_and_named_paths_checked_before_launch(self):
+        named = self.base / "named reference"
+        named.mkdir()
+        code, result, directory = self.invoke("--read", str(named))
+        self.assertEqual(0, code, result)
+        checkout = os.path.realpath(self.repo)
+        self.assertEqual({"profile": "multithread-peer-read", "hidden": [], "project_instructions": "none",
+                          "roots": [checkout, os.path.join(checkout, ".git"), str(self.provider.parent),
+                                    os.path.realpath(named)],
+                          "verified": {"outside_file": "absent", "hidden_unreadable": 0,
+                                       "escaping_links_unreadable": 0}},
+                         result["read_scope"])
+        probes = self.probes()
+        self.assertEqual(1, len(probes))
+        argv = probes[0]["argv"]
+        self.assertEqual(self.confinement(result), argv[1:5])
+        self.assertEqual(["sandbox", "--", "sh", "-c"], argv[5:9])
+        canary, probed = argv[-2:]
+        self.assertEqual(str(self.repo), probed)
+        self.assertFalse(Path(canary).exists(), "the canary is removed after the check")
+        self.assertFalse(Path(canary).is_relative_to(self.environment["HOME"]), "the caller's home is never written")
+        self.assertFalse(any(Path(canary).is_relative_to(root) for root in result["read_scope"]["roots"]))
+        self.assertEqual(str(self.repo), probes[0]["cwd"])
+
+    def test_what_git_ignores_and_links_leaving_the_scope_are_hidden_and_probed(self):
+        (self.repo / ".gitignore").write_text("_sessions/\n.env\nPOLICY.md\n")
+        (self.repo / "_sessions").mkdir()
+        (self.repo / "_sessions" / "AGENTS.md").write_text("private method\n")
+        (self.repo / ".env").write_text("artificial=1\n")
+        elsewhere = tempfile.TemporaryDirectory(prefix="relay-codex-outside-", dir="/tmp")
+        self.addCleanup(elsewhere.cleanup)
+        outside = Path(elsewhere.name) / "outside.md"  # beyond every readable root, including the fixture's provider
+        outside.write_text("private shared policy\n")
+        (self.repo / "REPORTING.md").symlink_to(outside)
+        (self.repo / "POLICY.md").symlink_to(outside)  # ignored, and no mount can sit on a link: probed instead
+        (self.repo / "inside.md").symlink_to(self.repo / ".gitignore")
+        code, result, _ = self.invoke()
+        self.assertEqual(0, code, result)
+        self.assertEqual([".env", "_sessions"], result["read_scope"]["hidden"])
+        self.assertEqual({"outside_file": "absent", "hidden_unreadable": 2, "escaping_links_unreadable": 2},
+                         result["read_scope"]["verified"])
+        checkout = os.path.realpath(self.repo)
+        self.assertIn(json.dumps(os.path.join(checkout, "_sessions")) + ' = "none"', self.confinement(result)[3])
+        probed = self.probes()[0]["argv"][-4:]
+        self.assertEqual([os.path.join(str(self.repo), name) for name in (".env", "_sessions", "POLICY.md", "REPORTING.md")],
+                         probed)
+
+    def test_hidden_paths_past_the_budget_collapse_into_their_busiest_directory(self):
+        (self.repo / ".gitignore").write_text("*.png\n")
+        shots = self.repo / "shots"
+        shots.mkdir()
+        (shots / "notes.md").write_text("tracked\n")
+        for index in range(40):
+            (shots / f"capture-{index:02}.png").write_bytes(b"x")
+        (self.repo / "cover.png").write_bytes(b"x")
+        with mock.patch.object(peer, "_HIDDEN_BUDGET", 2048):
+            code, result, _ = self.invoke()
+        self.assertEqual(0, code, result)
+        self.assertEqual(["cover.png", "shots"], result["read_scope"]["hidden"], "over-hiding is the safe direction")
+
+    def test_private_project_instructions_are_left_out_and_public_ones_kept(self):
+        # Codex refuses to start a thread whose AGENTS.md it may not read.
+        (self.repo / ".gitignore").write_text("_sessions/\n")
+        (self.repo / "_sessions").mkdir()
+        (self.repo / "_sessions" / "AGENTS.md").write_text("private method\n")
+        (self.repo / "AGENTS.md").symlink_to("_sessions/AGENTS.md")
+        code, result, _ = self.invoke()
+        self.assertEqual(0, code, result)
+        self.assertEqual("hidden", result["read_scope"]["project_instructions"])
+        argv = json.loads(self.receipt.read_text())["argv"]
+        self.assertEqual(["-c", "project_doc_max_bytes=0", "app-server"], argv[argv.index("app-server") - 2:][:3])
+        (self.repo / "AGENTS.md").unlink()
+        (self.repo / "AGENTS.md").write_text("public guidance\n")
+        code, result, _ = self.invoke()
+        self.assertEqual(0, code, result)
+        self.assertEqual("visible", result["read_scope"]["project_instructions"])
+        self.assertNotIn("project_doc_max_bytes=0", json.loads(self.receipt.read_text())["argv"])
+
+    def test_a_scope_holding_the_temporary_directory_cannot_be_checked_so_refuses(self):
+        code, result, _ = self.invoke("--read", tempfile.gettempdir())
+        self.assertNotEqual(0, code)
+        self.assertIn("needs a canary outside the scope", result["message"])
+        self.assertFalse(self.calls.exists(), "no Codex server started")
+
+    def test_only_the_outermost_hidden_path_is_mounted(self):
+        # Git lists an untracked folder holding only ignored content beside the ignored folder inside it.
+        listing = ["notes/", "notes/drafts/", "notes-2/", "zeta.log"]
+        with mock.patch.object(peer, "_git_lines", return_value=listing):
+            self.assertEqual(["notes", "notes-2", "zeta.log"], peer._hidden_paths(self.repo))
+
+    def test_a_named_path_may_unhide_an_ignored_path_but_not_reach_inside_one(self):
+        (self.repo / ".gitignore").write_text("reference/\n")
+        (self.repo / "reference" / "deep").mkdir(parents=True)
+        code, result, _ = self.invoke("--read", str(self.repo / "reference"))
+        self.assertEqual(0, code, result)
+        self.assertEqual([], result["read_scope"]["hidden"])
+        self.assertIn(os.path.realpath(self.repo / "reference"), result["read_scope"]["roots"])
+        code, result, _ = self.invoke("--read", str(self.repo / "reference" / "deep"))
+        self.assertNotEqual(0, code)
+        self.assertIn("lies inside a path this checkout ignores", result["message"])
+
+    def test_a_scope_that_leaks_refuses_before_any_task(self):
+        self.configure(sandbox_exit=1, sandbox_stdout="a hidden path is readable: /checkout/_sessions\n")
+        code, result, _ = self.invoke()
+        self.assertNotEqual(0, code)
+        self.assertEqual(("unavailable", False, "read_scope"),
+                         (result["state"], result["provider_started"], result["unavailable_stage"]))
+        self.assertIn("read-scope check failed inside this call's Codex profile (a hidden path is readable: "
+                      "/checkout/_sessions)", result["message"])
+        self.assertFalse(self.calls.exists(), "no Codex server started")
+
+    def test_read_paths_must_exist_and_belong_to_codex_calls(self):
+        code, result, _ = self.invoke("--read", str(self.base / "absent"))
+        self.assertIn("must be an existing absolute path", result["message"])
+        self.assertFalse(self.calls.exists())
+        with self.assertRaises(SystemExit), redirect_stderr(io.StringIO()):
+            peer.peer_main(["claude", "--task-file", str(self.task), "--read", str(self.base)])
+
+    def test_a_dry_run_shows_the_scope_without_probing(self):
+        code, result, _ = self.invoke("--dry-run")
+        self.assertEqual(0, code)
+        self.assertEqual("not_checked", result["read_scope"]["verified"])
+        self.assertFalse(Path(str(self.specification) + ".sandbox").exists())
 
     # --- generated images -------------------------------------------------
 
