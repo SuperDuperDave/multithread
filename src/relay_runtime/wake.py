@@ -1366,11 +1366,19 @@ def _inboxes_path():
     return Path(INBOXES) if INBOXES is not None else _state_dir() / "claude-inboxes.json"
 
 
+def _set_asides(path):
+    """(time in ns, file) for each of this file's failed set-asides: exactly `<name>.failed-<ASCII digits>`."""
+    prefix = f"{path.name}.failed-"
+    for item in path.parent.glob(prefix + "*"):
+        stamp = item.name[len(prefix):]
+        if stamp.isascii() and stamp.isdigit() and int(stamp) <= time.time_ns() + 60 * 10**9:  # none from the future
+            yield int(stamp), item
+
+
 def _prune_set_aside(path, within=86400):
     """Remove this file's failed set-asides older than a day, which no NOT RUNNING names any more."""
-    for item in path.parent.glob(f"{path.name}.failed-*"):
-        stamp = item.name.rsplit("-", 1)[1]
-        if stamp.isdigit() and time.time_ns() - int(stamp) > within * 10**9:
+    for stamp, item in _set_asides(path):
+        if time.time_ns() - stamp > within * 10**9:
             try:
                 os.unlink(item)
             except OSError:
@@ -1381,9 +1389,7 @@ def inboxes_set_aside(within=86400):
     """When a failed write last set the inbox map aside, within the last day: (UTC time, path), else None. Sessions
     that haven't prompted since are NOT RUNNING, and a sender should know why."""
     try:
-        path = _inboxes_path()
-        stamps = ((item.name.rsplit("-", 1)[1], item) for item in path.parent.glob(f"{path.name}.failed-*"))
-        newest = max((int(stamp), item) for stamp, item in stamps if stamp.isdigit())
+        newest = max(_set_asides(_inboxes_path()))
     except (OSError, ValueError):
         return None
     if time.time_ns() - newest[0] > within * 10**9:
