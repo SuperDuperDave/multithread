@@ -636,8 +636,11 @@ def _policy_listings():
                 time.sleep(0.05)
         record, clock = _policy_record(), _clock()
         parents, failed = record["parents"], record["failed"]
+        # Reuse needs the latest read to have been clean for every parent: successes from different reads never
+        # combine past a failure between them.
         ages = [_age(parents[parent], clock) for parent in _WSL_POLICY_PARENTS if parent in parents]
-        if len(ages) == len(_WSL_POLICY_PARENTS) and all(age is not None and age <= _POLICY_CACHE_SECONDS for age in ages):
+        if (failed is None and len(ages) == len(_WSL_POLICY_PARENTS)
+                and all(age is not None and age <= _POLICY_CACHE_SECONDS for age in ages)):
             return {parent: (parents[parent]["lines"], None) for parent in _WSL_POLICY_PARENTS}, None
         age = _age(failed, clock) if failed is not None else None
         if age is not None and age <= _POLICY_FAILURE_SECONDS:
@@ -656,7 +659,12 @@ def _policy_listings():
                     "failed": None if ok else {"at": float(done[1]), "wall": float(done[2]),
                                                "reads": {parent: list(read) for parent, read in listings.items()}}})
             except (OSError, TypeError):
-                pass  # the next call reads again
+                # An unrecorded read must not leave an older record to stand in for what it found.
+                try:
+                    os.unlink(_POLICY_CACHE)
+                except OSError:
+                    pass
+                record = {"parents": {}, "failed": None}
         return _with_last_clean_read(listings, record, _clock())
     finally:
         os.close(lock)

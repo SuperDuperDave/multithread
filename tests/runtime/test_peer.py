@@ -1489,6 +1489,28 @@ class PeerTests(unittest.TestCase):
                 self.assertEqual(([], []), sources())
                 answer(dropped, dropped)
                 self.assertEqual(2, len(sources()[0]))
+            # Successes from different reads never combine past a failure between them into a reused clean read.
+            with mock.patch.object(peer, "_POLICY_CACHE_SECONDS", 30), mock.patch.object(peer, "_POLICY_FAILURE_SECONDS", -1):
+                cache.unlink()
+                answer(ok, ok)
+                sources()
+                answer("denied", ok)
+                self.assertEqual(1, len(sources(boot=31, wall=31)[0]))
+                answer(ok, "denied")
+                self.assertEqual(1, len(sources(boot=37, wall=37)[0]))
+                found, reused = sources(boot=38, wall=38)
+                self.assertEqual((1, []), (len(found), reused), "the latest read failed, so this call reads again")
+            # A read that cannot be recorded leaves no older record to stand in for what it found.
+            with mock.patch.object(peer, "_POLICY_FAILURE_SECONDS", -1):
+                cache.unlink()
+                answer(ok, ok)
+                sources()
+                answer(["ClaudeCode"], ok)
+                with mock.patch.object(peer, "_atomic_record", side_effect=OSError("artificial full disk")):
+                    self.assertEqual([f"{hklm}\\ClaudeCode"], sources()[0])
+                self.assertFalse(cache.exists())
+                answer(dropped, dropped)
+                self.assertEqual((2, []), (len(sources()[0]), sources()[1]))
             # The calls queued behind a failure get the same stand-in.
             cache.unlink()
             answer(ok, ok)
