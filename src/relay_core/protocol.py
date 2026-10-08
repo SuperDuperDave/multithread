@@ -149,8 +149,8 @@ _SECRET_KEY_RE = re.compile(
 )
 _SECRET_VALUE_RES = (
     # A bearer credential is a token68 run (RFC 6750); "bearer token" or "bearer device key" is the scheme's name.
-    # A quote may open it, and JSON text may escape its slashes.
-    re.compile(r"\bBearer\s+[\"'\\]*[A-Za-z0-9._~+/\\-]{16,}=*", re.I),
+    # Any quote, backtick or escape may open it, and JSON text may escape its slashes.
+    re.compile(r"\bBearer\s+[^\sA-Za-z0-9._~+/-]{0,4}(?:[A-Za-z0-9._~+/-]|\\/){16,}=*", re.I),
     re.compile(r"\b(?:sk[-_]|ghp_|github_pat_|sb_secret_)[A-Za-z0-9_-]{12,}\b", re.I),
     re.compile(r"\beyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}"),
     re.compile(r"[a-z][a-z0-9+.-]*://[^\s/:@]+:[^\s/@]+@", re.I),

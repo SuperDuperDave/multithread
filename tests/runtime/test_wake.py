@@ -2035,11 +2035,11 @@ class SignalWakeTests(ClaudeTests):
                          result["skipped"])
         self.assertEqual([("wake-ledger", "show")] * 2, [arguments for _, arguments in self.ledger_calls[calls:]],
                          "one read per ledger and no write")
-        self.assertEqual({claude: [{"checkout": there, "role": "reviewer"},
-                                   {"checkout": there, "role": "unbound-since"},
-                                   {"checkout": str(unreachable), "role": "kept"}],
+        self.assertEqual({claude: [{"checkout": there, "role": "unbound-since"},
+                                   {"checkout": str(unreachable), "role": "kept"},
+                                   {"checkout": there, "role": "reviewer"}],
                           codex: [{"checkout": here, "role": "operator"}]}, json.loads(wake.RECIPIENTS.read_text()),
-                         "what was found now comes first; a stale place stays, since every use verifies it")
+                         "what was found fills gaps; a stale place stays, since every use verifies it")
         self.assertIn("1 could not be read; their bindings were not added", result["happened"])
         self.assertEqual([str(removed)], result["gone"], "a removed checkout is gone, not unread, and is never asked")
         self.assertNotIn(str(removed), json.dumps(self.ledger_calls))
@@ -2385,7 +2385,7 @@ class WakeIndexRebuildTests(unittest.TestCase):
     def index(self):
         return json.loads(wake.RECIPIENTS.read_text())
 
-    def test_found_places_lead_bounds_apply_once_and_a_concurrent_bind_survives(self):
+    def test_found_places_fill_gaps_bounds_apply_once_and_a_concurrent_bind_survives(self):
         wake.RECIPIENTS.write_text(json.dumps({self.key("r"): [{"checkout": "/old", "role": "w"}],
                                                self.key("x"): [{"checkout": "/x", "role": "x"}]}))
         wake.RECIPIENTS.chmod(0o600)
@@ -2409,12 +2409,11 @@ class WakeIndexRebuildTests(unittest.TestCase):
             "status", "exit_code", "ledgers", "places", "dropped")), result)
         self.assertIn("1 place(s) fell outside the bounds (2 per recipient", result["happened"])
         index = self.index()
-        self.assertEqual([self.key(name) for name in ("r", "x", "u", "s")] + [json.dumps(["codex", THREAD]),
-                                                                            self.key("h")], list(index),
-                         "indexed recipients keep their recency, found ones join by their newest binding, and one "
-                         "bound during the scan is newest")
-        self.assertEqual([{"checkout": "/b", "role": "late"}, {"checkout": "/a-primary", "role": "early"}],
-                         index[self.key("r")], "newest binding first, under the place bound")
+        self.assertEqual([self.key("u"), self.key("s"), json.dumps(["codex", THREAD])]
+                         + [self.key(name) for name in ("r", "x", "h")], list(index),
+                         "bind decides recency; recipients new to the index join at its old end, by newest binding")
+        self.assertEqual([{"checkout": "/old", "role": "w"}, {"checkout": "/b", "role": "late"}],
+                         index[self.key("r")], "found places fill gaps after indexed ones, newest binding first")
         self.assertEqual([{"checkout": "/a-primary", "role": "fresh"}], index[self.key("h")],
                          "a bind made during the scan is not erased by the snapshot")
         self.assertEqual([{"checkout": "/a-primary", "role": "paused"}], index[json.dumps(["codex", THREAD])],
@@ -2434,19 +2433,20 @@ class WakeIndexRebuildTests(unittest.TestCase):
         self.assertEqual([{"checkout": "/l", "role": "new"}, {"checkout": "/l", "role": "old"}],
                          self.index()[self.key("r")])
 
-    def test_a_place_bound_during_the_scan_outranks_every_place_the_scan_saw(self):
-        # Sol on a1c10ed: at the place bound, the snapshot's places pushed out the only current one.
-        seen = [{"checkout": "/l", "role": role} for role in ("one", "two")]
+    def test_a_place_bound_during_the_scan_keeps_its_rank_even_when_it_was_already_indexed(self):
+        # Sol on a1c10ed and 11fb797: at the place bound, the snapshot's places pushed out the only current one,
+        # first when it was new, then when a bind refreshed a place already indexed.
+        seen = [{"checkout": "/l", "role": "one"}, {"checkout": "/elsewhere", "role": "now"}]
         wake.RECIPIENTS.write_text(json.dumps({self.key("r"): seen}))
         wake.RECIPIENTS.chmod(0o600)
 
         def ledger(*_):
-            self.assertTrue(wake._remember(self.key("r"), "/elsewhere", "now"))  # unbound here, bound there
+            self.assertTrue(wake._remember(self.key("r"), "/elsewhere", "now"))  # unbound here, bound there again
             return 0, {"ledger": "/l", "bindings": [self.claude("r", "one", "2026-01-01T00:00:00Z"),
                                                     self.claude("r", "two", "2026-02-01T00:00:00Z")]}, ""
         with mock.patch.object(wake, "_RECIPIENT_PLACES", 2):
             result = wake.rebuild_index(ledger, checkouts=[self.base / "l"])
-        self.assertEqual([{"checkout": "/elsewhere", "role": "now"}, {"checkout": "/l", "role": "two"}],
+        self.assertEqual([{"checkout": "/elsewhere", "role": "now"}, {"checkout": "/l", "role": "one"}],
                          self.index()[self.key("r")])
         self.assertEqual(1, result["dropped"])
 

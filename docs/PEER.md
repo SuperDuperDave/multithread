@@ -462,7 +462,8 @@ a role in an account index (`wake-recipients.json` beside the ledgers' state:
 own binding names the exact session. Running `bind` again records an existing
 binding; `multithread wake-index rebuild` adds every enrolled checkout's
 bindings at once, with one read per ledger and no other write. It removes
-nothing, since each use is verified, and names any ledger it couldn't read. A recipient bound nowhere reachable is reported `NOT BOUND` with the
+nothing and reorders nothing `bind` recorded, since each use is verified, and
+names any ledger it couldn't read. A recipient bound nowhere reachable is reported `NOT BOUND` with the
 command that wakes it by hand. A ledger is named by its primary checkout, which
 outlives the linked worktrees that share it. As with a local rebind, sending the
 same signal again after its recipient binds in another checkout wakes it there

@@ -1305,9 +1305,10 @@ def rebuild_index(ledger=launcher_ledger, checkouts=None):
     """Add every active or paused binding in every enrolled checkout's ledger to the index, so bindings made before
     it existed are found without each holder binding again. One read per ledger; only the index is written.
 
-    Additive only: the index is a hint verified at every use, so a stale place costs one read, while removing one
-    from a snapshot could erase a bind made during the scan. A recipient's places found now come first, newest
-    binding first, then its earlier ones; the bounds apply once, at the end."""
+    It only fills gaps: bind decides recency, so whatever a bind records during the scan keeps its place. Nothing
+    is removed, since the index is a hint verified at every use and a stale place costs one read. Places found now
+    follow a recipient's indexed ones, newest binding first; recipients new to the index join at its old end, by
+    newest binding. The bounds apply once, at the end."""
     skipped = []
     if checkouts is None:
         try:
@@ -1318,7 +1319,6 @@ def rebuild_index(ledger=launcher_ledger, checkouts=None):
                                                "is unchanged."}
         skipped += [{"checkout": None, "problem": f"enrollment record {name}: {problem}"}
                     for name, problem in unreadable]
-    before = _places()  # a place recorded while the scan runs is newer than anything the scan saw
     read, found, gone = 0, [], []
     for checkout in checkouts:
         try:
@@ -1355,16 +1355,9 @@ def rebuild_index(ledger=launcher_ledger, checkouts=None):
 
     def change(places):
         nonlocal dropped
-        recent = {key: [item for item in items if item not in before.get(key, [])] for key, items in places.items()}
-        # Recency: recipients already indexed keep theirs, those found now join by their newest binding, and those
-        # bound during the scan are newest of all. Within a recipient: bound during the scan, found now, earlier.
-        order = [key for key in places if key in before and not recent[key]]
-        order += [key for key in sorted(fresh, key=newest.get) if key not in places]
-        order += [key for key in places if key not in order]
-        merged = {}
-        for key in order:
-            ranked = recent.get(key, []) + fresh.get(key, []) + places.get(key, [])
-            merged[key] = [item for index, item in enumerate(ranked) if item not in ranked[:index]]
+        merged = {key: fresh[key] for key in sorted(fresh, key=newest.get) if key not in places}
+        for key, items in places.items():
+            merged[key] = items + [item for item in fresh.get(key, []) if item not in items]
         bounded = {key: items[:_RECIPIENT_PLACES] for key, items in list(merged.items())[-_RECIPIENTS_KEPT:]}
         dropped = sum(map(len, merged.values())) - sum(map(len, bounded.values()))
         return bounded
