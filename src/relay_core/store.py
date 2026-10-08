@@ -751,6 +751,7 @@ class RelayStore:
         max_seq = int(
             self._execute("SELECT COALESCE(MAX(seq), 0) FROM events").fetchone()[0]
         )
+        elsewhere = self._wakes_elsewhere(agent, session, limit) if session is not None else []
         return {
             "brief_version": 1,
             "agent": agent,
@@ -764,7 +765,9 @@ class RelayStore:
                 "recent_intents": len(intent_rows) > limit,
                 "pending_signals": pending["has_more"],
                 "ratchet_items": len(actionable_ratchet) > limit,
+                "wakes_elsewhere": len(elsewhere) > limit,
             },
+            "wakes_elsewhere": elsewhere[:limit],
             "active_claims": [
                 self._brief_claim(item) for item in claims[:limit]
             ],
@@ -778,6 +781,28 @@ class RelayStore:
                 for item in actionable_ratchet[:limit]
             ],
         }
+
+    def _wakes_elsewhere(self, agent: str, session: str, limit: int) -> list[dict[str, Any]]:
+        """Recent wakes recorded here for this exact recipient that point at another checkout's ledger. The
+        signal is read and acknowledged there, so without this a lost wake would leave its recipient unaware."""
+        since = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(time.time() - 86400))
+        rows = self._execute(
+            """
+            SELECT attempt.seq, attempt.agent, attempt.session, attempt.target, attempt.recorded_at,
+                   json_extract(attempt.meta_json, '$.ref') AS ref
+            FROM events AS attempt JOIN events AS bound
+              ON bound.seq = json_extract(attempt.meta_json, '$.generation') AND bound.kind = 'wake.bound'
+            WHERE attempt.kind = 'wake.attempted' AND json_extract(attempt.meta_json, '$.ref') LIKE 'ledger:%'
+              AND attempt.recorded_at >= ?
+              AND ((json_extract(bound.meta_json, '$.provider') = 'codex' AND ? = 'codex'
+                    AND json_extract(bound.meta_json, '$.thread') = ?)
+                OR (json_extract(bound.meta_json, '$.provider') = 'claude' AND bound.agent = ? AND bound.session = ?))
+            ORDER BY attempt.seq DESC LIMIT ?
+            """,
+            (since, agent, session, agent, session, limit + 1),
+        ).fetchall()
+        return [{"seq": int(row["seq"]), "ref": row["ref"], "role": row["target"],
+                 "sender": f"{row['agent']}:{row['session']}", "recorded_at": row["recorded_at"]} for row in rows]
 
     def inbox(
         self, agent: str, *, session: str | None = None,

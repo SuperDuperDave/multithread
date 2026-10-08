@@ -12,6 +12,7 @@ not the recipient reading it: acknowledgement stays the recipient's own act.
 
 import argparse
 import base64
+import fcntl
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -25,6 +26,7 @@ import stat
 import struct
 import subprocess
 import sys
+import tempfile
 import time
 
 from relay_core.protocol import (ValidationError, canonical_agent, canonical_wake_expectation,
@@ -1193,6 +1195,107 @@ def _receives(binding, agent, session):
     return binding.get("bound_agent") == agent and binding.get("bound_session") == session
 
 
+# Where each recipient holds a role, so a signal recorded in one checkout's ledger can wake it in its own. A hint
+# only: every use is verified against that ledger's binding, so the index never decides who is woken.
+RECIPIENTS = Path(os.path.expanduser("~/.local/share/relay/wake-recipients.json"))
+_RECIPIENT_PLACES = 8
+
+
+def _recipient(provider, agent, session, thread):
+    return f"codex:{thread}" if provider == "codex" else f"claude:{agent}:{session}"
+
+
+def _places():
+    """The index, or {} when absent, unreadable, loosely held or malformed."""
+    try:
+        fd = os.open(RECIPIENTS, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError:
+        return {}
+    try:
+        status = os.fstat(fd)
+        if (not stat.S_ISREG(status.st_mode) or status.st_uid != os.getuid() or status.st_mode & 0o077
+                or status.st_size > 1 << 20):
+            return {}
+        value = json.loads(os.read(fd, status.st_size + 1))
+    except (OSError, ValueError):
+        return {}
+    finally:
+        os.close(fd)
+    if not isinstance(value, dict):
+        return {}
+    place = lambda item: (isinstance(item, dict) and set(item) == {"checkout", "role"}
+                          and isinstance(item["checkout"], str) and item["checkout"].startswith("/")
+                          and isinstance(item["role"], str))
+    return {key: [item for item in items if place(item)][:_RECIPIENT_PLACES]
+            for key, items in value.items() if isinstance(key, str) and isinstance(items, list)}
+
+
+def _remember(recipient, checkout, role):
+    """Record where a recipient holds a role; a failure costs only the cross-ledger lookup."""
+    try:
+        RECIPIENTS.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        lock = os.open(RECIPIENTS.with_suffix(".lock"), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    except OSError:
+        return False
+    try:
+        deadline = time.monotonic() + 5
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    return False
+                time.sleep(0.02)
+        places, place = _places(), {"checkout": checkout, "role": role}
+        places[recipient] = [place, *(item for item in places.get(recipient, []) if item != place)][:_RECIPIENT_PLACES]
+        fd, temporary = tempfile.mkstemp(prefix=".recipients-", dir=RECIPIENTS.parent)
+        try:
+            with os.fdopen(fd, "w") as stream:
+                os.fchmod(stream.fileno(), 0o600)
+                json.dump(places, stream, sort_keys=True)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, RECIPIENTS)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+        return True
+    except OSError:
+        return False
+    finally:
+        os.close(lock)
+
+
+def _wake_where_bound(args, ledger, repo, here, seq, recorded, target_agent, target_session, agent, session):
+    """Wake the recipient in a checkout where it holds a role, pointing back at the signal here; None when no
+    place in the index verifies against that ledger's own binding."""
+    provider = "codex" if target_agent == "codex" else "claude"
+    for place in _places().get(_recipient(provider, target_agent, target_session, target_session), []):
+        checkout = place["checkout"]
+        if checkout == here:
+            continue
+        code, shown, _ = ledger(Path(checkout), "wake-ledger", "show")
+        if code != 0 or not isinstance(shown, dict) or not isinstance(shown.get("bindings"), list):
+            continue
+        bound = sorted((binding for binding in shown["bindings"] if isinstance(binding, dict)
+                        and binding.get("state") == "active" and _receives(binding, target_agent, target_session)),
+                       key=lambda binding: binding["role"])
+        if not bound:
+            continue
+        binding = bound[0]
+        wake_args = argparse.Namespace(repo=checkout, steer=args.steer, agent=agent, session=session,
+                                       role=binding["role"], ref=f"ledger:{here}#{seq}", message_id=None,
+                                       dry_run=False, sender_repo=str(repo), sender_role=None, codex=args.codex,
+                                       **_expectation(binding))
+        result = wake(wake_args, ledger)
+        result["happened"] = (f"Recorded signal {seq} here; its recipient holds {binding['role']} in {checkout}, so "
+                              "the wake went there. " + result["happened"])
+        result["signal"], result["woken_in"] = recorded, checkout
+        return result
+    return None
+
+
 def _expectation(binding):
     if binding["provider"] == "codex":
         return {"expect_generation": binding["generation"], "expect_provider": "codex",
@@ -1241,8 +1344,12 @@ def signal_wake(args, rest, ledger=launcher_ledger):
         return _outcome("NOT SENT", f"Recorded signal {seq} for {target_agent} {target_session}, but that "
                         f"session's binding ({paused}) is paused, so no wake was sent.", later, signal=recorded)
     if not active:
-        # Its briefs read the ledger of the checkout it works in, which may not be this one.
+        # Its briefs read the ledger of the checkout it works in, which may not be this one: wake it there.
         here = shown.get("ledger") if isinstance(shown.get("ledger"), str) else str(repo)
+        crossed = _wake_where_bound(args, ledger, repo, here, seq, recorded, target_agent, target_session,
+                                    agent, session)
+        if crossed is not None:
+            return crossed
         return _outcome("NOT BOUND", f"Recorded signal {seq} for {target_agent} {target_session}, but no role in "
                         "this ledger is bound to that session, so it wasn't woken, and it sees the signal only if "
                         "it reads this ledger.", "If it works in another checkout, wake its role there: multithread "
@@ -1413,6 +1520,8 @@ def bind(args, ledger=launcher_ledger):
         metadata_unchanged = (args.scope is None or args.scope == current.get("role_scope")) and (
             args.charter is None or args.charter == current.get("charter"))
         if unchanged and metadata_unchanged and args.expected_generation is None:
+            _remember(_recipient(provider, current.get("bound_agent"), current.get("bound_session"), thread),
+                      shown["ledger"], role)
             return _outcome("ALREADY BOUND", f"{role} already wakes {target} (binding {current['generation']}, "
                             f"{current['state']}); nothing was recorded.", "Nothing.",
                             generation=current["generation"], **base)
@@ -1456,6 +1565,8 @@ def bind(args, ledger=launcher_ledger):
                         _ledger_next(code, repo, "run bind again"), coverage=coverage, **base)
     binding = recorded["binding"]
     base.update(generation=binding["generation"], binding_state=binding["state"], coverage=coverage)
+    # Re-running bind records an older binding here too, so the index fills without a migration.
+    _remember(_recipient(provider, agent, session, thread), shown["ledger"], role)
     if recorded["duplicate"]:
         return _outcome("ALREADY BOUND", f"{role} already wakes {target} (binding {binding['generation']}); "
                         "nothing was recorded.", "Nothing.", **base, **extra)

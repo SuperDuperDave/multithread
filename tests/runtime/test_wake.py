@@ -296,6 +296,7 @@ class WakeCase(unittest.TestCase):
         for patcher in (mock.patch.dict(os.environ, {"CODEX_HOME": str(self.codex_home),
                                                      "CLAUDE_CONFIG_DIR": str(self.claude_home)}),
                         mock.patch.object(wake, "account_launcher", return_value=LAUNCHER),
+                        mock.patch.object(wake, "RECIPIENTS", self.base / "recipients.json"),
                         mock.patch.object(hooks, "account_launcher", return_value=LAUNCHER)):
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -1876,6 +1877,114 @@ class SignalWakeTests(ClaudeTests):
         self.assertIn("--ref " + shlex.quote(f"ledger:{self.repo}#{seq}"), result["next"])
         self.assertEqual([], self.events("wake.attempted"))
         self.assertEqual([], self.inbox.lines)
+
+    def other_checkout(self):
+        """A second enrolled checkout with its own ledger, as on a real machine."""
+        other = self.base / "other"
+        other.mkdir()
+        for command in (["init", "-q"], ["-c", "user.name=Fixture", "-c", "user.email=fixture@invalid",
+                                         "commit", "-q", "--allow-empty", "-m", "seed"]):
+            subprocess.run(["git", "-C", str(other), *command], check=True, capture_output=True)
+        allowed = {(self.repo / ".git").resolve(), (other / ".git").resolve()}
+        def binding(actual):
+            if actual not in allowed:
+                from relay_core.store import StateError
+                raise StateError(f"Multithread refuses a foreign workspace: {actual}")
+        patcher = mock.patch("relay_core.store._assert_workspace_binding", side_effect=binding)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        # --home names one state directory for every checkout; production keeps one beside each checkout.
+        self.other_home = self.base / "state-other"
+        shared = self.ledger
+        def ledger(repo, *arguments):
+            if Path(repo).resolve() != other.resolve():
+                return shared(repo, *arguments)
+            self.ledger_calls.append((str(repo), arguments))
+            out, err = io.StringIO(), io.StringIO()
+            with redirect_stdout(out), redirect_stderr(err):
+                code = core_cli.main(["--repo", str(repo), "--home", str(self.other_home), "--json", *arguments])
+            if code != 0:
+                return code, None, err.getvalue().strip().splitlines()[-1].removeprefix("multithread: ")
+            return 0, json.loads(out.getvalue()), ""
+        self.ledger = ledger
+        return other
+
+    def test_bind_records_where_its_recipient_holds_a_role(self):
+        code, result = self.bind_inbox()
+        self.assertEqual(0, code, result)
+        index = json.loads(wake.RECIPIENTS.read_text())
+        self.assertEqual({"claude:claude:self": [{"checkout": result["ledger"], "role": "reviewer"}]}, index)
+        self.assertEqual(0o600, wake.RECIPIENTS.stat().st_mode & 0o777)
+        wake.RECIPIENTS.unlink()
+        self.bind_inbox()  # already bound: running bind again records an older binding too
+        self.assertIn("claude:claude:self", json.loads(wake.RECIPIENTS.read_text()))
+
+    def test_a_signal_wakes_its_recipient_in_the_checkout_where_it_holds_a_role(self):
+        # Foundry 2888/2889, Tools 848/849, Sentinel on #48: the recipient worked in another checkout, so a
+        # signal recorded here never reached it. The signal stays here; the wake goes where it is bound.
+        other = self.other_checkout()
+        out = io.StringIO()
+        with redirect_stdout(out):
+            code = wake.bind_main(["reviewer", "--repo", str(other), "--claude-socket", str(self.inbox_path),
+                                   "--agent", "claude", "--session", "self", "--json"], ledger=self.ledger)
+        self.assertEqual(0, code, out.getvalue())
+        result = self.signal_wake()
+        seq = self.signals()[-1]["seq"]
+        self.assertEqual("DELIVERED TO INBOX", result["status"], result)
+        self.assertEqual(json.loads(out.getvalue())["ledger"], result["woken_in"])
+        self.assertEqual(seq, result["signal"]["seq"])
+        self.assertIn(f"ledger sequence {seq} in {self.repo}", b"".join(self.inbox.lines).decode())
+        with RelayStore.open(repo=other, state_home=self.other_home) as store:
+            attempts = [row for row in store.events(limit=50) if row["kind"] == "wake.attempted"]
+            brief = store.brief("claude", session="self")
+            unrelated = store.brief("claude", session="someone-else")
+        self.assertEqual(f"ledger:{self.repo}#{seq}", attempts[-1]["meta"]["ref"])
+        self.assertEqual([], [row for row in self.events() if row["kind"] == "wake.attempted"],
+                         "the attempt is recorded where the recipient is bound; the signal stays here")
+        # Its own brief there shows the wake, so a lost wake doesn't leave it unaware; nobody else's does.
+        self.assertEqual([f"ledger:{self.repo}#{seq}"], [item["ref"] for item in brief["wakes_elsewhere"]])
+        self.assertEqual([], unrelated["wakes_elsewhere"])
+        out = io.StringIO()
+        with redirect_stdout(out):
+            core_cli.main(["--repo", str(other), "--home", str(self.other_home), "brief", "--agent", "claude",
+                           "--session", "self"])
+        self.assertIn("Wakes pointing at another checkout's ledger", out.getvalue())
+        self.assertIn(f'ref="ledger:{self.repo}#{seq}"', out.getvalue())
+        with redirect_stdout(io.StringIO()):
+            core_cli.main(["--repo", str(self.repo), "--home", str(self.home), "brief", "--agent", "claude",
+                           "--session", "self"])
+
+    def test_an_index_entry_that_does_not_verify_wakes_nobody(self):
+        other = self.other_checkout()
+        with RelayStore.open(repo=other, state_home=self.other_home):
+            pass
+        # The index points at a checkout whose role is held by another session: verification wakes nobody there.
+        with redirect_stdout(io.StringIO()):
+            wake.bind_main(["reviewer", "--repo", str(other), "--claude-socket", str(self.inbox_path),
+                            "--agent", "claude", "--session", "someone-else", "--json"], ledger=self.ledger)
+        wake.RECIPIENTS.write_text(json.dumps({"claude:claude:self": [{"checkout": str(other), "role": "reviewer"}]}))
+        wake.RECIPIENTS.chmod(0o600)
+        self.assertEqual("NOT BOUND", self.signal_wake()["status"])
+        self.assertEqual([], self.inbox.lines)
+        with redirect_stdout(io.StringIO()):
+            core_cli.main(["--repo", str(other), "--home", str(self.other_home), "unbind", "reviewer",
+                           "--agent", "claude", "--session", "someone-else"])
+        for name, index, mode in (
+                ("not bound there", {"claude:claude:self": [{"checkout": str(other), "role": "reviewer"}]}, 0o600),
+                ("readable by others", None, 0o644),
+                ("malformed", {"claude:claude:self": [{"checkout": "relative", "role": "reviewer"}]}, 0o600)):
+            with self.subTest(index=name):
+                if index is None:
+                    out = io.StringIO()
+                    with redirect_stdout(out):
+                        wake.bind_main(["reviewer", "--repo", str(other), "--claude-socket", str(self.inbox_path),
+                                        "--agent", "claude", "--session", "self", "--json"], ledger=self.ledger)
+                else:
+                    wake.RECIPIENTS.write_text(json.dumps(index))
+                wake.RECIPIENTS.chmod(mode)
+                result = self.signal_wake()
+                self.assertEqual("NOT BOUND", result["status"], result)
+                self.assertEqual([], self.inbox.lines)
 
     def test_a_paused_binding_is_recorded_but_not_woken(self):
         self.bind_inbox()

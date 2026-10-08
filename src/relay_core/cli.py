@@ -1187,6 +1187,14 @@ def _render_brief(result: Mapping[str, Any]) -> str:
          [_brief_event_line(event) for event in result["pending_signals"]]),
         ("ratchet_items", "Actionable ratchet items:", ratchet),
     ]
+    elsewhere = [
+        f"- seq={wake['seq']} ref={_quoted(wake['ref'], 200)} role={_quoted(wake['role'], 64)} "
+        f"from={_quoted(wake['sender'], 96)}"
+        for wake in result.get("wakes_elsewhere") or []
+    ]
+    if elsewhere:  # shown only when present, so an ordinary brief stays as it was
+        sections.append(("wakes_elsewhere", "Wakes pointing at another checkout's ledger (last 24 h; read and "
+                         "acknowledge each there with multithread --repo <that checkout>):", elsewhere))
 
     def render(counts: list[int]) -> str:
         lines = list(header)
