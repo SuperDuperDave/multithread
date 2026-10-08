@@ -18,6 +18,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import pwd
 import re
 import shlex
 import shutil
@@ -343,8 +344,21 @@ def inbox_problem(path):
     return None
 
 
-def deliver(path, text, timeout=_INBOX_TIMEOUT):
-    """Write the one user line Claude Code reads; the line is ready before connecting."""
+def _listener(connection):
+    """(pid, uid) of the process listening on a connected Unix socket, as the kernel recorded it."""
+    pid, uid, _ = struct.unpack("3i", connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED,
+                                                             struct.calcsize("3i")))
+    return pid, uid
+
+
+class InboxNotOwner(Exception):
+    """The connected inbox belongs to a process other than the bound session's, so nothing was sent."""
+
+
+def deliver(path, text, timeout=_INBOX_TIMEOUT, owner=None):
+    """Write the one user line Claude Code reads; the line is ready before connecting. With owner (pid, boot id,
+    start), the process listening on the connected socket must be exactly that one before anything is sent: the
+    path was checked earlier, and a process id can come round again in between."""
     line = (json.dumps({"type": "user", "message": {"role": "user", "content": text}}, ensure_ascii=True)
             + "\n").encode("ascii")
     connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -354,6 +368,13 @@ def deliver(path, text, timeout=_INBOX_TIMEOUT):
             connection.connect(str(path))
         except OSError as exc:
             raise InboxRefused(_detail(exc)) from None
+        if owner is not None:
+            try:
+                pid, uid = _listener(connection)
+            except OSError as exc:
+                raise InboxNotOwner(f"its listener couldn't be identified ({_detail(exc)})") from None
+            if uid != os.getuid() or pid != owner[0] or _process(pid) != owner[1:]:
+                raise InboxNotOwner(f"process {pid} is listening on it, not the session's process {owner[0]}")
         try:
             connection.sendall(line)
         except OSError as exc:
@@ -945,7 +966,7 @@ def wake(args, ledger=launcher_ledger):
         return result
 
     if binding["provider"] == "claude":
-        return _wake_inbox(args, role, binding, path, text, message_id, base, conclude)
+        return _wake_inbox(args, role, binding, text, message_id, base, conclude)
     try:
         daemon = Daemon(path)
     except DaemonUnavailable as exc:
@@ -1099,30 +1120,30 @@ def _refused_before_sending(completed):
         return False
 
 
-def _wake_inbox(args, role, binding, stored, text, message_id, base, conclude):
+def _wake_inbox(args, role, binding, text, message_id, base, conclude):
     """Claude Code: one line into the session's inbox. There is no separate steer.
 
     The binding names a session; its inbox is the one that session last reported from inside itself, while the
-    process that reported it still runs. A binding made before such reports is used only while the process behind
-    its stored inbox is the one that was bound. Anything else is a session that isn't running here, never a
-    delivery to whichever session took over its process id."""
+    process that reported it still runs, and that process must be the one listening when the line is sent. Anything
+    else is a session that isn't running here, never a delivery to whichever session took over its socket."""
     unsteered = " Claude Code has no separate steer, so --steer changed nothing." if args.steer else ""
     rebind = (f"Have the exact holder refresh {role} from its own Claude Code session with "
               "--claude-socket \"$CLAUDE_CODE_MESSAGING_SOCKET\". Moving it to another owner requires an explicitly "
               "authorized handover with --replace, --expected-generation, --reason and --approval-ref. "
               "Then run this wake again.")
     session = binding.get("bound_session")
-    path = live_inbox(session)
-    if path is None and inbox_problem(stored) is None and bound_process_alive(stored, binding.get("bound_at")):
-        path = stored
-    if path is None:
+
+    def not_running(why):
         base["recipient_state"] = {"reachability": "unavailable", "turn_state": "unknown", "source": "inbox_owner"}
         return conclude(_outcome(
-            "NOT RUNNING", f"The Claude Code session {session} bound to {role} isn't running: no inbox it reported is "
-            "still owned by its process, and the stored one isn't the process that was bound. Nothing was sent.",
-            f"It becomes reachable at its next prompt, when it reports its inbox; a session resumed with `claude "
-            f"--resume` keeps {role}. Send again then; message id {message_id} is still unused.", **base),
+            "NOT RUNNING", f"The Claude Code session {session} bound to {role} isn't running here: {why}. Nothing "
+            "was sent.", f"It becomes reachable at its next prompt, when it reports its inbox; a session resumed "
+            f"with `claude --resume` keeps {role}. Send again then; message id {message_id} is still unused.", **base),
             "not_sent", "inbox_missing", detail="not running")
+    entry = live_inbox(session)
+    if entry is None:
+        return not_running("no inbox it reported is still owned by its process")
+    path = entry["inbox"]
     problem = inbox_problem(path)
     if problem is not None:
         reason, why = problem
@@ -1134,7 +1155,9 @@ def _wake_inbox(args, role, binding, stored, text, message_id, base, conclude):
         return _outcome("DRY RUN", f"Would deliver to the Claude Code inbox at {path} for {role}. Nothing was "
                         "sent." + unsteered, "Run again without --dry-run to send.", **base)
     try:
-        deliver(path, text)
+        deliver(path, text, owner=(entry["pid"], entry["boot_id"], entry["start"]))
+    except InboxNotOwner as exc:
+        return not_running(f"the inbox it reported, {path}, is now held by another process ({exc})")
     except InboxRefused as exc:
         return conclude(_outcome("NOT SENT", f"The Claude Code inbox at {path} refused the connection ({exc}), so "
                                  "that session may have ended. Nothing was sent.", rebind, **base),
@@ -1223,13 +1246,14 @@ def _state_dir():
     """Beside the ledgers it describes: RELAY_HOME when one names their state, else the account's."""
     if os.environ.get("RELAY_HOME"):
         return Path(os.path.abspath(os.path.expanduser(os.environ["RELAY_HOME"])))
-    return Path(os.path.expanduser("~/.local/share/relay"))
+    # The account's home, as the launcher's registry finds it: an ambient HOME could point into a checkout.
+    return Path(pwd.getpwuid(os.getuid()).pw_dir) / ".local" / "share" / "relay"
 
 
 def _private_read(path, valid):
     """(value, usable): absent is usable and empty; valid(value) returns the normalized value, or None to refuse."""
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)  # a FIFO never blocks
     except FileNotFoundError:
         return {}, True
     except OSError:
@@ -1248,16 +1272,20 @@ def _private_read(path, valid):
     return ({}, False) if value is None else (value, True)
 
 
-def _private_update(path, read_file, change):
-    """Replace the file with change(value) under its lock; False when it could not be written. change may return
-    None to leave the file untouched."""
+def _private_update(path, read_file, change, wait=5):
+    """Replace the file with change(value) under its lock, waiting at most wait seconds for it; False when it could
+    not be written. change may return None to leave the file untouched."""
     try:
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        lock = os.open(path.with_suffix(".lock"), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        directory = os.lstat(path.parent)
+        if not stat.S_ISDIR(directory.st_mode) or directory.st_uid != os.getuid():
+            return False  # a symbolic link or someone else's directory
+        lock = os.open(path.with_suffix(".lock"),
+                       os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK, 0o600)
     except OSError:
         return False
     try:
-        deadline = time.monotonic() + 5
+        deadline = time.monotonic() + wait
         while True:
             try:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -1303,7 +1331,8 @@ INBOXES = None  # tests set an exact path
 PROC = Path("/proc")  # tests point this at a synthetic tree
 _INBOXES_KEPT = 256  # most recently reporting sessions
 _SOCKET_NAME = re.compile(r"([1-9][0-9]{0,9})\.sock")
-_INBOX_ANCESTRY = 16  # hook → shell → … → Claude Code
+_INBOX_ANCESTRY = 64  # hook → shell → … → Claude Code
+_HOOK_WAIT = 0.5  # the provider hook has seconds in all; a busy map costs one report, never the hook
 
 
 def _inboxes_path():
@@ -1354,44 +1383,46 @@ def _ancestors():
     return seen
 
 
-def remember_inbox(session, inbox):
+def _owns(entry):
+    """Whether the process an entry names still runs: same boot, process id and start time."""
+    return _process(entry["pid"]) == (entry["boot_id"], entry["start"])
+
+
+def remember_inbox(session, inbox, claim=False, wait=5):
     """Record that session's inbox is now inbox, as reported from inside it: the process the socket is named after
-    must be an ancestor of this one. False when nothing was recorded; a failure costs only the lookup."""
+    must be an ancestor of this one. Only a session's start may claim a socket another live session holds (one
+    process can switch sessions with /clear or /resume); a later report or a bind only creates or refreshes, so a
+    delayed report from a session that was switched away can't take its socket back. False when nothing was
+    recorded; a failure costs only the lookup."""
     pid = _inbox_owner(inbox)
     identity = _process(pid) if pid is not None and pid in _ancestors() else None
     if not isinstance(session, str) or not session or identity is None:
         return False
     entry = {"inbox": inbox, "boot_id": identity[0], "pid": pid, "start": identity[1]}
+    if _read_inboxes(_inboxes_path())[0].get(session) == entry:
+        return True  # unchanged: a prompt costs one read and no lock
+    refused = []
 
     def change(entries):
         if entries.get(session) == entry:
-            return None  # unchanged: a prompt costs one read
-        # One owner per path: when a process id comes round again, the newest report owns its socket.
+            return None
+        holders = [key for key, item in entries.items() if key != session and item["inbox"] == inbox and _owns(item)]
+        if holders and not claim:
+            refused.append(holders[0])
+            return None
         kept = {key: item for key, item in entries.items() if key != session and item["inbox"] != inbox}
-        return {**dict(list(kept.items())[-(_INBOXES_KEPT - 1):]), session: entry}
-    return _private_update(_inboxes_path(), _read_inboxes, change)
+        if len(kept) >= _INBOXES_KEPT:  # make room from sessions whose process has gone before live ones
+            dead = [key for key, item in kept.items() if not _owns(item)]
+            for key in (dead + list(kept))[:len(kept) - _INBOXES_KEPT + 1]:
+                kept.pop(key, None)
+        return {**kept, session: entry}
+    return _private_update(_inboxes_path(), _read_inboxes, change, wait) and not refused
 
 
 def live_inbox(session):
-    """The session's reported inbox if the process that reported it still owns it, else None."""
+    """The entry for the session's reported inbox if the process that reported it still owns it, else None."""
     entry = _read_inboxes(_inboxes_path())[0].get(session) if isinstance(session, str) else None
-    if entry is None or _process(entry["pid"]) != (entry["boot_id"], entry["start"]):
-        return None
-    return entry["inbox"]
-
-
-def bound_process_alive(inbox, bound_at):
-    """Whether the process now behind a binding's stored inbox started at least a second before the binding, so it
-    is the process that was bound: a process id belongs to one live process at a time."""
-    pid = _inbox_owner(inbox)
-    identity = _process(pid) if pid is not None else None
-    try:
-        bound = datetime.fromisoformat(str(bound_at).replace("Z", "+00:00")).timestamp()
-        boot = int(next(line.split()[1] for line in (PROC / "stat").read_text().splitlines()
-                        if line.startswith("btime ")))
-    except (OSError, ValueError, StopIteration, IndexError):
-        return False
-    return identity is not None and boot + identity[1] / os.sysconf("SC_CLK_TCK") <= bound - 1
+    return entry if entry is not None and _owns(entry) else None
 
 
 # Where each recipient holds a role, so a signal recorded in one checkout's ledger can wake it in its own. A hint

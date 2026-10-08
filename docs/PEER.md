@@ -676,15 +676,19 @@ A binding names the session, which survives `claude --resume`; its inbox is
 named after the session's process and moves on every restart. So each
 session's Multithread hook reports its current inbox at start and on every
 prompt, with that process's identity (boot, process id and start time), into
-an owner-only map beside the recipient index (`claude-inboxes.json`; only a
-process the inbox is named after, running above the hook, can report it). A
-wake goes to the inbox the bound session last reported while that exact
-process still runs, so a restarted or resumed session is reachable again from
-its first prompt without binding again. A binding made before any report is
-used only while the process behind its stored inbox started before the
-binding. Anything else is `NOT RUNNING` (exit 4, nothing sent, the message
-id stays unused): a process id that comes round again belongs to another
-session, which never receives a wake meant for this one. An inbox that is
+an owner-only map beside the recipient index (`claude-inboxes.json`, in the
+account's home, never an ambient `HOME`). Only a process the inbox is named
+after, running above the hook, can report it. One process can switch sessions
+(`/clear`, `/resume`), so only a session's start may take a socket another
+live session holds; a later report or a `bind` only creates or refreshes, and
+Claude Code runs these hooks to completion before continuing. A wake goes to
+the inbox the bound session last reported while that exact process still runs,
+and checks the process listening on the connected socket before sending. A
+restarted or resumed session is reachable again from its first prompt without
+binding again; a binding with no report, such as one made by an earlier
+release, is reachable from its session's next prompt. Anything else is
+`NOT RUNNING` (exit 4, nothing sent, the message id stays unused): a socket
+another session now holds never receives a wake meant for this one. An inbox that is
 gone, fails its checks or refuses the connection is still `NOT SENT`. The
 same owner can refresh its binding; a new holder needs release or
 [authorized handover](#inspect-pending-work-and-role-handovers). In one live test before this command existed, an idle Claude

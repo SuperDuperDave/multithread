@@ -322,8 +322,10 @@ class WakeCase(unittest.TestCase):
         for pid in (7739, 7740, 7741):
             self.fake_process(pid)
         self.fake_process(os.getpid(), ppid=7739)
+        named_listener = lambda connection: (int(Path(connection.getpeername()).stem), os.getuid())
         for patcher in (mock.patch.object(wake, "PROC", self.proc),
-                        mock.patch.object(wake, "INBOXES", self.base / "inboxes.json")):
+                        mock.patch.object(wake, "INBOXES", self.base / "inboxes.json"),
+                        mock.patch.object(wake, "_listener", side_effect=named_listener)):
             patcher.start()
             self.addCleanup(patcher.stop)
 
@@ -506,6 +508,7 @@ class SenderContextTests(WakeCase):
         inbox = FakeInbox(self.codex_home / "7741.sock")
         self.inbox = inbox
         self.addCleanup(inbox.close)
+        self.fake_process(os.getpid(), ppid=7741)  # bound from inside that session
         code, out = self.run_helper(wake.bind_main, "reviewer", "--claude-socket", str(inbox.path),
                                     "--agent", "claude", "--session", "receiver", "--json")
         self.assertEqual(0, code, out)
@@ -1818,6 +1821,7 @@ class ClaudeTests(WakeCase):
         restarted = FakeInbox(self.codex_home / "7740.sock")
         self.addCleanup(restarted.close)
         shutil.rmtree(self.proc / "7739")  # the session restarted: its old process is gone
+        self.fake_process(os.getpid(), ppid=7740)
         self.assertEqual(0, self.bind_inbox(path=restarted.path)[0])
         delivered = self.wake_inbox()
         self.assertEqual("DELIVERED TO INBOX", delivered["status"], "following the next step delivers it")
@@ -1873,14 +1877,35 @@ class ClaudeTests(WakeCase):
                 self.assertEqual(("not_sent", "inbox_missing", "not running"),
                                  tuple(self.conclusion()[key] for key in ("outcome", "reason", "detail")))
 
-    def test_a_binding_from_before_sessions_reported_wakes_only_its_own_process(self):
+    def test_a_binding_without_a_report_is_not_running_until_its_session_reports(self):
+        # Bindings from before this release have no report; the stored socket is never trusted on its own.
         self.bind_inbox()
-        wake.INBOXES.unlink()  # bound by a release that kept no map
-        self.assertEqual("DELIVERED TO INBOX", self.wake_inbox()["status"], "the bound process still runs")
-        self.fake_process(7739, start=int((time.time() - 1000 + 60) * 100))
-        self.assertEqual("NOT RUNNING", self.wake_inbox("--id", "after-reuse")["status"],
-                         "a younger process is not the one bound")
-        self.assertEqual(1, len(self.inbox.lines))
+        wake.INBOXES.unlink()
+        self.assertEqual("NOT RUNNING", self.wake_inbox()["status"])
+        self.assertEqual([], self.inbox.lines)
+        self.assertTrue(wake.remember_inbox("self", str(self.inbox_path)), "its next prompt reports it")
+        self.assertEqual("DELIVERED TO INBOX", self.wake_inbox()["status"], "the same message id is still unused")
+
+    def test_a_session_switch_in_one_process_moves_the_socket_and_a_late_report_cannot_take_it_back(self):
+        # Sol on f353f6a: /clear or /resume puts session B on A's process and socket.
+        self.bind_inbox()  # A is "self"
+        self.assertTrue(wake.remember_inbox("switched-to", str(self.inbox_path), claim=True), "B's start claims it")
+        self.assertFalse(wake.remember_inbox("self", str(self.inbox_path)), "a late report from A is refused")
+        self.assertEqual(["switched-to"], list(json.loads(wake.INBOXES.read_text())))
+        result = self.wake_inbox()
+        self.assertEqual("NOT RUNNING", result["status"], result)
+        self.assertEqual([], self.inbox.lines, "A's wake never reaches B")
+        self.assertTrue(wake.remember_inbox("self", str(self.inbox_path), claim=True), "/resume back to A claims it")
+        self.assertEqual("DELIVERED TO INBOX", self.wake_inbox()["status"])
+
+    def test_a_socket_taken_over_between_check_and_send_receives_nothing(self):
+        # Sol on f353f6a: the path is checked, then connected; the listener is checked again after connecting.
+        self.bind_inbox()
+        with mock.patch.object(wake, "_listener", return_value=(4242, os.getuid())):
+            result = self.wake_inbox()
+        self.assertEqual("NOT RUNNING", result["status"], result)
+        self.assertIn("now held by another process (process 4242 is listening on it", result["happened"])
+        self.assertEqual([], self.inbox.lines)
 
     def test_only_a_session_can_report_its_own_inbox(self):
         self.assertFalse(wake.remember_inbox("self", str(self.codex_home / "7740.sock")), "7740 isn't an ancestor")
@@ -1896,7 +1921,7 @@ class ClaudeTests(WakeCase):
     def test_the_hook_reports_its_session_inbox_and_never_fails_for_it(self):
         with mock.patch.dict(os.environ, {"CLAUDE_CODE_MESSAGING_SOCKET": str(self.inbox_path)}):
             runtime_cli._report_inbox("self")
-            self.assertEqual(str(self.inbox_path), wake.live_inbox("self"))
+            self.assertEqual(str(self.inbox_path), wake.live_inbox("self")["inbox"])
             with mock.patch.object(wake, "remember_inbox", side_effect=OSError("synthetic")):
                 runtime_cli._report_inbox("self")
 
@@ -1906,6 +1931,30 @@ class ClaudeTests(WakeCase):
         bound = self.events("wake.bound")[-1]
         self.assertEqual([f"reviewer: active, bound to the Claude Code inbox {self.inbox_path} (binding "
                           f"{bound['seq']}, by claude:self at {bound['recorded_at']})"], out.splitlines())
+
+
+class InboxListenerTests(unittest.TestCase):
+    def test_the_kernel_names_the_listening_process(self):
+        directory = tempfile.mkdtemp(prefix="w", dir="/tmp" if len(tempfile.gettempdir()) > 40 else None)
+        self.addCleanup(shutil.rmtree, directory, True)
+        path = os.path.join(directory, "inbox.sock")
+        ready, release = os.pipe(), os.pipe()
+        child = os.fork()
+        if child == 0:
+            server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            server.bind(path)
+            server.listen(1)
+            os.write(ready[1], b"1")
+            os.read(release[0], 1)
+            os._exit(0)
+        self.addCleanup(os.waitpid, child, 0)
+        self.addCleanup(os.write, release[1], b"1")
+        os.read(ready[0], 1)
+        identity = wake._process(child)
+        self.assertIsNotNone(identity)
+        with self.assertRaises(wake.InboxNotOwner):
+            wake.deliver(path, "x", owner=(child + 1, *identity))
+        wake.deliver(path, "x", owner=(child, *identity))
 
 
 class SignalWakeTests(ClaudeTests):
