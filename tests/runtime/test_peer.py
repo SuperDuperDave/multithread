@@ -1203,6 +1203,8 @@ class PeerTests(unittest.TestCase):
                   mock.patch.object(peer, "_WSL_CLAUDE_POLICY", policy), mock.patch.object(peer, "_WSL_REG", reg),
                   mock.patch.object(peer, "_is_wsl", return_value=wsl), mock.patch.object(peer, "_REG_BACKOFF", (0, 0, 0)),
                   mock.patch.object(peer, "_REG_TIMEOUT", 0.5),
+                  mock.patch.object(peer, "_POLICY_CACHE", self.base / "policy-read.json"),
+                  mock.patch.object(peer, "_POLICY_CACHE_SECONDS", -1),  # every case here reads afresh
                   mock.patch.dict(os.environ, environ or {"CLAUDE_CONFIG_DIR": str(home)})):
                 return peer._managed_claude_sources(cwd or self.repo)
         self.assertEqual([], sources())
@@ -1329,6 +1331,73 @@ class PeerTests(unittest.TestCase):
         if running():
             os.kill(descendant, signal.SIGKILL)
             self.fail("the descendant outlived the restricted fault")
+
+    def test_parallel_calls_read_the_windows_policy_once_and_one_at_a_time(self):
+        # WSL's interop drops some launches made in a burst (each fails after 10 s), so parallel restricted calls
+        # once refused together; now one reads while the rest wait, and they reuse its clean read.
+        import threading
+        reg, log, answer = self.base / "reg.exe", self.base / "reg.log", self.base / "reg-exit"
+        answer.write_text("0")
+        reg.write_text(f"#!{sys.executable}\nimport os,sys,time\nL={str(log)!r}\n"
+                       "def mark(w):\n    fd=os.open(L,os.O_WRONLY|os.O_APPEND|os.O_CREAT);os.write(fd,f'{w} {time.monotonic()}\\n'.encode());os.close(fd)\n"
+                       f"mark('start');time.sleep(0.1);mark('end');code=int(open({str(answer)!r}).read())\n"
+                       "sys.stdout.write('' if code else '\\r\\n'+{'HKLM':'HKEY_LOCAL_MACHINE','HKCU':'HKEY_CURRENT_USER'}[sys.argv[2][:4]]+sys.argv[2][4:]+'\\\\Microsoft\\r\\n');sys.exit(code)\n")
+        reg.chmod(0o700)
+        cache = self.base / "state" / "policy-read.json"
+        def reads():
+            return [line.split()[0] for line in log.read_text().splitlines()].count("start") if log.exists() else 0
+        with (mock.patch.object(peer, "_MANAGED_CLAUDE_SETTINGS", {}), mock.patch.object(peer, "_WSL_REG", reg),
+              mock.patch.object(peer, "_WSL_CLAUDE_POLICY", self.base / "no-policy"),
+              mock.patch.object(peer, "_is_wsl", return_value=True), mock.patch.object(peer, "_REG_BACKOFF", (0, 0, 0)),
+              mock.patch.object(peer, "_POLICY_CACHE", cache),
+              mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.base / "claude-home")})):
+            results = []
+            threads = [threading.Thread(target=lambda: results.append(peer._managed_claude_sources(self.repo)))
+                       for _ in range(6)]
+            [thread.start() for thread in threads]
+            [thread.join() for thread in threads]
+            self.assertEqual([[]] * 6, results)
+            self.assertEqual(2, reads(), "one read of each parent serves every waiting call")
+            depth = peak = 0
+            for line in sorted(log.read_text().splitlines(), key=lambda line: float(line.split()[1])):
+                depth += 1 if line.startswith("start") else -1
+                peak = max(peak, depth)
+            self.assertEqual(1, peak, "never two launches at once")
+            self.assertEqual(0o600, cache.stat().st_mode & 0o777)
+            # A stale, foreign-boot or loosely permissioned record is not reused.
+            for name, change in (("stale", lambda value: {**value, "at": value["at"] - 31}),
+                                 ("another boot", lambda value: {**value, "boot": "another"}),
+                                 ("another reg.exe", lambda value: {**value, "reg": "/elsewhere/reg.exe"}),
+                                 ("readable by others", None)):
+                with self.subTest(cache=name):
+                    before = reads()
+                    if change is None:
+                        cache.chmod(0o644)
+                    else:
+                        cache.write_text(json.dumps(change(json.loads(cache.read_text()))))
+                    self.assertEqual([], peer._managed_claude_sources(self.repo))
+                    self.assertEqual(before + 2, reads())
+            # A failed read refuses and is never kept: the next call reads again.
+            cache.unlink()
+            answer.write_text("1")
+            before = reads()
+            self.assertEqual(2, len(peer._managed_claude_sources(self.repo)))
+            self.assertFalse(cache.exists())
+            answer.write_text("0")
+            self.assertEqual([], peer._managed_claude_sources(self.repo))
+            self.assertEqual(before + 8 + 2, reads())
+            # A reader that never finishes leaves the others refusing, not reading alongside it.
+            import fcntl
+            holder = os.open(cache.with_suffix(".lock"), os.O_RDWR)
+            fcntl.flock(holder, fcntl.LOCK_EX)
+            try:
+                with mock.patch.object(peer, "_POLICY_LOCK_SECONDS", 0.2):
+                    cache.unlink()
+                    found = peer._managed_claude_sources(self.repo)
+            finally:
+                os.close(holder)
+            self.assertEqual(2, len(found))
+            self.assertIn("another policy read did not finish", found[0])
 
     def test_the_cli_keywords_for_every_tool_are_not_tool_names(self):
         for word in ("default", "all", "Read,ALL"):

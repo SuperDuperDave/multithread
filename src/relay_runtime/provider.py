@@ -9,6 +9,7 @@ workflow completion. Provider configuration comes from the installed worker.
 import argparse
 from collections import Counter
 from contextlib import contextmanager
+import fcntl
 import hashlib
 import json
 import math
@@ -485,6 +486,12 @@ def _claude_config_home(cwd):
 # while one normally answers in 40 ms); a read that hangs or fails is retried after these pauses.
 _REG_BACKOFF = (0.2, 0.5, 1.0)
 _REG_TIMEOUT = 3
+# WSL's interop drops some launches made in a burst (seven or more at once here): each fails after 10 s with
+# "UtilAcceptVsock: accept4 failed 110". Parallel calls therefore read the policy one at a time, and a clean read
+# is reused for a few seconds, no longer than the preflight's own check-to-launch gap matters.
+_POLICY_CACHE = Path(os.path.expanduser("~/.local/share/relay/windows-policy-read.json"))
+_POLICY_CACHE_SECONDS = 30
+_POLICY_LOCK_SECONDS = 40
 _HIVES = {"HKLM": "HKEY_LOCAL_MACHINE", "HKCU": "HKEY_CURRENT_USER"}
 
 
@@ -525,6 +532,76 @@ def _reg_query(parent):
     return None, failure
 
 
+def _boot_clock():
+    """This boot's identity and its clock, which every process on the machine shares."""
+    try:
+        return Path("/proc/sys/kernel/random/boot_id").read_text().strip(), time.clock_gettime(time.CLOCK_BOOTTIME)
+    except (OSError, AttributeError):
+        return None, None
+
+
+def _cached_policy():
+    boot, now = _boot_clock()
+    try:
+        fd = os.open(_POLICY_CACHE, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError:
+        return None
+    try:
+        status = os.fstat(fd)
+        if status.st_uid != os.getuid() or status.st_mode & 0o077 or status.st_size > 1 << 20:
+            return None
+        value = json.loads(os.read(fd, status.st_size + 1))
+    except (OSError, ValueError):
+        return None
+    finally:
+        os.close(fd)
+    listings = value.get("listings") if isinstance(value, dict) else None
+    fresh = (boot is not None and value.get("boot") == boot and value.get("reg") == str(_WSL_REG)
+             and type(value.get("at")) is float and 0 <= now - value["at"] <= _POLICY_CACHE_SECONDS)
+    if (not fresh or not isinstance(listings, dict) or set(listings) != set(_WSL_POLICY_PARENTS)
+            or not all(isinstance(lines, list) and all(isinstance(line, str) for line in lines)
+                       for lines in listings.values())):
+        return None
+    return {parent: (listings[parent], None) for parent in _WSL_POLICY_PARENTS}
+
+
+def _policy_listings():
+    """Each policy parent's listing, or None and why. One reader at a time on this machine; the calls that waited
+    reuse its clean read. A failed read is never kept, so it can only refuse."""
+    try:
+        _POLICY_CACHE.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        lock = os.open(_POLICY_CACHE.with_suffix(".lock"), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    except OSError:
+        lock = None  # nowhere to coordinate: read alone, as before
+    try:
+        if lock is not None:
+            deadline = time.monotonic() + _POLICY_LOCK_SECONDS
+            while True:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        return {parent: (None, "another policy read did not finish") for parent in _WSL_POLICY_PARENTS}
+                    time.sleep(0.05)
+            cached = _cached_policy()
+            if cached is not None:
+                return cached
+        listings = {parent: _reg_query(parent) for parent in _WSL_POLICY_PARENTS}
+        boot, now = _boot_clock()
+        if lock is not None and boot is not None and all(listed is not None for listed, _ in listings.values()):
+            try:
+                _atomic_record(_POLICY_CACHE.parent, _POLICY_CACHE.name,
+                               {"boot": boot, "at": float(now), "reg": str(_WSL_REG),
+                                "listings": {parent: listed for parent, (listed, _) in listings.items()}})
+            except OSError:
+                pass  # the next call reads again
+        return listings
+    finally:
+        if lock is not None:
+            os.close(lock)
+
+
 def _managed_claude_sources(cwd):
     """Managed Claude settings this machine would apply to a restricted call: a best-effort preflight.
 
@@ -540,8 +617,7 @@ def _managed_claude_sources(cwd):
         if _WSL_CLAUDE_POLICY.exists():
             found.append(str(_WSL_CLAUDE_POLICY))
         if _WSL_REG.exists():
-            for parent in _WSL_POLICY_PARENTS:
-                listed, failure = _reg_query(parent)
+            for parent, (listed, failure) in _policy_listings().items():
                 if listed is None:
                     found.append(parent + f"\\ClaudeCode (unreadable after {len(_REG_BACKOFF) + 1} attempts: {failure})")
                     continue
