@@ -76,6 +76,7 @@ def _parser():
                                       ("setup", "check readiness or explicitly enroll this repository"),
                                       ("update", "review and explicitly install a public release update"),
                                       ("wake", "send a short attributed wake to a bound Codex conversation"),
+                                      ("wake-index", "rebuild the account's index of where wake recipients hold roles"),
                                       ("observe", "inspect a guarded Codex role and original queue without sending")):
                 native = action.add_parser(name, help=description, add_help=False)
                 native.add_argument("--help", action="store_true", dest="native_help")
@@ -599,7 +600,7 @@ def _native_arguments(args, global_repos=()):
     if args.native_help:
         forwarded += ["--help"]
     boundary = forwarded.index("--") if "--" in forwarded else len(forwarded)
-    scoped = args.command != "hooks" and not (
+    scoped = args.command not in ("hooks", "wake-index") and not (  # account-wide: no checkout
         args.command == "agent" and forwarded[:2] in (
             ["muse", "list"], ["muse", "inspect"], ["muse", "register"], ["muse", "remove"])) and not (
         args.command == "peer" and forwarded[:1] in (["report"], ["control"]))
@@ -672,7 +673,8 @@ def main(argv=None, *, registry=None, command_alias_check=None):
         args = core_cli.parse(parser, raw[:boundary] + ["wake"])
         args.command, args.provider_args = "signal-wake", raw[boundary + 1:]
     else:
-        helper = boundary < len(raw) and raw[boundary] in {"agent", "bind", "hooks", "setup", "update", "wake", "observe"}
+        helper = boundary < len(raw) and raw[boundary] in {"agent", "bind", "hooks", "setup", "update", "wake",
+                                                                   "wake-index", "observe"}
         args = core_cli.parse(parser, raw[:boundary + 1] if helper else raw)
         if helper:
             args.provider_args = raw[boundary + 1:]
@@ -684,8 +686,8 @@ def main(argv=None, *, registry=None, command_alias_check=None):
     try:
         if args.state_home is not None or "RELAY_HOME" in os.environ:
             raise StateError("installed Multithread refuses state-directory overrides")
-        if args.command in {"agent", "bind", "hooks", "launch", "peer", "setup", "update", "wake", "observe",
-                            "signal-wake"}:
+        if args.command in {"agent", "bind", "hooks", "launch", "peer", "setup", "update", "wake", "wake-index",
+                            "observe", "signal-wake"}:
             forwarded = _native_arguments(args, global_repos)
             # A compatibility invocation must verify the preferred alias before
             # any helper executes it. Keep hooks and read-only runtime diagnosis
@@ -703,10 +705,10 @@ def main(argv=None, *, registry=None, command_alias_check=None):
             from .hooks import hooks_main
             from .setup import setup_main
             from .update import update_main
-            from .wake import bind_main, wake_main, observe_main, signal_wake_main
+            from .wake import bind_main, wake_main, wake_index_main, observe_main, signal_wake_main
             return {"agent": agent_main, "bind": bind_main, "hooks": hooks_main, "launch": launch_main,
                     "peer": peer_main, "setup": setup_main, "update": update_main,
-                    "wake": wake_main, "observe": observe_main,
+                    "wake": wake_main, "wake-index": wake_index_main, "observe": observe_main,
                     "signal-wake": signal_wake_main}[args.command](forwarded)
         if args.command == "provider-hook":
             seen = {}

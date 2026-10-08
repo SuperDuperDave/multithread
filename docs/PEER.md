@@ -460,7 +460,9 @@ binding, pointing back at the signal. `bind` records where each recipient holds
 a role in an account index (`wake-recipients.json` beside the ledgers' state:
 `RELAY_HOME`, else `~/.local/share/relay`; owner only); the index is only a hint, and a wake goes out only when that checkout's
 own binding names the exact session. Running `bind` again records an existing
-binding. A recipient bound nowhere reachable is reported `NOT BOUND` with the
+binding; `multithread wake-index rebuild` records every enrolled checkout's
+bindings at once, with one read per ledger and no other write. A ledger that
+doesn't answer keeps its earlier places and is named. A recipient bound nowhere reachable is reported `NOT BOUND` with the
 command that wakes it by hand. A ledger is named by its primary checkout, which
 outlives the linked worktrees that share it. As with a local rebind, sending the
 same signal again after its recipient binds in another checkout wakes it there

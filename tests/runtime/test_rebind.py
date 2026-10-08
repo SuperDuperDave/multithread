@@ -213,6 +213,9 @@ class RebindTests(unittest.TestCase):
         self.apply(case, old, plan["expected_binding"])
         self.assert_preserved(case, before, identities)
         self.assert_real_ledger(case, 2)
+        # The original authority and the new path's alias name one checkout, listed once at its new place.
+        found, unreadable = case.registry.checkouts()
+        self.assertEqual(([case.repo.resolve()], []), ([path.resolve() for path in found], unreadable))
 
     def test_explicit_git_repair_restores_peer_topology_before_main_rebind(self):
         case = self.case

@@ -34,7 +34,7 @@ from relay_core.protocol import (ValidationError, canonical_agent, canonical_wak
                                  canonical_wake_role, canonical_wake_sender, canonical_wake_thread,
                                  wake_ref_sequence)
 from . import account_launcher, hooks
-from .enrollment import NotEnrolled
+from .enrollment import EnrollmentError, NotEnrolled, Registry
 
 SOCKET = Path("app-server-control") / "app-server-control.sock"
 EXIT_CODES = {"STEERED": 0, "QUEUED": 0, "DELIVERED TO INBOX": 0, "DRY RUN": 0, "STATUS": 0,
@@ -1249,9 +1249,9 @@ def _places():
     return _read_places(_recipients_path())[0]
 
 
-def _remember(recipient, checkout, role):
-    """Record where a recipient holds a role; a failure costs only the cross-ledger lookup. An unusable index is
-    set aside, never overwritten."""
+def _rewrite_places(change):
+    """Replace the index with change(places) under its lock; False when it could not be written, which costs only
+    the cross-ledger lookup. An unusable index is set aside, never overwritten."""
     path = _recipients_path()
     try:
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -1271,9 +1271,7 @@ def _remember(recipient, checkout, role):
         places, usable = _read_places(path)
         if not usable:
             os.replace(path, path.with_name(f"{path.name}.unusable-{time.time_ns()}"))
-        place = {"checkout": checkout, "role": role}
-        kept = [place, *(item for item in places.pop(recipient, []) if item != place)][:_RECIPIENT_PLACES]
-        places = {**dict(list(places.items())[-(_RECIPIENTS_KEPT - 1):]), recipient: kept}  # newest last
+        places = change(places)
         fd, temporary = tempfile.mkstemp(prefix=".recipients-", dir=path.parent)
         try:
             with os.fdopen(fd, "w") as stream:
@@ -1290,6 +1288,87 @@ def _remember(recipient, checkout, role):
         return False
     finally:
         os.close(lock)
+
+
+def _placed(places, recipient, place):
+    """places with recipient's newest place first and recipient itself newest, within both bounds."""
+    kept = [place, *(item for item in places.pop(recipient, []) if item != place)][:_RECIPIENT_PLACES]
+    return {**dict(list(places.items())[-(_RECIPIENTS_KEPT - 1):]), recipient: kept}
+
+
+def _remember(recipient, checkout, role):
+    """Record where a recipient holds a role."""
+    return _rewrite_places(lambda places: _placed(places, recipient, {"checkout": checkout, "role": role}))
+
+
+def rebuild_index(ledger=launcher_ledger, checkouts=None):
+    """Record every active or paused binding in every enrolled checkout's ledger, so bindings made before the
+    index existed are found without each holder binding again. One read per ledger; only the index is written.
+    A ledger that answers replaces its places; one that doesn't keeps them, since unavailable is not empty."""
+    skipped = []
+    if checkouts is None:
+        try:
+            checkouts, unreadable = Registry.for_account().checkouts()
+        except EnrollmentError as exc:
+            return {"schema": 1, "status": "NOT REBUILT", "exit_code": 1, "ledgers": 0, "places": 0,
+                    "skipped": [], "happened": f"The account's enrollments could not be read ({exc}); the index "
+                                               "is unchanged."}
+        skipped += [{"checkout": None, "problem": f"enrollment record {name}: {problem}"}
+                    for name, problem in unreadable]
+    answered, found = set(), []
+    for checkout in checkouts:
+        code, shown, problem = ledger(Path(checkout), "wake-ledger", "show")
+        if (code != 0 or not isinstance(shown, dict) or not isinstance(shown.get("bindings"), list)
+                or not isinstance(shown.get("ledger"), str)):
+            skipped.append({"checkout": str(checkout), "problem": problem or "its answer listed no bindings"})
+            continue
+        answered.add(shown["ledger"])
+        for binding in shown["bindings"]:
+            if not isinstance(binding, dict) or binding.get("state") not in ("active", "paused"):
+                continue
+            if binding.get("provider") == "codex":
+                names, recipient = [binding.get("thread")], _recipient("codex", None, None, binding.get("thread"))
+            else:
+                names = [binding.get("bound_agent"), binding.get("bound_session")]
+                recipient = _recipient("claude", *names, None)
+            if all(isinstance(name, str) and name for name in names) and isinstance(binding.get("role"), str):
+                found.append((str(binding.get("bound_at") or ""), recipient,
+                              {"checkout": shown["ledger"], "role": binding["role"]}))
+
+    def change(places):
+        places = {key: kept for key, items in places.items()
+                  if (kept := [item for item in items if item["checkout"] not in answered])}
+        for _, recipient, place in sorted(found, key=lambda item: item[0]):  # oldest first, so the newest ends last
+            places = _placed(places, recipient, place)
+        return places
+
+    written = _rewrite_places(change)
+    status = "NOT REBUILT" if not written else "PARTIAL" if skipped else "REBUILT"
+    happened = (f"Read {len(answered)} ledger(s) and recorded {len(found)} binding(s) in {_recipients_path()}."
+                if written else f"Read {len(answered)} ledger(s), but {_recipients_path()} could not be written; "
+                "it is unchanged.")
+    if skipped and written:
+        happened += f" {len(skipped)} could not be read; places in their ledgers are kept."
+    return {"schema": 1, "status": status, "exit_code": 0 if status == "REBUILT" else 1, "ledgers": len(answered),
+            "places": len(found), "skipped": skipped, "happened": happened}
+
+
+def wake_index_main(argv=None, *, ledger=launcher_ledger):
+    parser = argparse.ArgumentParser(prog="multithread wake-index", description=(
+        "The account's index of where each wake recipient holds a role, which lets a signal recorded in one "
+        "checkout wake its recipient in another. `bind` keeps it current; `rebuild` reads every enrolled "
+        "checkout's bindings once and records them, writing nothing else."))
+    parser.add_argument("action", choices=("rebuild",))
+    parser.add_argument("--json", action="store_true", help="one JSON object with the same outcome")
+    args = parser.parse_args(argv)
+    result = rebuild_index(ledger)
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    else:
+        print(_printable(f"{result['status']}: {result['happened']}"))
+        for item in result["skipped"]:
+            print(_printable(f"Not read: {item['checkout'] or 'an enrollment'}: {item['problem']}"))
+    return result["exit_code"]
 
 
 def _wake_where_bound(args, ledger, repo, here, seq, recorded, target_agent, target_session, agent, session):

@@ -63,6 +63,23 @@ class EnrollmentTests(unittest.TestCase):
     def record_path(self):
         return next(self.registry.root.glob("*.json"))
 
+    def test_checkouts_lists_each_enrolled_checkout_and_names_an_unreadable_record(self):
+        self.assertEqual(([], []), self.registry.checkouts(), "no registry is no enrollments")
+        other = self.second_repo()
+        self.registry.enroll(self.repo)
+        self.registry.enroll(other)
+        before = snapshot(self.base)
+        found, unreadable = self.registry.checkouts()
+        self.assertEqual(sorted([self.repo.resolve(), other.resolve()]), sorted(path.resolve() for path in found))
+        self.assertEqual([], unreadable)
+        self.assertEqual(before, snapshot(self.base), "listing enrollments changed something")
+        damaged = self.registry.root / (hashlib.sha256(os.fsencode(str((other / ".git").resolve()))).hexdigest()
+                                        + ".json")
+        damaged.write_text("{}")
+        found, unreadable = self.registry.checkouts()
+        self.assertEqual([self.repo.resolve()], [path.resolve() for path in found], "one bad record spoils no other")
+        self.assertEqual([damaged.name], [name for name, _ in unreadable])
+
     def test_unknown_lookup_does_not_create_anything(self):
         self.assert_refusal_unchanged(lambda: self.registry.lookup(self.repo))
         self.assertFalse(self.registry.root.exists())

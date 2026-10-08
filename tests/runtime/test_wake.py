@@ -2008,6 +2008,43 @@ class SignalWakeTests(ClaudeTests):
         self.assertIn(f"ledger sequence {seq} in {self.repo.resolve()}", b"".join(self.inbox.lines).decode())
         self.assertNotIn(str(linked), b"".join(self.inbox.lines).decode())
 
+    def test_rebuild_finds_bindings_the_index_never_saw_and_keeps_what_it_could_not_read(self):
+        # A role bound before 0.4.28 is in no index until its holder binds again; rebuild reads every ledger once.
+        other = self.other_checkout()
+        with redirect_stdout(io.StringIO()):
+            wake.bind_main(["reviewer", "--repo", str(other), "--claude-socket", str(self.inbox_path),
+                            "--agent", "claude", "--session", "self", "--json"], ledger=self.ledger)
+        self.bound()  # and a Codex role here
+        there, here = (self.ledger(repo, "wake-ledger", "show")[1]["ledger"] for repo in (other, self.repo))
+        unreachable = self.base / "unreachable"
+        claude, codex = json.dumps(["claude", "claude", "self"]), json.dumps(["codex", THREAD])
+        wake.RECIPIENTS.write_text(json.dumps({claude: [{"checkout": there, "role": "unbound-since"},
+                                                        {"checkout": str(unreachable), "role": "kept"}]}))
+        shared = self.ledger
+
+        def ledger(repo, *arguments):
+            if Path(repo) == unreachable:
+                return None, None, "it didn't answer within 30 s"
+            return shared(repo, *arguments)
+        calls = len(self.ledger_calls)
+        result = wake.rebuild_index(ledger, checkouts=[self.repo, other, unreachable])
+        self.assertEqual(("PARTIAL", 1, 2, 2), (result["status"], result["exit_code"], result["ledgers"],
+                                                 result["places"]), result)
+        self.assertEqual([{"checkout": str(unreachable), "problem": "it didn't answer within 30 s"}],
+                         result["skipped"])
+        self.assertEqual([("wake-ledger", "show")] * 2, [arguments for _, arguments in self.ledger_calls[calls:]],
+                         "one read per ledger and no write")
+        self.assertEqual({claude: [{"checkout": there, "role": "reviewer"},
+                                   {"checkout": str(unreachable), "role": "kept"}],
+                          codex: [{"checkout": here, "role": "operator"}]}, json.loads(wake.RECIPIENTS.read_text()),
+                         "an answering ledger's places are replaced; an unanswering one's are kept")
+        self.assertEqual("DELIVERED TO INBOX", self.signal_wake()["status"])
+        self.assertEqual("REBUILT", wake.rebuild_index(self.ledger, checkouts=[self.repo, other])["status"])
+        with mock.patch.object(wake, "_rewrite_places", return_value=False):
+            result = wake.rebuild_index(self.ledger, checkouts=[self.repo])
+        self.assertEqual(("NOT REBUILT", 1), (result["status"], result["exit_code"]))
+        self.assertIn("could not be written; it is unchanged", result["happened"])
+
     def test_the_index_keeps_recent_recipients_and_sets_an_unusable_file_aside(self):
         with mock.patch.object(wake, "_RECIPIENTS_KEPT", 3):
             for name in ("z", "y", "a", "b", "y"):  # recency, not alphabetical order, decides what stays
@@ -2414,6 +2451,20 @@ class RoutingTests(unittest.TestCase):
                     code = runtime_cli.main(["--repo", "/srv/checkout", "--json", command, *argv])
                 self.assertEqual(5, code)
                 helper.assert_called_once_with([*argv, "--repo", "/srv/checkout", "--json"])
+
+    def test_wake_index_is_account_wide_so_no_checkout_is_forwarded(self):
+        with mock.patch("relay_runtime.wake.wake_index_main", return_value=1) as helper:
+            code = runtime_cli.main(["--repo", "/srv/checkout", "--json", "wake-index", "rebuild"])
+        self.assertEqual(1, code)
+        helper.assert_called_once_with(["rebuild", "--json"])
+        result = {"schema": 1, "status": "PARTIAL", "exit_code": 1, "ledgers": 2, "places": 3,
+                  "skipped": [{"checkout": "/srv/gone", "problem": "it didn't answer within 30 s"}],
+                  "happened": "Read 2 ledger(s) and recorded 3 binding(s)."}
+        out = io.StringIO()
+        with mock.patch.object(wake, "rebuild_index", return_value=result), redirect_stdout(out):
+            self.assertEqual(1, wake.wake_index_main(["rebuild"]))
+        self.assertEqual("PARTIAL: Read 2 ledger(s) and recorded 3 binding(s).\n"
+                         "Not read: /srv/gone: it didn't answer within 30 s\n", out.getvalue())
 
     def test_read_only_worker_profile_covers_exactly_the_wake_reads(self):
         parser = runtime_cli._parser()

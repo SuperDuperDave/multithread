@@ -1099,6 +1099,36 @@ class Registry:
         except OSError as exc:
             raise EnrollmentError("enrollment identity is unavailable; no state was opened") from exc
 
+    def checkouts(self) -> tuple[list[Path], list[tuple[str, str]]]:
+        """Every enrolled primary checkout, read-only, and each record that could not be read. No registry means
+        no enrollments; an unreadable record is reported, never taken as absent."""
+        try:
+            with _Custody() as custody:
+                registry = _held_unless_absent(self.root, custody, private=True)
+                if registry is None:
+                    return [], []
+                with os.scandir(registry.fd) as entries:
+                    names = []
+                    for count, entry in enumerate(entries, 1):
+                        if count > _MAX_REGISTRY_ENTRIES:
+                            raise EnrollmentError("account binding inventory exceeds its supported bound")
+                        if _AUTHORITY.fullmatch(entry.name):
+                            names.append(entry.name)
+                custody.verify()
+        except OSError as exc:
+            raise EnrollmentError("the account's enrollments are unavailable") from exc
+        found, unreadable = [], []
+        for name in sorted(names):
+            try:
+                with _Custody() as custody:  # one record's fault never spoils another's custody
+                    record, authority = self._route(custody.get(self.root, private=True), name)
+            except (OSError, EnrollmentError) as exc:
+                unreadable.append((name, str(exc) or type(exc).__name__))
+                continue
+            if authority == name:  # an alias is read through its authority
+                found.append(Path(record["common"]).parent)
+        return found, unreadable
+
     def enroll(self, repo: str | os.PathLike[str]) -> Enrollment:
         """Explicitly reserve one workspace; never adopt existing state."""
         publication_started = False
