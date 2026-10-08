@@ -1314,12 +1314,15 @@ def rebuild_index(ledger=launcher_ledger, checkouts=None):
             checkouts, unreadable = Registry.for_account().checkouts()
         except EnrollmentError as exc:
             return {"schema": 1, "status": "NOT REBUILT", "exit_code": 1, "ledgers": 0, "places": 0, "dropped": 0,
-                    "skipped": [], "happened": f"The account's enrollments could not be read ({exc}); the index "
+                    "skipped": [], "gone": [], "happened": f"The account's enrollments could not be read ({exc}); the index "
                                                "is unchanged."}
         skipped += [{"checkout": None, "problem": f"enrollment record {name}: {problem}"}
                     for name, problem in unreadable]
-    read, found = 0, []
+    read, found, gone = 0, [], []
     for checkout in checkouts:
+        if not os.path.lexists(checkout):  # positively absent: a removed checkout's enrollment, not an unread ledger
+            gone.append(str(checkout))
+            continue
         code, shown, problem = ledger(Path(checkout), "wake-ledger", "show")
         if (code != 0 or not isinstance(shown, dict) or not isinstance(shown.get("bindings"), list)
                 or not isinstance(shown.get("ledger"), str)):
@@ -1363,10 +1366,12 @@ def rebuild_index(ledger=launcher_ledger, checkouts=None):
                          f"{_RECIPIENTS_KEPT} recipients).")
         if skipped:
             happened += f" {len(skipped)} could not be read; their bindings were not added."
+        if gone:
+            happened += f" {len(gone)} enrolled checkout(s) no longer exist."
     else:
         happened = f"Read {read} ledger(s), but {_recipients_path()} could not be written; it is unchanged."
     return {"schema": 1, "status": status, "exit_code": 0 if status == "REBUILT" else 1, "ledgers": read,
-            "places": len(found), "dropped": dropped, "skipped": skipped, "happened": happened}
+            "places": len(found), "dropped": dropped, "skipped": skipped, "gone": gone, "happened": happened}
 
 
 def wake_index_main(argv=None, *, ledger=launcher_ledger):

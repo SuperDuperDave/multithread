@@ -2016,7 +2016,8 @@ class SignalWakeTests(ClaudeTests):
                             "--agent", "claude", "--session", "self", "--json"], ledger=self.ledger)
         self.bound()  # and a Codex role here
         there, here = (self.ledger(repo, "wake-ledger", "show")[1]["ledger"] for repo in (other, self.repo))
-        unreachable = self.base / "unreachable"
+        unreachable, removed = self.base / "unreachable", self.base / "removed"
+        unreachable.mkdir()
         claude, codex = json.dumps(["claude", "claude", "self"]), json.dumps(["codex", THREAD])
         wake.RECIPIENTS.write_text(json.dumps({claude: [{"checkout": there, "role": "unbound-since"},
                                                         {"checkout": str(unreachable), "role": "kept"}]}))
@@ -2027,7 +2028,7 @@ class SignalWakeTests(ClaudeTests):
                 return None, None, "it didn't answer within 30 s"
             return shared(repo, *arguments)
         calls = len(self.ledger_calls)
-        result = wake.rebuild_index(ledger, checkouts=[self.repo, other, unreachable])
+        result = wake.rebuild_index(ledger, checkouts=[self.repo, other, unreachable, removed])
         self.assertEqual(("PARTIAL", 1, 2, 2), (result["status"], result["exit_code"], result["ledgers"],
                                                  result["places"]), result)
         self.assertEqual([{"checkout": str(unreachable), "problem": "it didn't answer within 30 s"}],
@@ -2040,8 +2041,12 @@ class SignalWakeTests(ClaudeTests):
                           codex: [{"checkout": here, "role": "operator"}]}, json.loads(wake.RECIPIENTS.read_text()),
                          "what was found now comes first; a stale place stays, since every use verifies it")
         self.assertIn("1 could not be read; their bindings were not added", result["happened"])
+        self.assertEqual([str(removed)], result["gone"], "a removed checkout is gone, not unread, and is never asked")
+        self.assertNotIn(str(removed), json.dumps(self.ledger_calls))
+        result = wake.rebuild_index(self.ledger, checkouts=[self.repo, other, removed])
+        self.assertEqual(("REBUILT", 0), (result["status"], result["exit_code"]), "a gone checkout isn't a failure")
+        self.assertIn("1 enrolled checkout(s) no longer exist", result["happened"])
         self.assertEqual("DELIVERED TO INBOX", self.signal_wake()["status"])
-        self.assertEqual("REBUILT", wake.rebuild_index(self.ledger, checkouts=[self.repo, other])["status"])
         with mock.patch.object(wake, "_rewrite_places", return_value=False):
             result = wake.rebuild_index(self.ledger, checkouts=[self.repo])
         self.assertEqual(("NOT REBUILT", 1), (result["status"], result["exit_code"]))
@@ -2361,7 +2366,10 @@ class WakeIndexRebuildTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(prefix="relay-wake-index-")
         self.addCleanup(temporary.cleanup)
-        patcher = mock.patch.object(wake, "RECIPIENTS", Path(temporary.name) / "recipients.json")
+        self.base = Path(temporary.name)
+        for name in ("a", "b", "l"):
+            (self.base / name).mkdir()
+        patcher = mock.patch.object(wake, "RECIPIENTS", self.base / "recipients.json")
         patcher.start()
         self.addCleanup(patcher.stop)
 
@@ -2381,21 +2389,22 @@ class WakeIndexRebuildTests(unittest.TestCase):
         wake.RECIPIENTS.write_text(json.dumps({self.key("r"): [{"checkout": "/old", "role": "w"}],
                                                self.key("x"): [{"checkout": "/x", "role": "x"}]}))
         wake.RECIPIENTS.chmod(0o600)
+        a, b = str(self.base / "a"), str(self.base / "b")
         answers = {
-            "/a": {"ledger": "/a-primary", "bindings": [
+            a: {"ledger": "/a-primary", "bindings": [
                 self.claude("r", "early", "2026-01-01T00:00:00Z"), self.claude("s", "s", "2026-02-01T00:00:00Z"),
                 {"provider": "codex", "thread": THREAD, "role": "paused", "bound_at": "2026-03-01T00:00:00Z",
                  "state": "paused"},
                 self.claude("gone", "gone", "2026-05-01T00:00:00Z", state="unbound")]},
-            "/b": {"ledger": "/b", "bindings": [
+            b: {"ledger": "/b", "bindings": [
                 self.claude("r", "late", "2026-04-01T00:00:00Z"), self.claude("u", "u", "2026-01-15T00:00:00Z")]}}
 
         def ledger(repo, *arguments):
-            if str(repo) == "/b":  # another session binds after /a was read, before the index is written
+            if str(repo) == b:  # another session binds after /a was read, before the index is written
                 self.assertTrue(wake._remember(self.key("h"), "/a-primary", "fresh"))
             return 0, answers[str(repo)], ""
         with mock.patch.object(wake, "_RECIPIENT_PLACES", 2), mock.patch.object(wake, "_RECIPIENTS_KEPT", 6):
-            result = wake.rebuild_index(ledger, checkouts=["/a", "/b"])
+            result = wake.rebuild_index(ledger, checkouts=[a, b])
         self.assertEqual(("REBUILT", 0, 2, 5, 1), tuple(result[name] for name in (
             "status", "exit_code", "ledgers", "places", "dropped")), result)
         self.assertIn("1 older place(s) fell outside the bounds (2 per recipient", result["happened"])
@@ -2415,7 +2424,8 @@ class WakeIndexRebuildTests(unittest.TestCase):
         bindings = [self.claude("r", "old", "2026-01-01T00:00:00Z"), self.claude("a", "a", "2026-02-01T00:00:00Z"),
                     self.claude("b", "b", "2026-03-01T00:00:00Z"), self.claude("r", "new", "2026-04-01T00:00:00Z")]
         with mock.patch.object(wake, "_RECIPIENTS_KEPT", 3):
-            result = wake.rebuild_index(lambda *_: (0, {"ledger": "/l", "bindings": bindings}, ""), checkouts=["/l"])
+            result = wake.rebuild_index(lambda *_: (0, {"ledger": "/l", "bindings": bindings}, ""),
+                                        checkouts=[self.base / "l"])
         self.assertEqual(0, result["dropped"])
         self.assertEqual([{"checkout": "/l", "role": "new"}, {"checkout": "/l", "role": "old"}],
                          self.index()[self.key("r")])
