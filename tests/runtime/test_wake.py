@@ -1898,6 +1898,20 @@ class ClaudeTests(WakeCase):
         self.assertTrue(wake.remember_inbox("self", str(self.inbox_path), claim=True), "/resume back to A claims it")
         self.assertEqual("DELIVERED TO INBOX", self.wake_inbox()["status"])
 
+    def test_a_session_switch_while_connecting_sends_nothing(self):
+        # Daybreak Blue on 6dc7d72: the wake read A's entry, then /resume switched the same process to B.
+        self.bind_inbox()
+        listener = wake._listener
+
+        def switch_then_listen(connection):
+            self.assertTrue(wake.remember_inbox("switched-to", str(self.inbox_path), claim=True))
+            return listener(connection)
+        with mock.patch.object(wake, "_listener", side_effect=switch_then_listen):
+            result = self.wake_inbox()
+        self.assertEqual("NOT RUNNING", result["status"], result)
+        self.assertIn("another session took it over while connecting", result["happened"])
+        self.assertEqual([], self.inbox.lines)
+
     def test_a_socket_taken_over_between_check_and_send_receives_nothing(self):
         # Sol on f353f6a: the path is checked, then connected; the listener is checked again after connecting.
         self.bind_inbox()

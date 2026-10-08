@@ -688,7 +688,10 @@ restarted or resumed session is reachable again from its first prompt without
 binding again; a binding with no report, such as one made by an earlier
 release, is reachable from its session's next prompt. Anything else is
 `NOT RUNNING` (exit 4, nothing sent, the message id stays unused): a socket
-another session now holds never receives a wake meant for this one. An inbox that is
+another session now holds never receives a wake meant for this one. The map is
+checked again just before sending; a wake that lands in the moment between a
+`/clear` or `/resume` and the new session's start report can still reach the
+new conversation in that same window. An inbox that is
 gone, fails its checks or refuses the connection is still `NOT SENT`. The
 same owner can refresh its binding; a new holder needs release or
 [authorized handover](#inspect-pending-work-and-role-handovers). In one live test before this command existed, an idle Claude

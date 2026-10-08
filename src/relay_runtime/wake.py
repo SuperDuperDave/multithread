@@ -355,10 +355,11 @@ class InboxNotOwner(Exception):
     """The connected inbox belongs to a process other than the bound session's, so nothing was sent."""
 
 
-def deliver(path, text, timeout=_INBOX_TIMEOUT, owner=None):
+def deliver(path, text, timeout=_INBOX_TIMEOUT, owner=None, still=None):
     """Write the one user line Claude Code reads; the line is ready before connecting. With owner (pid, boot id,
     start), the process listening on the connected socket must be exactly that one before anything is sent: the
-    path was checked earlier, and a process id can come round again in between."""
+    path was checked earlier, and a process id can come round again in between. still() is asked last, just before
+    sending: one process can switch sessions while this connects."""
     line = (json.dumps({"type": "user", "message": {"role": "user", "content": text}}, ensure_ascii=True)
             + "\n").encode("ascii")
     connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -375,6 +376,8 @@ def deliver(path, text, timeout=_INBOX_TIMEOUT, owner=None):
                 raise InboxNotOwner(f"its listener couldn't be identified ({_detail(exc)})") from None
             if uid != os.getuid() or pid != owner[0] or _process(pid) != owner[1:]:
                 raise InboxNotOwner(f"process {pid} is listening on it, not the session's process {owner[0]}")
+        if still is not None and not still():
+            raise InboxNotOwner("another session took it over while connecting")
         try:
             connection.sendall(line)
         except OSError as exc:
@@ -1155,7 +1158,8 @@ def _wake_inbox(args, role, binding, text, message_id, base, conclude):
         return _outcome("DRY RUN", f"Would deliver to the Claude Code inbox at {path} for {role}. Nothing was "
                         "sent." + unsteered, "Run again without --dry-run to send.", **base)
     try:
-        deliver(path, text, owner=(entry["pid"], entry["boot_id"], entry["start"]))
+        deliver(path, text, owner=(entry["pid"], entry["boot_id"], entry["start"]),
+                still=lambda: live_inbox(session) == entry)
     except InboxNotOwner as exc:
         return not_running(f"the inbox it reported, {path}, is now held by another process ({exc})")
     except InboxRefused as exc:
