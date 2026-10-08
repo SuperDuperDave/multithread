@@ -29,7 +29,8 @@ import time
 
 from relay_core.protocol import (ValidationError, canonical_agent, canonical_wake_expectation,
                                  canonical_wake_message_id, canonical_wake_project, canonical_wake_ref,
-                                 canonical_wake_role, canonical_wake_sender, canonical_wake_thread)
+                                 canonical_wake_role, canonical_wake_sender, canonical_wake_thread,
+                                 wake_ref_sequence)
 from . import account_launcher, hooks
 from .enrollment import NotEnrolled
 
@@ -735,7 +736,8 @@ def fingerprint(path):
 
 def message_text(agent, ref, ledger, sender=None):
     """The whole wake: who sends it and where the work is, never the work itself."""
-    where = f"ledger sequence {ref} in {ledger}" if ref.isdigit() else ref
+    sequence = wake_ref_sequence(ref)
+    where = ref if sequence is None else f"ledger sequence {sequence[1]} in {sequence[0] or ledger}"
     context = ""
     if sender is not None:
         label = f"{sender['project']}/{sender['role']}" if sender["project"] else sender["role"]
@@ -847,7 +849,7 @@ def wake(args, ledger=launcher_ledger):
     except ValidationError as exc:
         return _outcome("NOT SENT", f"The wake wasn't sent: {exc}.", "Correct that and run this again.")
     content = []
-    if not ref.isdigit():
+    if wake_ref_sequence(ref) is None:
         try:
             sha256, size = fingerprint(ref)
         except (FileNotFoundError, NotADirectoryError, IsADirectoryError):
@@ -1234,12 +1236,18 @@ def signal_wake(args, rest, ledger=launcher_ledger):
     bindings = sorted((binding for binding in shown.get("bindings", []) if isinstance(binding, dict)
                        and _receives(binding, target_agent, target_session)), key=lambda binding: binding["role"])
     active = [binding for binding in bindings if binding["state"] == "active"]
-    if not active:
+    if bindings and not active:
         paused = ", ".join(binding["role"] for binding in bindings)
-        why = (f"that session's binding ({paused}) is paused" if paused
-               else "no role in this ledger is bound to that session")
-        return _outcome("NOT SENT", f"Recorded signal {seq} for {target_agent} {target_session}, but {why}, so no "
-                        "wake was sent.", later, signal=recorded)
+        return _outcome("NOT SENT", f"Recorded signal {seq} for {target_agent} {target_session}, but that "
+                        f"session's binding ({paused}) is paused, so no wake was sent.", later, signal=recorded)
+    if not active:
+        # Its briefs read the ledger of the checkout it works in, which may not be this one.
+        here = shown.get("ledger") if isinstance(shown.get("ledger"), str) else str(repo)
+        return _outcome("NOT BOUND", f"Recorded signal {seq} for {target_agent} {target_session}, but no role in "
+                        "this ledger is bound to that session, so it wasn't woken, and it sees the signal only if "
+                        "it reads this ledger.", "If it works in another checkout, wake its role there: multithread "
+                        f"wake <role> --repo <its checkout> --ref {shlex.quote(f'ledger:{here}#{seq}')}.",
+                        signal=recorded)
     binding = active[0]
     wake_args = argparse.Namespace(repo=str(repo), steer=args.steer, agent=agent, session=session,
                                    role=binding["role"], ref=str(seq), message_id=None, dry_run=False,

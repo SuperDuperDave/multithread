@@ -1018,7 +1018,7 @@ class WakeCommandTests(WakeLedgerCase):
         code, _, err = self.cli("--json", "wake-ledger", "plan", "operator", "--ref", "task.md",
                                 "--requested", "queue")
         self.assertEqual(64, code)
-        self.assertIn("ref must be an absolute task-file path or a ledger sequence number", err)
+        self.assertIn("ref must be an absolute task-file path, a ledger sequence number or ledger:/checkout#N", err)
 
 
 if __name__ == "__main__":

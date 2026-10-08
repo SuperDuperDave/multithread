@@ -1824,6 +1824,7 @@ class RelayStore:
         recipient_agent, recipient_session = ("codex", holder["thread"]) if holder["provider"] == "codex" else (bound["agent"], bound["session"])
         recipient = f"{recipient_agent}:{recipient_session}"
         attempt.update(recipient=recipient, consumption_state="unknown")
+        # A sequence in another checkout's ledger is acknowledged there; its consumption is not observed here.
         signal = self._execute("SELECT kind FROM events WHERE seq = ?", (int(meta["ref"]),)).fetchone() if meta["ref"].isdigit() else None
         if signal is not None and signal["kind"] in DELIVERY_SIGNAL_KINDS:
             acknowledgement = self._execute(

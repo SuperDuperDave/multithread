@@ -13,6 +13,7 @@ import hashlib
 import io
 import json
 import os
+import shlex
 import re
 from pathlib import Path
 import shutil
@@ -1466,10 +1467,24 @@ class WakeLedgerTests(WakeCase):
         self.assertIn("ledger sequence 999 doesn't exist here", missing["happened"])
         self.assertEqual("Correct that and run this again.", missing["next"])
 
+    def test_a_sequence_in_another_ledger_names_that_checkout_and_never_collides(self):
+        # The conversation stays in the ledger where it started; only the wake crosses, naming where to read.
+        generation = self.bound()
+        elsewhere = self.wake(ref=f"ledger:/elsewhere/checkout#{generation}")
+        self.assertEqual(f"Multithread wake from claude: ledger sequence {generation} in /elsewhere/checkout",
+                         elsewhere["text"])
+        self.assertNotIn("ref_sha256", elsewhere, "a sequence carries no file content")
+        here = self.wake(ref=str(generation))
+        self.assertEqual("QUEUED", here["status"], "the same number in this ledger is another message")
+        self.assertNotEqual(elsewhere["message_id"], here["message_id"])
+        for bad in ("ledger:relative#3", "ledger:/x#0", "ledger:/x#", "ledger:/x"):
+            with self.subTest(ref=bad):
+                self.assertEqual("NOT SENT", self.wake(ref=bad)["status"])
+
     def test_bad_input_refuses_before_the_ledger_or_the_daemon(self):
         self.bound()
         cases = [
-            (["--ref", "relative/task.md"], "ref must be an absolute task-file path or a ledger sequence number"),
+            (["--ref", "relative/task.md"], "ref must be an absolute task-file path, a ledger sequence number or ledger:/checkout#N"),
             (["--ref", str(self.base / "missing.md")], "which isn't a file here"),
             (["--ref", str(self.task), "--id", "has space"], "message id must be"),
         ]
@@ -1852,11 +1867,13 @@ class SignalWakeTests(ClaudeTests):
     def test_a_session_without_a_binding_is_recorded_but_not_woken(self):
         self.bind_inbox()
         result = self.signal_wake(target=("claude", "someone-else"))
-        self.assertEqual(("NOT SENT", 4), (result["status"], result["exit_code"]))
+        self.assertEqual(("NOT BOUND", 4), (result["status"], result["exit_code"]))
         seq = self.signals()[-1]["seq"]
         self.assertEqual(seq, result["signal"]["seq"])
-        self.assertIn("no role in this ledger is bound to that session, so no wake was sent", result["happened"])
-        self.assertIn(f"--ref {seq}", result["next"])
+        self.assertIn("no role in this ledger is bound to that session, so it wasn't woken", result["happened"])
+        self.assertNotIn("next prompt", result["happened"] + result["next"], "its briefs may read another ledger")
+        # The remedy names this signal in this ledger, so a wake sent from another checkout points at it exactly.
+        self.assertIn("--ref " + shlex.quote(f"ledger:{self.repo}#{seq}"), result["next"])
         self.assertEqual([], self.events("wake.attempted"))
         self.assertEqual([], self.inbox.lines)
 

@@ -135,6 +135,8 @@ _WAKE_ROLE_RE = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
 _WAKE_PROJECT_RE = re.compile(r"^[a-z][a-z0-9-]{0,79}$")
 _WAKE_MESSAGE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _WAKE_SEQUENCE_REF_RE = re.compile(r"^[1-9][0-9]{0,11}$")
+# A sequence in another checkout's ledger: the conversation stays where it started, and only the wake crosses.
+_WAKE_LEDGER_REF_RE = re.compile(r"^ledger:(/.*)#([1-9][0-9]{0,11})$")
 _RESOURCE_RE = re.compile(
     r"^[a-z][a-z0-9-]{0,31}:[a-z0-9][a-z0-9._/+\-]{0,159}$"
 )
@@ -515,22 +517,33 @@ def canonical_wake_message_id(value: Any) -> str:
 
 
 def canonical_wake_ref(value: Any) -> str:
-    """A pointer the recipient can follow: an absolute file path or a ledger sequence."""
+    """A pointer the recipient can follow: an absolute file path, a sequence in the recipient's ledger, or
+    ledger:/checkout#N, a sequence in that checkout's ledger."""
 
     ref = _one_line("ref", value, 400)
     if ref != value or not (
-        _WAKE_SEQUENCE_REF_RE.fullmatch(ref) or ref.startswith("/")
+        _WAKE_SEQUENCE_REF_RE.fullmatch(ref) or _WAKE_LEDGER_REF_RE.fullmatch(ref) or ref.startswith("/")
     ):
         raise ValidationError(
-            "ref must be an absolute task-file path or a ledger sequence number"
+            "ref must be an absolute task-file path, a ledger sequence number or ledger:/checkout#N"
         )
     return ref
+
+
+def wake_ref_sequence(ref: str) -> tuple[str | None, int] | None:
+    """For a sequence reference, the checkout whose ledger holds it (None: the recipient's own) and the
+    sequence; None for a task file."""
+
+    if _WAKE_SEQUENCE_REF_RE.fullmatch(ref):
+        return None, int(ref)
+    match = _WAKE_LEDGER_REF_RE.fullmatch(ref)
+    return (match.group(1), int(match.group(2))) if match else None
 
 
 def canonical_wake_content(ref: str, sha256: Any, size: Any) -> None:
     """A file reference names its bytes by sha256 and size; a sequence names neither."""
 
-    if ref.isdigit():
+    if wake_ref_sequence(ref) is not None:
         if sha256 is not None or size is not None:
             raise ValidationError("a ledger sequence reference carries no file sha256 or size")
         return
