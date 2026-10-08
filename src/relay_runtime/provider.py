@@ -493,6 +493,11 @@ _POLICY_CACHE = Path(os.path.expanduser("~/.local/share/relay/windows-policy-rea
 _POLICY_CACHE_SECONDS = 30
 _POLICY_FAILURE_SECONDS = 5
 _POLICY_STALE_SECONDS = 6 * 3600
+# Fresh-read outcomes kept to tell a masked outage from a blip: a stand-in kept young by an occasional lucky read
+# would otherwise hide that most reads fail.
+_POLICY_OUTCOMES = 20
+_INTEROP_WINDOW = 3600
+_INTEROP_MINIMUM = 8
 _POLICY_LOCK_SECONDS = 40
 _HIVES = {"HKLM": "HKEY_LOCAL_MACHINE", "HKCU": "HKEY_CURRENT_USER"}
 
@@ -566,21 +571,26 @@ def _policy_record():
     try:
         fd = os.open(_POLICY_CACHE, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
     except OSError:
-        return {"parents": {}, "failed": None}
+        return {"parents": {}, "failed": None, "outcomes": []}
     try:
         status = os.fstat(fd)
         if status.st_uid != os.getuid() or status.st_mode & 0o077 or status.st_size > 1 << 20:
-            return {"parents": {}, "failed": None}
+            return {"parents": {}, "failed": None, "outcomes": []}
         value = json.loads(os.read(fd, status.st_size + 1))
     except (OSError, ValueError):
-        return {"parents": {}, "failed": None}
+        return {"parents": {}, "failed": None, "outcomes": []}
     finally:
         os.close(fd)
     if not isinstance(value, dict) or boot is None or value.get("boot") != boot or value.get("reg") != str(_WSL_REG):
-        return {"parents": {}, "failed": None}
+        return {"parents": {}, "failed": None, "outcomes": []}
     lines = lambda listed: isinstance(listed, list) and all(isinstance(line, str) for line in listed)
     stamped = lambda entry: isinstance(entry, dict) and all(
         type(entry.get(key)) is float and math.isfinite(entry[key]) for key in ("at", "wall"))
+    outcomes = value.get("outcomes", [])
+    if not (isinstance(outcomes, list) and len(outcomes) <= _POLICY_OUTCOMES and all(
+            isinstance(item, list) and len(item) == 2 and type(item[0]) is float and math.isfinite(item[0])
+            and type(item[1]) is bool for item in outcomes)):
+        return {"parents": {}, "failed": None, "outcomes": []}
     parents = value.get("parents") if isinstance(value.get("parents"), dict) else {}
     failed, reads = value.get("failed"), (value.get("failed") or {}).get("reads") if isinstance(value.get("failed"), dict) else None
     failed_ok = (stamped(failed) and isinstance(reads, dict) and set(reads) == set(_WSL_POLICY_PARENTS)
@@ -588,10 +598,20 @@ def _policy_record():
                          or (read[0] is None and isinstance(read[1], str))) for read in reads.values())
                  and any(read[0] is None for read in reads.values()))
     if failed is not None and not failed_ok:
-        return {"parents": {}, "failed": None}  # a record with a malformed part is not used at all
+        return {"parents": {}, "failed": None, "outcomes": []}  # a record with a malformed part is not used at all
     return {"parents": {parent: entry for parent, entry in parents.items()
                         if parent in _WSL_POLICY_PARENTS and stamped(entry) and lines(entry.get("lines"))},
-            "failed": failed if failed_ok else None}
+            "failed": failed if failed_ok else None, "outcomes": outcomes}
+
+
+def _interop_health(outcomes, wall):
+    """When most recent fresh reads failed, how many and since when: a hint that WSL needs a restart."""
+    recent = [(at, ok) for at, ok in outcomes if wall is not None and 0 <= wall - at <= _INTEROP_WINDOW]
+    failed = [at for at, ok in recent if not ok]
+    if len(recent) < _INTEROP_MINIMUM or 2 * len(failed) < len(recent):
+        return None
+    return {"failed": len(failed), "of": len(recent),
+            "since": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(min(failed)))}
 
 
 def _with_last_clean_read(listings, record, clock):
@@ -630,7 +650,7 @@ def _policy_listings():
             os.unlink(_POLICY_CACHE)
         except OSError:
             pass
-        return {parent: _reg_query(parent) for parent in _WSL_POLICY_PARENTS}, None
+        return {parent: _reg_query(parent) for parent in _WSL_POLICY_PARENTS}, None, None
     try:
         deadline = time.monotonic() + _POLICY_LOCK_SECONDS
         while True:
@@ -639,21 +659,23 @@ def _policy_listings():
                 break
             except BlockingIOError:
                 if time.monotonic() >= deadline:  # no read failed, so nothing stands in
-                    return {parent: (None, "another policy read did not finish") for parent in _WSL_POLICY_PARENTS}, None
+                    return ({parent: (None, "another policy read did not finish") for parent in _WSL_POLICY_PARENTS},
+                            None, None)
                 time.sleep(0.05)
         record, clock = _policy_record(), _clock()
         parents, failed = record["parents"], record["failed"]
+        health = _interop_health(record["outcomes"], clock[2])
         # Reuse needs the latest read to have been clean for every parent: successes from different reads never
         # combine past a failure between them.
         ages = [_age(parents[parent], clock) for parent in _WSL_POLICY_PARENTS if parent in parents]
         if (failed is None and len(ages) == len(_WSL_POLICY_PARENTS)
                 and all(age is not None and age <= _POLICY_CACHE_SECONDS for age in ages)):
-            return {parent: (parents[parent]["lines"], None) for parent in _WSL_POLICY_PARENTS}, None
+            return {parent: (parents[parent]["lines"], None) for parent in _WSL_POLICY_PARENTS}, None, health
         age = _age(failed, clock) if failed is not None else None
         if age is not None and age <= _POLICY_FAILURE_SECONDS:
             shared = {parent: (listed, failure and failure + ", read by another call")
                       for parent, (listed, failure) in failed["reads"].items()}
-            return _with_last_clean_read(shared, record, clock)
+            return (*_with_last_clean_read(shared, record, clock), health)
         listings = {parent: _reg_query(parent) for parent in _WSL_POLICY_PARENTS}
         if clock[0] is not None:
             try:  # every success is kept per parent, a positive too, so a later outage cannot erase it
@@ -661,8 +683,10 @@ def _policy_listings():
                 updated = {**parents, **{parent: {"at": float(clock[1]), "wall": float(clock[2]), "lines": listed}
                                          for parent, (listed, _) in listings.items() if listed is not None}}
                 ok = all(listed is not None for listed, _ in listings.values())
+                outcomes = [*record["outcomes"], [float(clock[2]), ok]][-_POLICY_OUTCOMES:]
+                health = _interop_health(outcomes, done[2])
                 _atomic_record(_POLICY_CACHE.parent, _POLICY_CACHE.name, {
-                    "boot": clock[0], "reg": str(_WSL_REG), "parents": updated,
+                    "boot": clock[0], "reg": str(_WSL_REG), "parents": updated, "outcomes": outcomes,
                     "failed": None if ok else {"at": float(done[1]), "wall": float(done[2]),
                                                "reads": {parent: list(read) for parent, read in listings.items()}}})
             except (OSError, TypeError):
@@ -671,17 +695,18 @@ def _policy_listings():
                     os.unlink(_POLICY_CACHE)
                 except OSError:
                     pass
-                record = {"parents": {}, "failed": None}
-        return _with_last_clean_read(listings, record, _clock())
+                record = {"parents": {}, "failed": None, "outcomes": []}
+        return (*_with_last_clean_read(listings, record, _clock()), health)
     finally:
         os.close(lock)
 
 
-def _managed_claude_sources(cwd, reused=None):
+def _managed_claude_sources(cwd, observed=None):
     """Managed Claude settings this machine would apply to a restricted call: a best-effort preflight.
 
-    Present, or unreadable, sources are returned; an empty list means none was found. When an earlier clean
-    Windows policy read stood in for a failed one, its description is appended to `reused`.
+    Present, or unreadable, sources are returned; an empty list means none was found. `observed` receives
+    windows_policy_reused when an earlier clean read stood in for a failed one, and windows_interop when most
+    recent fresh reads failed.
     """
     found = []
     machine = _MANAGED_CLAUDE_SETTINGS.get(platform.system())
@@ -693,9 +718,10 @@ def _managed_claude_sources(cwd, reused=None):
         if _WSL_CLAUDE_POLICY.exists():
             found.append(str(_WSL_CLAUDE_POLICY))
         if _WSL_REG.exists():
-            listings, reuse = _policy_listings()
-            if reuse is not None and reused is not None:
-                reused.append(reuse)
+            listings, reuse, health = _policy_listings()
+            if observed is not None:
+                observed.update({key: value for key, value in (("windows_policy_reused", reuse),
+                                                                ("windows_interop", health)) if value is not None})
             for parent, (listed, failure) in listings.items():
                 if listed is None:
                     found.append(parent + f"\\ClaudeCode (unreadable after {len(_REG_BACKOFF) + 1} attempts: {failure})")
@@ -1481,6 +1507,7 @@ def _run_peer(args, interruption):
     attachments = []
     envelope["attachments"] = []  # one shape for every record: a list, empty without --attach
     envelope["windows_policy_reused"] = None  # set when an earlier clean policy read stood in for a failed one
+    envelope["windows_interop"] = None  # set when most recent fresh policy reads failed: WSL needs a restart
     envelope["native_output_mode"] = "stream_json" if streaming else "final_json"
     try:
         task = _task(args.task_file)
@@ -1492,10 +1519,9 @@ def _run_peer(args, interruption):
                                    for item in attachments]
         stage = "relay_configuration"
         plan = prepare(args.client, args.repo, args.relay, args.provider)
-        reused = []
-        managed = _managed_claude_sources(plan["repo"], reused) if args.tools is not None else []
-        if reused:
-            envelope["windows_policy_reused"] = reused[0]
+        observed = {}
+        managed = _managed_claude_sources(plan["repo"], observed) if args.tools is not None else []
+        envelope.update(observed)
         if managed:
             raise LaunchError("Managed Claude settings were found (" + ", ".join(managed) + "); they stay in force under "
                               "--restricted, hooks included, so a --tools call cannot establish its registry. No provider was started.")
@@ -2219,6 +2245,11 @@ def _display_peer(envelope, *, report_entry=None):
     fault = envelope.get("control_fault")
     if isinstance(fault, dict):
         details.append(("Peer input", fault.get("detail")))
+    interop = envelope.get("windows_interop")
+    if isinstance(interop, dict):
+        details.append(("Windows interop", f"failed {interop.get('failed')} of {interop.get('of')} recent policy "
+                                           f"reads since {interop.get('since')}; restarting WSL (wsl --shutdown) "
+                                           "usually clears it"))
     reuse = envelope.get("windows_policy_reused")
     if isinstance(reuse, dict):
         details.append(("Windows policy", f"reused the last successful read, from {reuse.get('read_at')} "

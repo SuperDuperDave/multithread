@@ -1444,8 +1444,10 @@ class PeerTests(unittest.TestCase):
             answers.write_text(json.dumps({"HKLM": first, "HKCU": second}))
         def sources(**later):
             offset.update({"boot": 0.0, "wall": 0.0, **later})
-            reused = []
-            return peer._managed_claude_sources(self.repo, reused), reused
+            observed = {}
+            found = peer._managed_claude_sources(self.repo, observed)
+            sources.observed = observed
+            return found, [observed["windows_policy_reused"]] if "windows_policy_reused" in observed else []
         ok, dropped = ["Microsoft"], "vsock"
         with (mock.patch.object(peer, "_MANAGED_CLAUDE_SETTINGS", {}), mock.patch.object(peer, "_WSL_REG", reg),
               mock.patch.object(peer, "_WSL_CLAUDE_POLICY", self.base / "no-policy"),
@@ -1534,6 +1536,30 @@ class PeerTests(unittest.TestCase):
                 with mock.patch.object(peer.os, "open", side_effect=no_lock):
                     self.assertEqual([f"{hklm}\\ClaudeCode"], sources()[0])
                 self.assertFalse(cache.exists())
+            # Most recent fresh reads failing is named, even while a lucky read keeps the stand-in young.
+            with mock.patch.object(peer, "_POLICY_FAILURE_SECONDS", -1):
+                cache.unlink(missing_ok=True)
+                answer(ok, ok)
+                sources()
+                self.assertNotIn("windows_interop", sources.observed)
+                answer(dropped, dropped)
+                for _ in range(7):
+                    sources()
+                health = sources.observed["windows_interop"]
+                self.assertEqual((7, 8), (health["failed"], health["of"]))
+                self.assertRegex(health["since"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
+                answer(ok, ok)
+                for _ in range(6):
+                    sources()
+                self.assertIn("windows_interop", sources.observed, "half failed (7 of 14) still counts")
+                sources()
+                self.assertNotIn("windows_interop", sources.observed, "under half failed: healthy again")
+                value = json.loads(cache.read_text())
+                self.assertEqual(15, len(value["outcomes"]))
+                cache.write_text(json.dumps({**value, "outcomes": [["not a time", True]]}))
+                answer(dropped, dropped)
+                found, reused = sources()
+                self.assertEqual((2, []), (len(found), reused), "a record with malformed outcomes is not used at all")
             # The calls queued behind a failure get the same stand-in.
             cache.unlink(missing_ok=True)
             answer(ok, ok)
@@ -1555,8 +1581,8 @@ class PeerTests(unittest.TestCase):
             self.assertIn("another policy read did not finish", found[0])
         # The call's record and its display name the stand-in.
         stand_in = {"read_at": "2026-10-08T01:12:00Z", "age_seconds": 9600, "because": f"{hkcu}: timed out"}
-        def preflight(cwd, reused=None):
-            reused.append(stand_in)
+        def preflight(cwd, observed=None):
+            observed["windows_policy_reused"] = stand_in
             return []
         with mock.patch.object(peer, "_managed_claude_sources", side_effect=preflight):
             code, result, _ = self.invoke("--tools", "none", "--dry-run")
@@ -1567,6 +1593,19 @@ class PeerTests(unittest.TestCase):
         self.assertIn("Windows policy: reused the last successful read, from 2026-10-08T01:12:00Z (9600 s old), "
                       "because interop failed", output.getvalue())
         self.assertIsNone(self.invoke("--dry-run")[1]["windows_policy_reused"], "every record carries the field")
+        self.assertIsNone(self.invoke("--dry-run")[1]["windows_interop"], "every record carries the field")
+        failing = {"failed": 14, "of": 16, "since": "2026-10-08T05:50:00Z"}
+        def degraded(cwd, observed=None):
+            observed["windows_interop"] = failing
+            return []
+        with mock.patch.object(peer, "_managed_claude_sources", side_effect=degraded):
+            code, result, _ = self.invoke("--tools", "none", "--dry-run")
+        self.assertEqual((0, failing), (code, result["windows_interop"]), "a hint, not a gate")
+        output = io.StringIO()
+        with redirect_stdout(output), redirect_stderr(io.StringIO()):
+            peer._display_peer({**result, "state": "returned", "result": "ok"})
+        self.assertIn("Windows interop: failed 14 of 16 recent policy reads since 2026-10-08T05:50:00Z; restarting "
+                      "WSL (wsl --shutdown) usually clears it", output.getvalue())
 
     def test_the_cli_keywords_for_every_tool_are_not_tool_names(self):
         for word in ("default", "all", "Read,ALL"):
