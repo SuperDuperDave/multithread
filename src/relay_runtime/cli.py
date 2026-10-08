@@ -184,16 +184,17 @@ class InboxProblem(str):
 
 
 def _inbox_problem(inbox, written):
+    # Fixed text only: the inbox path and $CLAUDE_PID come from the environment and never reach model context.
     from .wake import _ancestors, _inbox_owner
     claude, pid = os.environ.get("CLAUDE_PID"), _inbox_owner(inbox)
     if inbox is None:
         why = "Claude Code gave this session no inbox ($CLAUDE_CODE_MESSAGING_SOCKET is unset)"
     elif pid is None:
-        why = f"its inbox {inbox} isn't named after a Claude Code process"
+        why = "its inbox isn't named after a Claude Code process"
     elif claude is not None and str(pid) != claude:
-        why = f"its inbox {inbox} belongs to another Claude Code process (this one is {claude})"
+        why = "its inbox belongs to another Claude Code process than this one ($CLAUDE_PID)"
     elif pid not in _ancestors():
-        why = f"the process its inbox {inbox} is named after isn't running this hook"
+        why = "the process its inbox is named after isn't running this hook"
     elif not written:
         why = ("the inbox map stayed busy, or another session's report holds this socket after a /clear or /resume; "
                "the next prompt reports again")
@@ -398,17 +399,19 @@ def _provider_worker(args):
             problem = getattr(args, "inbox_problem", None)
             if problem is not None and not getattr(args, "inbox_warning", None):
                 roles = [item["role"] for item in ledger.wake_bindings()["bindings"]
-                         if item["state"] != "unbound" and item["provider"] == "claude"
+                         if item["state"] == "active" and item["provider"] == "claude"
                          and item["bound_session"] == payload["session_id"]]
                 if roles:
                     args.inbox_warning = _role_warning(problem, roles)
+            warning = getattr(args, "inbox_warning", None)
+            if warning:
+                context = warning + "\n\n" + context
         if len(context.encode("utf-8")) > _MAX_PROVIDER_CONTEXT:
             raise StateError("provider context exceeded its bound")
     output = {"hookSpecificOutput": {"hookEventName": name, "additionalContext": context}}
     warning = getattr(args, "inbox_warning", None)
     if warning and name != "PostToolUse":
-        output = {"systemMessage": warning, "hookSpecificOutput": {
-            "hookEventName": name, "additionalContext": warning + "\n\n" + context}}
+        output = {"systemMessage": warning, **output}
     print(json.dumps(output, ensure_ascii=False, separators=(",", ":")))
     return 0
 

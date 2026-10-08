@@ -1823,8 +1823,8 @@ def _describe(binding):
     if claude:  # a wake follows the session to the inbox it last reported, not the socket it was bound with
         now, bound = binding.get("reported_inbox"), binding["endpoint"].removeprefix("unix://")
         lines.append(f"  inbox now: {now}, reported by its running process" if now else
-                     "  inbox now: none reported by a running process; it reports at its next prompt, and wakes "
-                     "say NOT RUNNING until then")
+                     "  inbox now: none reported by a running process; it reports at its next prompt"
+                     + (", and wakes say NOT RUNNING until then" if binding["state"] == "active" else ""))
         if now != bound:
             lines.append(f"  inbox when bound: {bound}")
     if binding["provider"] == "codex":
