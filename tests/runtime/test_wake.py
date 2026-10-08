@@ -2407,10 +2407,12 @@ class WakeIndexRebuildTests(unittest.TestCase):
             result = wake.rebuild_index(ledger, checkouts=[a, b])
         self.assertEqual(("REBUILT", 0, 2, 5, 1), tuple(result[name] for name in (
             "status", "exit_code", "ledgers", "places", "dropped")), result)
-        self.assertIn("1 older place(s) fell outside the bounds (2 per recipient", result["happened"])
+        self.assertIn("1 place(s) fell outside the bounds (2 per recipient", result["happened"])
         index = self.index()
-        self.assertEqual([self.key(name) for name in ("r", "x", "h", "u", "s")] + [json.dumps(["codex", THREAD])],
-                         list(index), "indexed recipients keep their recency; new ones join by their newest binding")
+        self.assertEqual([self.key(name) for name in ("r", "x", "u", "s")] + [json.dumps(["codex", THREAD]),
+                                                                            self.key("h")], list(index),
+                         "indexed recipients keep their recency, found ones join by their newest binding, and one "
+                         "bound during the scan is newest")
         self.assertEqual([{"checkout": "/b", "role": "late"}, {"checkout": "/a-primary", "role": "early"}],
                          index[self.key("r")], "newest binding first, under the place bound")
         self.assertEqual([{"checkout": "/a-primary", "role": "fresh"}], index[self.key("h")],
@@ -2420,15 +2422,47 @@ class WakeIndexRebuildTests(unittest.TestCase):
         self.assertNotIn(self.key("gone"), index)
 
     def test_a_recipient_found_twice_keeps_both_places_when_others_fill_the_bound(self):
-        # Sol on b2f63e8: trimming as each place went in evicted the recipient, then restored only its newest place.
+        # Sol on b2f63e8: trimming as each place went in evicted R once C arrived, then restored only R's newest.
         bindings = [self.claude("r", "old", "2026-01-01T00:00:00Z"), self.claude("a", "a", "2026-02-01T00:00:00Z"),
-                    self.claude("b", "b", "2026-03-01T00:00:00Z"), self.claude("r", "new", "2026-04-01T00:00:00Z")]
+                    self.claude("b", "b", "2026-03-01T00:00:00Z"), self.claude("c", "c", "2026-04-01T00:00:00Z"),
+                    self.claude("r", "new", "2026-05-01T00:00:00Z")]
         with mock.patch.object(wake, "_RECIPIENTS_KEPT", 3):
             result = wake.rebuild_index(lambda *_: (0, {"ledger": "/l", "bindings": bindings}, ""),
                                         checkouts=[self.base / "l"])
-        self.assertEqual(0, result["dropped"])
+        self.assertEqual(1, result["dropped"], "only the oldest recipient falls outside the bound")
+        self.assertEqual([self.key(name) for name in ("b", "c", "r")], list(self.index()))
         self.assertEqual([{"checkout": "/l", "role": "new"}, {"checkout": "/l", "role": "old"}],
                          self.index()[self.key("r")])
+
+    def test_a_place_bound_during_the_scan_outranks_every_place_the_scan_saw(self):
+        # Sol on a1c10ed: at the place bound, the snapshot's places pushed out the only current one.
+        seen = [{"checkout": "/l", "role": role} for role in ("one", "two")]
+        wake.RECIPIENTS.write_text(json.dumps({self.key("r"): seen}))
+        wake.RECIPIENTS.chmod(0o600)
+
+        def ledger(*_):
+            self.assertTrue(wake._remember(self.key("r"), "/elsewhere", "now"))  # unbound here, bound there
+            return 0, {"ledger": "/l", "bindings": [self.claude("r", "one", "2026-01-01T00:00:00Z"),
+                                                    self.claude("r", "two", "2026-02-01T00:00:00Z")]}, ""
+        with mock.patch.object(wake, "_RECIPIENT_PLACES", 2):
+            result = wake.rebuild_index(ledger, checkouts=[self.base / "l"])
+        self.assertEqual([{"checkout": "/elsewhere", "role": "now"}, {"checkout": "/l", "role": "two"}],
+                         self.index()[self.key("r")])
+        self.assertEqual(1, result["dropped"])
+
+    def test_a_checkout_that_cannot_be_inspected_is_unread_not_gone(self):
+        locked = self.base / "locked"
+        (locked / "repo").mkdir(parents=True)
+        locked.chmod(0)
+        self.addCleanup(locked.chmod, 0o700)
+        if os.access(locked, os.R_OK | os.X_OK):
+            self.skipTest("this account reads a mode-0 directory")
+        result = wake.rebuild_index(lambda *_: self.fail("an uninspectable checkout is not asked"),
+                                    checkouts=[locked / "repo", self.base / "never-existed"])
+        self.assertEqual(("PARTIAL", 1), (result["status"], result["exit_code"]))
+        self.assertEqual([str(locked / "repo")], [item["checkout"] for item in result["skipped"]])
+        self.assertIn("could not be inspected", result["skipped"][0]["problem"])
+        self.assertEqual([str(self.base / "never-existed")], result["gone"])
 
     def test_unreadable_enrollments_change_nothing(self):
         registry = mock.Mock()

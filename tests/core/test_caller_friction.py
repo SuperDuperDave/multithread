@@ -37,14 +37,18 @@ class CallerFrictionTests(unittest.TestCase):
         token = "A" * 21 + "-_" * 11  # 43 base64url characters, artificial
         for credential in ("Bearer " + "B" * 32, "Bearer very-secret-value", "Bearer TOPSECRET_CANARY_0123456789",
                            "Authorization: Bearer " + token, "bearer " + "abc.DEF_123~+/" * 3 + "==",
-                           "token in a sentence (Bearer abcdefghijklmnopqrstuvwxyz)."):
+                           "token in a sentence (Bearer abcdefghijklmnopqrstuvwxyz).",
+                           # Sol on 7669656: a quote, a JSON-escaped slash, a quoted JWT with short segments.
+                           'Bearer "' + "Q" * 32 + '"', "Bearer ab\\/" + "c" * 20,
+                           'Bearer "eyJ' + "a" * 5 + ".e30." + "s" * 10 + '"'):
             with self.subTest(credential=credential), \
                     self.assertRaisesRegex(ValidationError, "appears to contain a credential"):
                 normalize_event({**base, "summary": credential})
         for prose in ("Review the pairing boundary: bearer token issuance and device revocation",
                       "Claim: audit bearer auth on the pairing endpoint before slice 2 ships",
                       "Bearer tokens expire after 30 days; the bearer header is checked server-side",
-                      "Store the bearer credential in the keychain, never in logs"):
+                      "Store the bearer credential in the keychain, never in logs",
+                      'The "bearer" scheme, quoted: bearer "token" or bearer \\"auth\\"'):
             with self.subTest(prose=prose):
                 self.assertEqual(prose, normalize_event({**base, "summary": prose}).summary)
 

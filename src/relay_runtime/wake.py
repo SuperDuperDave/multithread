@@ -1318,10 +1318,16 @@ def rebuild_index(ledger=launcher_ledger, checkouts=None):
                                                "is unchanged."}
         skipped += [{"checkout": None, "problem": f"enrollment record {name}: {problem}"}
                     for name, problem in unreadable]
+    before = _places()  # a place recorded while the scan runs is newer than anything the scan saw
     read, found, gone = 0, [], []
     for checkout in checkouts:
-        if not os.path.lexists(checkout):  # positively absent: a removed checkout's enrollment, not an unread ledger
+        try:
+            os.lstat(checkout)
+        except (FileNotFoundError, NotADirectoryError):  # positively absent: a removed checkout's enrollment
             gone.append(str(checkout))
+            continue
+        except OSError as exc:  # present or not, it can't be read: unavailable is not absent
+            skipped.append({"checkout": str(checkout), "problem": f"it could not be inspected ({exc.strerror})"})
             continue
         code, shown, problem = ledger(Path(checkout), "wake-ledger", "show")
         if (code != 0 or not isinstance(shown, dict) or not isinstance(shown.get("bindings"), list)
@@ -1349,10 +1355,16 @@ def rebuild_index(ledger=launcher_ledger, checkouts=None):
 
     def change(places):
         nonlocal dropped
-        merged = dict(places)  # a recipient already indexed keeps its recency; a new one joins by its newest binding
-        for recipient in sorted(fresh, key=newest.get):
-            merged[recipient] = fresh[recipient] + [item for item in places.get(recipient, [])
-                                                    if item not in fresh[recipient]]
+        recent = {key: [item for item in items if item not in before.get(key, [])] for key, items in places.items()}
+        # Recency: recipients already indexed keep theirs, those found now join by their newest binding, and those
+        # bound during the scan are newest of all. Within a recipient: bound during the scan, found now, earlier.
+        order = [key for key in places if key in before and not recent[key]]
+        order += [key for key in sorted(fresh, key=newest.get) if key not in places]
+        order += [key for key in places if key not in order]
+        merged = {}
+        for key in order:
+            ranked = recent.get(key, []) + fresh.get(key, []) + places.get(key, [])
+            merged[key] = [item for index, item in enumerate(ranked) if item not in ranked[:index]]
         bounded = {key: items[:_RECIPIENT_PLACES] for key, items in list(merged.items())[-_RECIPIENTS_KEPT:]}
         dropped = sum(map(len, merged.values())) - sum(map(len, bounded.values()))
         return bounded
@@ -1362,7 +1374,7 @@ def rebuild_index(ledger=launcher_ledger, checkouts=None):
     if written:
         happened = f"Read {read} ledger(s) and recorded {len(found)} binding(s) in {_recipients_path()}."
         if dropped:
-            happened += (f" {dropped} older place(s) fell outside the bounds ({_RECIPIENT_PLACES} per recipient, "
+            happened += (f" {dropped} place(s) fell outside the bounds ({_RECIPIENT_PLACES} per recipient, "
                          f"{_RECIPIENTS_KEPT} recipients).")
         if skipped:
             happened += f" {len(skipped)} could not be read; their bindings were not added."
