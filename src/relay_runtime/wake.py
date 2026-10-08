@@ -534,7 +534,7 @@ def _observation_binding(ledger, repo, role, expected, deadline):
             or len(endpoint) > 4096 or not Path(endpoint.removeprefix("unix://")).is_absolute()):
         raise Unusable("binding_malformed")
     # History may advance independently of a binding; it is neither a target nor a fence.
-    return {key: value for key, value in binding.items() if key != "last_attempt"}
+    return {key: value for key, value in binding.items() if key not in ("last_attempt", "earlier_attempt")}
 
 
 def _observation_runtime(reply, thread_id):
@@ -1843,10 +1843,14 @@ def _describe(binding):
         lines.append(f"  scope: {binding['role_scope']}")
     if binding.get("charter") is not None:
         lines.append(f"  charter: {binding['charter']}")
-    last = binding.get("last_attempt")
+    last, earlier = binding.get("last_attempt"), binding.get("earlier_attempt")
     if last:
         lines.append(f"  last wake: {last['message_id']} {last['outcome']} at {last['at']} "
                      f"(ledger seq {last['seq']})")
+    elif earlier and binding["state"] != "unbound":
+        lines.append(f"  last wake: none under binding {binding['generation']}; the last was "
+                     f"{earlier['message_id']} {earlier['outcome']} at {earlier['at']} under binding "
+                     f"{earlier['generation']} (ledger seq {earlier['seq']})")
     return lines
 
 
