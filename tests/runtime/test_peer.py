@@ -1304,10 +1304,18 @@ class PeerTests(unittest.TestCase):
         from relay_runtime import claude_peer
         # The leader exits and is reaped while a descendant keeps running in its group: a restricted fault kills the
         # descendant at once, with no shutdown grace.
-        process = subprocess.Popen(["sh", "-c", "sleep 30 & exit 0"], start_new_session=True,
-                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        process = subprocess.Popen(["sh", "-c", "sleep 30 & echo $!; exit 0"], start_new_session=True,
+                                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        descendant = int(process.stdout.readline())
+        process.stdout.close()
         process.wait()
         os.killpg(process.pid, 0)  # the descendant still holds the group
+        def running():  # a killed process awaiting its reaper is a zombie, not a survivor
+            try:
+                stat = Path(f"/proc/{descendant}/stat").read_text()
+            except FileNotFoundError:
+                return False
+            return stat.rsplit(")", 1)[1].split()[0] not in ("Z", "X")
         envelope = {"partial_result": "words written before the fault"}
         driver = claude_peer._Driver(process, b"task", str(self.repo), None, envelope, 1, None, tools=[])
         driver.results = [{"result_excerpt": "THE ANSWER", "result_excerpt_truncated": False}]
@@ -1316,14 +1324,10 @@ class PeerTests(unittest.TestCase):
         self.assertNotIn("partial_result", envelope)
         self.assertIsNone(driver.results[0]["result_excerpt"])
         deadline = time.monotonic() + 5
-        while time.monotonic() < deadline:
-            try:
-                os.killpg(process.pid, 0)
-            except ProcessLookupError:
-                break
+        while time.monotonic() < deadline and running():
             time.sleep(0.02)
-        else:
-            os.killpg(process.pid, signal.SIGKILL)
+        if running():
+            os.kill(descendant, signal.SIGKILL)
             self.fail("the descendant outlived the restricted fault")
 
     def test_the_cli_keywords_for_every_tool_are_not_tool_names(self):

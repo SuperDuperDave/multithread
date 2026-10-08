@@ -336,7 +336,8 @@ class _Driver:
             record["result_excerpt"], record["result_excerpt_truncated"] = None, False
         try:
             # The provider leads its own group, and descendants that outlive the leader keep it. The kernel never
-            # reissues a number still used as a group ID, so this reaches only this call's processes.
+            # reissues a number still used as a group ID, so while any remain this reaches only them; an emptied
+            # group's number can be reused, an accepted risk shared with the ordinary cleanup.
             os.killpg(self.process.pid, signal.SIGKILL)
         except (ProcessLookupError, PermissionError, AttributeError, TypeError):
             pass
