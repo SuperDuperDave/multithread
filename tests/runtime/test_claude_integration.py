@@ -35,7 +35,7 @@ class ClaudeIntegrationTests(unittest.TestCase):
                      'REQUESTS_PATH': str(self.requests)}
         self.executable(self.provider, ''.join(f'{key} = {value!r}\n' for key, value in constants.items()) + source)
 
-    def invoke(self, steps, *, update=False, closure_fault=False, progress_only=False, restricted=False):
+    def invoke(self, steps, *, update=False, closure_fault=False, progress_only=False, restricted=False, recorded=True):
         self.plan_claude()
         self.specification.write_text(json.dumps(steps))
         directory = self.base / 'stream-evidence'
@@ -69,8 +69,9 @@ class ClaudeIntegrationTests(unittest.TestCase):
               mock.patch.object(control.CallControl, 'set_target', advertise)):
             code = peer.peer_main(arguments)
         value = json.loads(output.getvalue())
-        self.assertTrue((directory/'result.json').exists(), value.get('message'))  # a refusal names its reason
-        self.assertEqual(value, json.loads((directory/'result.json').read_text()))
+        if recorded:
+            self.assertTrue((directory/'result.json').exists(), value.get('message'))  # a refusal names its reason
+            self.assertEqual(value, json.loads((directory/'result.json').read_text()))
         self.assertIsNotNone(value['process_exit_code'], (value.get('unavailable_stage'), value.get('message')))
         self.assertEqual('not_checked', value['workflow_completion'])
         receipt = directory/'control/receipts'/(identifier+'.json')
@@ -262,6 +263,24 @@ class RestrictedCallTests(ClaudeIntegrationTests):
             self.assertIn(flag, argv)
         self.assertEqual('', argv[argv.index('--tools') + 1])
         self.assertIn('--tools', value['follow_up_preparation']['argv_prefix'])
+        self.assertEqual([], value['attachments'], 'every record lists its attachments, empty without --attach')
+        self.assertEqual([], json.loads((self.base / 'stream-evidence' / 'result.json').read_text())['attachments'])
+
+    def test_a_restricted_result_that_cannot_be_recorded_is_withheld(self):
+        import shutil
+        shutil.rmtree(self.base / 'stream-evidence', ignore_errors=True)
+        original = peer._atomic_record
+        def record(directory, name, value, **options):
+            if name == 'result.json':
+                raise OSError('artificial full disk')
+            return original(directory, name, value, **options)
+        with mock.patch.object(peer, '_atomic_record', side_effect=record):
+            code, value, _ = self.invoke(self.restricted_steps(), restricted=True, recorded=False)
+        self.assertNotEqual(0, code)
+        self.assertEqual(('uncertain', None), (value['state'], value['result']))
+        self.assertIn('withheld', value['evidence_recording'])
+        self.assertNotIn(protocol.ANSWER, json.dumps(value))
+        self.assertNotIn('follow_up_preparation', value)
 
     def test_a_registry_change_after_the_result_revokes_it_and_exits_nonzero(self):
         import shutil

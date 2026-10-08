@@ -513,11 +513,11 @@ def _reg_query(parent):
         listed = answer.stdout.decode("utf-8", "replace").splitlines()
         full = _HIVES[parent.split("\\", 1)[0]] + "\\" + parent.split("\\", 1)[1]
         keys = [line.strip() for line in listed if line.strip() and not line[:1].isspace()]
-        if not keys:
+        if not any(line.strip() for line in listed):
             empty += 1  # an empty key and a glitched success look alike; only a consistent answer decides
             failure = "empty listing"
             continue
-        if all(key.lower() == full.lower() or key.lower().startswith(full.lower() + "\\") for key in keys):
+        if keys and all(key.lower() == full.lower() or key.lower().startswith(full.lower() + "\\") for key in keys):
             return listed, None
         failure = "no recognizable listing"
     if empty == len(_REG_BACKOFF) + 1:
@@ -1324,6 +1324,7 @@ def _run_peer(args, interruption):
     streaming = (args.client == "codex" or args.live_input or args.stream_progress
                  or args.tools is not None or bool(args.attach))
     attachments = []
+    envelope["attachments"] = []  # one shape for every record: a list, empty without --attach
     envelope["native_output_mode"] = "stream_json" if streaming else "final_json"
     try:
         task = _task(args.task_file)
@@ -1331,9 +1332,8 @@ def _run_peer(args, interruption):
         if args.tools is not None:
             envelope["provider_tools"] = {"requested": args.tools, "reported": None, "mcp_servers": None,
                                           "source": "not_observed"}
-        if attachments:
-            envelope["attachments"] = [{key: item[key] for key in ("path", "media_type", "bytes", "sha256")}
-                                       for item in attachments]
+        envelope["attachments"] = [{key: item[key] for key in ("path", "media_type", "bytes", "sha256")}
+                                   for item in attachments]
         stage = "relay_configuration"
         plan = prepare(args.client, args.repo, args.relay, args.provider)
         managed = _managed_claude_sources(plan["repo"]) if args.tools is not None else []
@@ -1426,7 +1426,7 @@ def _run_peer(args, interruption):
                                            "requested_session_id": session, "resumed": bool(args.resume),
                                            "requested_model": args.model, "requested_effort": args.effort,
                                            "requested_tools": args.tools,
-                                           "attachments": envelope.get("attachments", []),
+                                           "attachments": envelope["attachments"],
                                            "task_sha256": hashlib.sha256(task).hexdigest(),
                                            "timeout_seconds": args.timeout})
         with _private_file(directory, "task.txt") as stream:
@@ -1600,12 +1600,14 @@ def _run_peer(args, interruption):
                         message="A restricted call returns a result only when its stream reached a normal end and was "
                                 "verified to it; this one did not, so its result is withheld. Inspect retained output.")
         code = 1
-    if restricted and envelope.get("state") != "returned":
+    def withhold_text():
         # A withheld restricted answer leaves no text in the record or the display; retained raw output stays
         # private evidence in the call directory.
         envelope.pop("partial_result", None)
         for record in envelope.get("native_results") or []:
             record["result_excerpt"], record["result_excerpt_truncated"] = None, False
+    if restricted and envelope.get("state") != "returned":
+        withhold_text()
     preparation = _follow_up_preparation(args, plan, envelope) if code == 0 else None
     if preparation is not None:
         envelope["follow_up_preparation"] = preparation
@@ -1619,6 +1621,13 @@ def _run_peer(args, interruption):
             envelope["needs_attention"] = True
             envelope["evidence_recording"] = "unavailable; preserve this returned result"
             code = 1
+            if restricted and envelope.get("state") == "returned":
+                # A restricted answer stands only with its record, so an unrecorded one is withheld.
+                envelope.update(state="uncertain", result=None,
+                                evidence_recording="unavailable; the restricted result is withheld",
+                                message="A restricted call returns a result only with its record; result.json could "
+                                        "not be written, so the result is withheld. Inspect retained output.")
+                withhold_text()
     if args.json:
         print(json.dumps(envelope, ensure_ascii=True, sort_keys=True))
     else:

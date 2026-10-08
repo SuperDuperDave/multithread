@@ -1237,7 +1237,8 @@ class PeerTests(unittest.TestCase):
         # WSL's bridge to Windows fails a call now and then (a live training step was refused by one); a read
         # that recovers on a retry decides alone, and a policy key found on the retry still refuses.
         # A success that lists nothing recognizable is a failed read, retried; it refuses if it never recovers.
-        for garbled in ([0, "\r\nERROR: something else\r\n"], [0, "\r\nHKEY_LOCAL_MACHINE\\SOFTWARE\\Other\r\n"]):
+        for garbled in ([0, "\r\nERROR: something else\r\n"], [0, "\r\nHKEY_LOCAL_MACHINE\\SOFTWARE\\Other\r\n"],
+                        [0, "\r\n    garbage\r\n"], [0, "\r\n    HKEY_CURRENT_USER\\SOFTWARE\\Policies\\ClaudeCode\r\n"]):
             with self.subTest(listing=garbled[1]):
                 self.assertEqual([hkcu + "\\ClaudeCode (unreadable after 4 attempts: no recognizable listing)"],
                                  sources(keys=dict(listing, **{hkcu: garbled})))
