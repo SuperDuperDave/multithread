@@ -337,7 +337,10 @@ class _Driver:
         try:
             # The provider leads its own session; once the leader is reaped its group ID may be reused, so only
             # an unreaped leader's group is signalled (the ordinary cleanup handles what remains).
-            if self.process.returncode is None and self.process.poll() is None:
+            # A reaped leader's group is signalled only while a member still holds the output pipe: then the group
+            # is alive, so its ID cannot have been reused.
+            holding = getattr(self, "observation", None) is not None and not self.observation.eof
+            if (self.process.returncode is None and self.process.poll() is None) or holding:
                 os.killpg(self.process.pid, signal.SIGKILL)
         except (ProcessLookupError, PermissionError, AttributeError, TypeError):
             pass
@@ -638,6 +641,7 @@ def run(process, task: bytes, repo: str, resume: str | None, directory: Path,
     owned_observer = observer is None
     observation = observer if observer is not None else Observation(process, directory, envelope)
     observation.driver = driver
+    driver.observation = observation
     if driver.attachments:
         observation.retain = driver.retain
     try:

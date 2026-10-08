@@ -493,7 +493,7 @@ def _reg_query(parent):
 
     It lists the parent's subkeys: key paths are not localized, unlike reg.exe's messages.
     """
-    failure = "not attempted"
+    failure, empty = "not attempted", 0
     for pause in (0, *_REG_BACKOFF):
         time.sleep(pause)
         try:
@@ -513,9 +513,15 @@ def _reg_query(parent):
         listed = answer.stdout.decode("utf-8", "replace").splitlines()
         full = _HIVES[parent.split("\\", 1)[0]] + "\\" + parent.split("\\", 1)[1]
         keys = [line.strip() for line in listed if line.strip() and not line[:1].isspace()]
-        if keys and all(key.lower().startswith(full.lower() + "\\") for key in keys):
+        if not keys:
+            empty += 1  # an empty key and a glitched success look alike; only a consistent answer decides
+            failure = "empty listing"
+            continue
+        if all(key.lower() == full.lower() or key.lower().startswith(full.lower() + "\\") for key in keys):
             return listed, None
         failure = "no recognizable listing"
+    if empty == len(_REG_BACKOFF) + 1:
+        return [], None  # every attempt answered that the parent has no subkeys
     return None, failure
 
 
@@ -819,14 +825,15 @@ def _record_refusal(target, envelope):
         envelope["message"] = ((message + " " if message else "") + f"This refusal's record is in {target}; "
                                "a retry needs a new --output-dir.")
         body = json.dumps(envelope, ensure_ascii=True, sort_keys=True).encode("utf-8")
-        temporary = ".result.json.partial"
-        out = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=fd)
+        name = f".result-{os.getpid()}-{uuid.uuid4().hex}.partial"
+        out = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=fd)
+        temporary = name  # created by this call, so this call may remove it
         with os.fdopen(out, "wb") as stream:
             stream.write(body)
             stream.flush()
             os.fsync(stream.fileno())
-        os.rename(temporary, "result.json", src_dir_fd=fd, dst_dir_fd=fd)
-        temporary = None
+        # link() refuses an existing result.json, unlike rename(): another writer's record is never replaced.
+        os.link(temporary, "result.json", src_dir_fd=fd, dst_dir_fd=fd, follow_symlinks=False)
     except OSError:
         envelope.pop("evidence_directory", None)
         envelope["message"] = message
@@ -1013,17 +1020,19 @@ def _wait(process, timeout, observer=None, feedback=None):
             time.sleep(min(0.01, remaining))
 
 
-def _stop(process, observer=None):
+def _stop(process, observer=None, *, immediate=False):
     # This call owns this process group only. Give the provider its normal
     # SIGTERM cleanup before escalation; never touch another native session.
-    try:
-        os.killpg(process.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        pass
-    try:
-        _wait(process, 5, observer)
-    except subprocess.TimeoutExpired:
-        pass
+    # A restricted session holding an adversarial task gets no grace.
+    if not immediate:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            _wait(process, 5, observer)
+        except subprocess.TimeoutExpired:
+            pass
     # Descendants can outlive the leader; terminate only the group we created.
     try:
         os.killpg(process.pid, signal.SIGKILL)
@@ -1287,6 +1296,7 @@ def _follow_up_preparation(args, plan, envelope):
 
 
 def _run_peer(args, interruption):
+    restricted = getattr(args, "tools", None) is not None
     from .peer_control import CallControl, ControlError, ObservedControl
     session = args.resume or (str(uuid.uuid4()) if args.client == "claude" else None)
     envelope = {"schema": 1, "provider": args.client, "state": "unavailable",
@@ -1486,7 +1496,7 @@ def _run_peer(args, interruption):
                     except subprocess.TimeoutExpired:
                         interruption["stopping"] = True
                         envelope["caller_stop_reason"] = "shutdown_timeout"
-                        _stop(process, observer)
+                        _stop(process, observer, immediate=restricted)
                         envelope["server_cleanup"] = "owned process stopped after stdin closed"
                         envelope["needs_attention"] = True
                     code = 0 if envelope["state"] == "returned" else 1
@@ -1498,7 +1508,7 @@ def _run_peer(args, interruption):
                 interrupted = isinstance(exc, KeyboardInterrupt)
                 envelope["caller_stop_reason"] = "interrupted" if interrupted else "timeout"
                 if process is not None:
-                    _stop(process, observer) if observer is not None else _stop(process)
+                    _stop(process, observer, immediate=restricted) if observer is not None else _stop(process, immediate=restricted)
                 if process is not None:
                     envelope["provider_started"] = True
                 reason = "Call interrupted" if interrupted else "Call timed out"
@@ -1525,7 +1535,7 @@ def _run_peer(args, interruption):
         if isinstance(exc, KeyboardInterrupt):
             envelope.setdefault("caller_stop_reason", "interrupted")
         if process is not None:
-            _stop(process, observer) if observer is not None else _stop(process)
+            _stop(process, observer, immediate=restricted) if observer is not None else _stop(process, immediate=restricted)
             envelope["provider_started"] = True
         _call_problem(envelope, "Interrupted; inspect any retained evidence before retrying.")
         code = 128 + (interruption["signal"] or signal.SIGINT)
@@ -1535,7 +1545,7 @@ def _run_peer(args, interruption):
         interruption["stopping"] = True
         if process is not None:
             if process.poll() is None:
-                _stop(process, observer) if observer is not None else _stop(process)
+                _stop(process, observer, immediate=restricted) if observer is not None else _stop(process, immediate=restricted)
                 _call_problem(envelope, "The owned provider required cleanup; inspect its observed turn and retained evidence.")
             envelope.update(provider_started=True, process_exit_code=process.returncode)
         try:
@@ -1590,6 +1600,12 @@ def _run_peer(args, interruption):
                         message="A restricted call returns a result only when its stream reached a normal end and was "
                                 "verified to it; this one did not, so its result is withheld. Inspect retained output.")
         code = 1
+    if restricted and envelope.get("state") != "returned":
+        # A withheld restricted answer leaves no text in the record or the display; retained raw output stays
+        # private evidence in the call directory.
+        envelope.pop("partial_result", None)
+        for record in envelope.get("native_results") or []:
+            record["result_excerpt"], record["result_excerpt_truncated"] = None, False
     preparation = _follow_up_preparation(args, plan, envelope) if code == 0 else None
     if preparation is not None:
         envelope["follow_up_preparation"] = preparation

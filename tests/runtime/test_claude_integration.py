@@ -283,6 +283,9 @@ class RestrictedCallTests(ClaudeIntegrationTests):
         self.assertEqual(('uncertain', None), (value['state'], value['result']))
         self.assertEqual('shutdown_timeout', value['caller_stop_reason'])
         self.assertIn('result is withheld', value['message'])
+        # Withheld means withheld everywhere in the record: no excerpt or partial carries the answer.
+        self.assertNotIn(protocol.ANSWER, json.dumps(value))
+        self.assertNotIn(protocol.ANSWER, (self.base / 'stream-evidence' / 'result.json').read_text())
         original = peer._wait
         calls = []
         def interrupted(*arguments, **options):

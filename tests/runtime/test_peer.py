@@ -878,7 +878,7 @@ class PeerTests(unittest.TestCase):
         process = mock.Mock(returncode=None)
         stops = 0
 
-        def interrupted_stop(child):
+        def interrupted_stop(child, **options):
             nonlocal stops
             self.assertIs(process, child)
             stops += 1
@@ -1237,11 +1237,16 @@ class PeerTests(unittest.TestCase):
         # WSL's bridge to Windows fails a call now and then (a live training step was refused by one); a read
         # that recovers on a retry decides alone, and a policy key found on the retry still refuses.
         # A success that lists nothing recognizable is a failed read, retried; it refuses if it never recovers.
-        for garbled in ([0, ""], [0, "\r\nERROR: something else\r\n"], [0, "\r\nHKEY_LOCAL_MACHINE\\SOFTWARE\\Other\r\n"]):
+        for garbled in ([0, "\r\nERROR: something else\r\n"], [0, "\r\nHKEY_LOCAL_MACHINE\\SOFTWARE\\Other\r\n"]):
             with self.subTest(listing=garbled[1]):
                 self.assertEqual([hkcu + "\\ClaudeCode (unreadable after 4 attempts: no recognizable listing)"],
                                  sources(keys=dict(listing, **{hkcu: garbled})))
         self.assertEqual([], sources(keys=dict(listing, **{hkcu: [[0, ""], listing[hkcu]]})))
+        # The parent's own header (it has values) is a recognizable listing, and an answer of no subkeys given by
+        # every attempt is an empty key, not a glitch: neither refuses forever.
+        header = [0, "\r\nHKEY_CURRENT_USER\\SOFTWARE\\Policies\r\n    Setting    REG_SZ    1\r\n"]
+        self.assertEqual([], sources(keys=dict(listing, **{hkcu: header})))
+        self.assertEqual([], sources(keys=dict(listing, **{hkcu: [0, "\r\n"]})))
         transient = [[1, ""], listing[hkcu]]
         self.assertEqual([], sources(keys=dict(listing, **{hkcu: transient})))
         found_late = [[1, ""], [1, ""], [1, ""], [0, "\r\nHKEY_CURRENT_USER\\SOFTWARE\\Policies\\ClaudeCode\r\n"]]
@@ -1277,6 +1282,22 @@ class PeerTests(unittest.TestCase):
         self.assertNotEqual(0, code)
         self.assertEqual("another call", (other / "result.json").read_text())
         self.assertIsNone(result["evidence_directory"])
+
+    def test_a_refusal_record_never_replaces_one_already_there(self):
+        record = self.base / "raced-call"
+        real_listdir = os.listdir
+        def raced(target=None):
+            names = real_listdir(target)
+            if isinstance(target, int):  # another writer publishes after the emptiness check
+                with open(os.path.join(record, "result.json"), "x") as stream:
+                    stream.write("the other writer")
+                return names
+            return names
+        with (mock.patch.object(peer, "_managed_claude_sources", return_value=["/etc/claude-code"]),
+              mock.patch.object(peer.os, "listdir", raced)):
+            self.invoke("--tools", "none", output=record)
+        self.assertEqual("the other writer", (record / "result.json").read_text())
+        self.assertEqual(["result.json"], sorted(path.name for path in record.iterdir()), "no temporary left behind")
 
     def test_a_late_fault_drops_a_stored_partial_and_never_signals_a_reaped_group(self):
         from relay_runtime import claude_peer
