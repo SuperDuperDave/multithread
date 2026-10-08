@@ -1205,6 +1205,7 @@ class PeerTests(unittest.TestCase):
                   mock.patch.object(peer, "_REG_TIMEOUT", 0.5),
                   mock.patch.object(peer, "_POLICY_CACHE", self.base / "policy-read.json"),
                   mock.patch.object(peer, "_POLICY_CACHE_SECONDS", -1),  # every case here reads afresh
+                  mock.patch.object(peer, "_POLICY_FAILURE_SECONDS", -1),
                   mock.patch.dict(os.environ, environ or {"CLAUDE_CONFIG_DIR": str(home)})):
                 return peer._managed_claude_sources(cwd or self.repo)
         self.assertEqual([], sources())
@@ -1383,15 +1384,28 @@ class PeerTests(unittest.TestCase):
             with mock.patch.object(peer, "_boot_clock", side_effect=lambda: ("boot-x", 100.0 + reads())):
                 self.assertEqual([], peer._managed_claude_sources(self.repo))
             self.assertEqual(100.0 + before, json.loads(cache.read_text())["at"])
-            # A failed read refuses and is never kept: the next call reads again.
+            # A failed read refuses, and the calls queued behind it refuse with it rather than each retrying in turn;
+            # once it is a few seconds old the next call reads again.
             cache.unlink()
             answer.write_text("1")
             before = reads()
             self.assertEqual(2, len(peer._managed_claude_sources(self.repo)))
-            self.assertFalse(cache.exists())
             answer.write_text("0")
-            self.assertEqual([], peer._managed_claude_sources(self.repo))
+            shared = peer._managed_claude_sources(self.repo)
+            self.assertEqual(2, len(shared))
+            self.assertIn("read by another call", shared[0])
+            self.assertEqual(before + 8, reads())
+            with mock.patch.object(peer, "_POLICY_FAILURE_SECONDS", -1):
+                self.assertEqual([], peer._managed_claude_sources(self.repo))
             self.assertEqual(before + 8 + 2, reads())
+            # A clean read is never mistaken for a failure, nor a failure for a clean read.
+            for forged in ({"HKLM\\SOFTWARE\\Policies": [None, None]}, {"HKLM\\SOFTWARE\\Policies": [["x"], "timed out"]}):
+                with self.subTest(record=forged):
+                    value = json.loads(cache.read_text())
+                    cache.write_text(json.dumps({**value, "reads": {**value["reads"], **forged}}))
+                    before = reads()
+                    self.assertEqual([], peer._managed_claude_sources(self.repo))
+                    self.assertEqual(before + 2, reads())
             # A reader that never finishes leaves the others refusing, not reading alongside it.
             import fcntl
             holder = os.open(cache.with_suffix(".lock"), os.O_RDWR)

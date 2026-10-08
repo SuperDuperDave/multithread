@@ -491,6 +491,7 @@ _REG_TIMEOUT = 3
 # is reused for a few seconds, no longer than the preflight's own check-to-launch gap matters.
 _POLICY_CACHE = Path(os.path.expanduser("~/.local/share/relay/windows-policy-read.json"))
 _POLICY_CACHE_SECONDS = 30
+_POLICY_FAILURE_SECONDS = 5
 _POLICY_LOCK_SECONDS = 40
 _HIVES = {"HKLM": "HKEY_LOCAL_MACHINE", "HKCU": "HKEY_CURRENT_USER"}
 
@@ -541,6 +542,8 @@ def _boot_clock():
 
 
 def _cached_policy():
+    """A recent read another call made: a clean one for 30 seconds from its start, a failed one for a few
+    seconds from its end, so the calls queued behind a failure refuse with it instead of each retrying in turn."""
     boot, now = _boot_clock()
     try:
         fd = os.open(_POLICY_CACHE, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
@@ -555,19 +558,22 @@ def _cached_policy():
         return None
     finally:
         os.close(fd)
-    listings = value.get("listings") if isinstance(value, dict) else None
-    fresh = (boot is not None and value.get("boot") == boot and value.get("reg") == str(_WSL_REG)
-             and type(value.get("at")) is float and 0 <= now - value["at"] <= _POLICY_CACHE_SECONDS)
-    if (not fresh or not isinstance(listings, dict) or set(listings) != set(_WSL_POLICY_PARENTS)
-            or not all(isinstance(lines, list) and all(isinstance(line, str) for line in lines)
-                       for lines in listings.values())):
+    reads = value.get("reads") if isinstance(value, dict) else None
+    if (boot is None or value.get("boot") != boot or value.get("reg") != str(_WSL_REG) or type(value.get("at")) is not float
+            or not isinstance(reads, dict) or set(reads) != set(_WSL_POLICY_PARENTS)
+            or not all(isinstance(read, list) and len(read) == 2 and (
+                (isinstance(read[0], list) and all(isinstance(line, str) for line in read[0]) and read[1] is None)
+                or (read[0] is None and isinstance(read[1], str))) for read in reads.values())):
         return None
-    return {parent: (listings[parent], None) for parent in _WSL_POLICY_PARENTS}
+    failed = any(listed is None for listed, _ in reads.values())
+    if not 0 <= now - value["at"] <= (_POLICY_FAILURE_SECONDS if failed else _POLICY_CACHE_SECONDS):
+        return None
+    return {parent: (listed, failure and failure + ", read by another call") for parent, (listed, failure) in reads.items()}
 
 
 def _policy_listings():
     """Each policy parent's listing, or None and why. One reader at a time on this machine; the calls that waited
-    reuse its clean read. A failed read is never kept, so it can only refuse."""
+    reuse its read. A failure is shared only briefly, and only ever refuses."""
     try:
         _POLICY_CACHE.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         lock = os.open(_POLICY_CACHE.with_suffix(".lock"), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
@@ -587,14 +593,15 @@ def _policy_listings():
             cached = _cached_policy()
             if cached is not None:
                 return cached
-        boot, now = _boot_clock()  # a reused read is as old as its first query, not its last
+        boot, started = _boot_clock()  # a reused clean read is as old as its first query, not its last
         listings = {parent: _reg_query(parent) for parent in _WSL_POLICY_PARENTS}
-        if lock is not None and boot is not None and all(listed is not None for listed, _ in listings.values()):
+        if lock is not None and boot is not None:
+            failed = any(listed is None for listed, _ in listings.values())
             try:
                 _atomic_record(_POLICY_CACHE.parent, _POLICY_CACHE.name,
-                               {"boot": boot, "at": float(now), "reg": str(_WSL_REG),
-                                "listings": {parent: listed for parent, (listed, _) in listings.items()}})
-            except OSError:
+                               {"boot": boot, "at": float(_boot_clock()[1] if failed else started), "reg": str(_WSL_REG),
+                                "reads": {parent: list(read) for parent, read in listings.items()}})
+            except (OSError, TypeError):
                 pass  # the next call reads again
         return listings
     finally:
