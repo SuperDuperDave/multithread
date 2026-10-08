@@ -1072,6 +1072,26 @@ class WakeOutcomeTests(WakeCase):
         self.assertEqual("NOT SENT", json.loads(out)["status"], "a real wake still names its sender")
 
 
+    def test_after_a_handover_the_listing_never_claims_the_previous_holders_wake(self):
+        # AX rule 1: a binding's "last wake" went to someone else once its role was handed over.
+        first = self.bound()
+        sent = self.wake()
+        self.daemon.threads[OTHER] = dict(self.daemon.threads[THREAD])
+        self.assertEqual(0, self.handover()[0])
+        second = self.events("wake.bound")[-1]["seq"]
+        code, out = self.run_helper(wake.bind_main, "operator")
+        self.assertIn(f"  last wake: none under binding {second}; the last was {sent['message_id']} "
+                      f"{sent['outcome']} at ", out)
+        self.assertIn(f"under binding {first} (ledger seq ", out)
+        shown = json.loads(self.run_helper(wake.bind_main, "operator", "--json")[1])["bindings"][0]
+        self.assertIsNone(shown["last_attempt"])
+        self.assertEqual(first, shown["earlier_attempt"]["generation"])
+        again = self.wake()
+        listing = self.run_helper(wake.bind_main, "operator")[1]
+        self.assertIn(f"  last wake: {again['message_id']} ", listing, "its own wake once it has one")
+        self.assertNotIn("none under binding", listing)
+
+
 class QueuedReadinessTests(WakeCase):
     def assert_observation_only(self, methods):
         self.assertEqual(1, methods.count("thread/read"))

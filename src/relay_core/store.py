@@ -1788,11 +1788,20 @@ class RelayStore:
 
     def _wake_state(self, role: str) -> dict[str, Any]:
         binding = self._wake_binding(role)
-        last = self._execute(
+        latest = self._execute(
             "SELECT * FROM events WHERE target = ? AND kind = 'wake.attempted' "
             "ORDER BY seq DESC LIMIT 1",
             (role,),
         ).fetchone()
+        last = latest
+        if binding is not None and latest is not None and \
+                json.loads(latest["meta_json"])["generation"] != binding["generation"]:
+            # A binding's last wake is its own: one sent to a replaced binding went to someone else.
+            last = self._execute(
+                "SELECT * FROM events WHERE target = ? AND kind = 'wake.attempted' "
+                "AND json_extract(meta_json, '$.generation') = ? ORDER BY seq DESC LIMIT 1",
+                (role, binding["generation"]),
+            ).fetchone()
         state = (
             "unbound" if binding is None
             else "paused" if binding["paused_seq"] is not None
@@ -1803,6 +1812,8 @@ class RelayStore:
             "state": state,
             **(binding or {}),
             "last_attempt": self._wake_attempt(last) if last is not None else None,
+            "earlier_attempt": (self._wake_attempt(latest)
+                                if latest is not None and last is None else None),
         }
 
     def wake_history(self, role: str, *, limit: int = 30, before: int | None = None,
