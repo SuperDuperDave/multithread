@@ -682,10 +682,17 @@ inbox is named after (`$CLAUDE_PID`), running above the hook, can report it,
 and a session's end forgets it. One process can switch sessions (`/clear`,
 `/resume`), so only a session's start may take a socket another live session
 holds. Any other report that finds one fails closed: it drops that entry and
-records nothing until the next report, so a lost start costs `NOT RUNNING`
-for a prompt, never a wake delivered to the wrong session. Binding a Claude
-Code inbox requires `--session "$CLAUDE_CODE_SESSION_ID"`, the session a wake
-will follow. A wake goes to
+records nothing until the next report, so a lost start alone costs
+`NOT RUNNING` for a prompt. A start and an end each wait up to 2 seconds for
+a busy map. If both the old session's end and the new session's start are
+lost, the socket stays with the old session until the new one's first prompt,
+and a wake for the old session can reach the new one until then. A change to
+the map that can't be written (a full disk, say) sets the whole map aside
+instead (`claude-inboxes.json.failed-<time>`), so every Claude role is
+`NOT RUNNING` until its session's next prompt. The hook that set it aside warns
+its session and the person, and a wake's `NOT RUNNING` names it for a day. Binding a
+Claude Code inbox requires `--session "$CLAUDE_CODE_SESSION_ID"`, the session a
+wake will follow, and records the inbox only when that variable names it. A wake goes to
 the inbox the bound session last reported while that exact process still runs,
 and checks the process listening on the connected socket before sending. A
 restarted or resumed session is reachable again from its first prompt without
@@ -693,9 +700,10 @@ binding again; a binding with no report, such as one made by an earlier
 release, is reachable from its session's next prompt. Anything else is
 `NOT RUNNING` (exit 4, nothing sent, the message id stays unused): a socket
 another session now holds never receives a wake meant for this one. The map is
-checked again just before sending; a wake that lands in the moment between a
-`/clear` or `/resume` and the new session's start report can still reach the
-new conversation in that same window. An inbox that is
+checked again just before sending. A wake that races a `/clear` or `/resume`
+can still reach the new conversation: one sent after the switch and before
+the new session's start report has landed and been read by that last check.
+A stalled filesystem stalls the hook's report, as it stalls the ledger. An inbox that is
 gone, fails its checks or refuses the connection is still `NOT SENT`. The
 same owner can refresh its binding; a new holder needs release or
 [authorized handover](#inspect-pending-work-and-role-handovers). In one live test before this command existed, an idle Claude

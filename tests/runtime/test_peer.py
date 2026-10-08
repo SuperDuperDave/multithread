@@ -1317,7 +1317,7 @@ class PeerTests(unittest.TestCase):
         def running():  # a killed process awaiting its reaper is a zombie, not a survivor
             try:
                 stat = Path(f"/proc/{descendant}/stat").read_text()
-            except FileNotFoundError:
+            except (FileNotFoundError, ProcessLookupError):  # reaped between opening and reading
                 return False
             return stat.rsplit(")", 1)[1].split()[0] not in ("Z", "X")
         envelope = {"partial_result": "words written before the fault"}

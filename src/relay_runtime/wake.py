@@ -1145,7 +1145,10 @@ def _wake_inbox(args, role, binding, text, message_id, base, conclude):
             "not_sent", "inbox_missing", detail="not running")
     entry = live_inbox(session)
     if entry is None:
-        return not_running("no inbox it reported is still owned by its process")
+        aside = inboxes_set_aside()
+        return not_running("no inbox it reported is still owned by its process" + (
+            "" if aside is None else f". Multithread set every session's inbox report aside at {aside[0]} after a "
+            f"write failed ({aside[1]}); each Claude Code session is NOT RUNNING until its next prompt"))
     path = entry["inbox"]
     problem = inbox_problem(path)
     if problem is not None:
@@ -1276,9 +1279,11 @@ def _private_read(path, valid):
     return ({}, False) if value is None else (value, True)
 
 
-def _private_update(path, read_file, change, wait=5):
+def _private_update(path, read_file, change, wait=5, discard=False):
     """Replace the file with change(value) under its lock, waiting at most wait seconds for it; False when it could
-    not be written. change may return None to leave the file untouched."""
+    not be written. change may return None to leave the file untouched. With discard, a write that fails once the
+    lock is held sets the file aside instead (None), so a stale entry can't outlive the change that should have
+    ended it; the set-aside file is the diagnostic."""
     try:
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         directory = os.lstat(path.parent)
@@ -1317,7 +1322,18 @@ def _private_update(path, read_file, change, wait=5):
                 os.unlink(temporary)
         return True
     except OSError:
-        return False
+        if not discard:
+            return False
+        try:
+            os.replace(path, path.with_name(f"{path.name}.failed-{time.time_ns()}"))  # a rename needs no space
+        except FileNotFoundError:
+            return False
+        except OSError:
+            try:
+                os.unlink(path)
+            except OSError:
+                return False
+        return None
     finally:
         os.close(lock)
 
@@ -1336,11 +1352,26 @@ PROC = Path("/proc")  # tests point this at a synthetic tree
 _INBOXES_KEPT = 256  # most recently reporting sessions
 _SOCKET_NAME = re.compile(r"([1-9][0-9]{0,9})\.sock")
 _INBOX_ANCESTRY = 64  # hook → shell → … → Claude Code
-_HOOK_WAIT = 0.5  # the provider hook has seconds in all; a busy map costs one report, never the hook
+_HOOK_WAIT = 0.5  # the provider hook has 3 s in all; a busy map costs one prompt's report, never the hook
+_SWITCH_WAIT = 2.0  # a lost start or end leaves the socket with the session before it, so it waits longer
 
 
 def _inboxes_path():
     return Path(INBOXES) if INBOXES is not None else _state_dir() / "claude-inboxes.json"
+
+
+def inboxes_set_aside(within=86400):
+    """When a failed write last set the inbox map aside, within the last day: (UTC time, path), else None. Sessions
+    that haven't prompted since are NOT RUNNING, and a sender should know why."""
+    try:
+        path = _inboxes_path()
+        stamps = ((item.name.rsplit("-", 1)[1], item) for item in path.parent.glob(f"{path.name}.failed-*"))
+        newest = max((int(stamp), item) for stamp, item in stamps if stamp.isdigit())
+    except (OSError, ValueError):
+        return None
+    if time.time_ns() - newest[0] > within * 10**9:
+        return None
+    return datetime.fromtimestamp(newest[0] / 10**9, timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ"), str(newest[1])
 
 
 def _valid_inboxes(value):
@@ -1397,8 +1428,8 @@ def remember_inbox(session, inbox, claim=False, wait=5):
     must be this Claude Code process ($CLAUDE_PID, which a nested session sets to its own) and an ancestor of this
     one. One process can switch sessions (/clear, /resume), so only a session's start claims a socket another live
     session holds. Any other report that finds one fails closed: it drops that holder and records nothing this
-    time, so a lost claim heals at the next prompt and costs NOT RUNNING, never a misdelivered wake. False when
-    nothing was recorded; a failure costs only the lookup."""
+    time, so a lost claim alone heals at the next prompt and costs NOT RUNNING. False when nothing was recorded,
+    None when a failed write set the whole map aside; a failure costs only the lookup."""
     pid = _inbox_owner(inbox)
     claude = os.environ.get("CLAUDE_PID")
     if claude is not None and str(pid) != claude:
@@ -1424,17 +1455,18 @@ def remember_inbox(session, inbox, claim=False, wait=5):
             for key in (dead + list(kept))[:len(kept) - _INBOXES_KEPT + 1]:
                 kept.pop(key, None)
         return {**kept, session: entry}
-    return _private_update(_inboxes_path(), _read_inboxes, change, wait) and not refused
+    written = _private_update(_inboxes_path(), _read_inboxes, change, wait, discard=True)
+    return written and not refused
 
 
-def forget_inbox(session, inbox):
+def forget_inbox(session, inbox, wait=_SWITCH_WAIT):
     """A session ended in this process (exit, /clear, /resume elsewhere): its entry no longer names a reachable
     session. Only the entry for this exact inbox is removed."""
     def change(entries):
         if entries.get(session, {}).get("inbox") != inbox:
             return None
         return {key: item for key, item in entries.items() if key != session}
-    return _private_update(_inboxes_path(), _read_inboxes, change, _HOOK_WAIT)
+    return _private_update(_inboxes_path(), _read_inboxes, change, wait, discard=True)
 
 
 def live_inbox(session):
@@ -1900,8 +1932,8 @@ def bind(args, ledger=launcher_ledger):
     base.update(generation=binding["generation"], binding_state=binding["state"], coverage=coverage)
     # Re-running bind records an older binding here too, so the index fills without a migration.
     base["index_recorded"] = _remember(_recipient(provider, agent, session, thread), shown["ledger"], role)
-    if inbox is not None:
-        remember_inbox(session, inbox)  # run from inside the session, as the inbox check above requires
+    if inbox is not None and this_session == session:
+        remember_inbox(session, inbox)  # only from inside the session it names; its hook reports otherwise
     if recorded["duplicate"]:
         return _outcome("ALREADY BOUND", f"{role} already wakes {target} (binding {binding['generation']}); "
                         "nothing was recorded.", "Nothing.", **base, **extra)

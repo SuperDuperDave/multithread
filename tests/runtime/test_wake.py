@@ -6,7 +6,9 @@ its arguments. The ledger is a real disposable one. No real daemon, provider,
 conversation or account configuration is touched.
 """
 
+import argparse
 import base64
+import errno
 import fcntl
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timezone
@@ -515,8 +517,9 @@ class SenderContextTests(WakeCase):
         self.inbox = inbox
         self.addCleanup(inbox.close)
         self.fake_process(os.getpid(), ppid=7741)  # bound from inside that session
-        code, out = self.run_helper(wake.bind_main, "reviewer", "--claude-socket", str(inbox.path),
-                                    "--agent", "claude", "--session", "receiver", "--json")
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "receiver"}):  # bound from inside it
+            code, out = self.run_helper(wake.bind_main, "reviewer", "--claude-socket", str(inbox.path),
+                                        "--agent", "claude", "--session", "receiver", "--json")
         self.assertEqual(0, code, out)
         binding = self.source_binding(provider="codex", session="registrar", thread=OTHER)
         result = self.sender_wake(recipient="reviewer", agent="codex", session=OTHER)
@@ -1677,8 +1680,11 @@ class ClaudeTests(WakeCase):
         self.addCleanup(self.inbox.close)
 
     def bind_inbox(self, *extra, path=None):
-        code, out = self.run_helper(wake.bind_main, "reviewer", "--claude-socket", str(path or self.inbox_path),
-                                    "--agent", "claude", "--session", "self", "--json", *extra)
+        # From inside the session it names, unless a test says which session this is.
+        inside = {} if "CLAUDE_CODE_SESSION_ID" in os.environ else {"CLAUDE_CODE_SESSION_ID": "self"}
+        with mock.patch.dict(os.environ, inside):
+            code, out = self.run_helper(wake.bind_main, "reviewer", "--claude-socket", str(path or self.inbox_path),
+                                        "--agent", "claude", "--session", "self", "--json", *extra)
         return code, json.loads(out)
 
     def wake_inbox(self, *extra):
@@ -1942,6 +1948,61 @@ class ClaudeTests(WakeCase):
         with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "self"}):
             self.assertEqual("BOUND", self.bind_inbox()[1]["status"])
 
+    def test_bind_records_an_inbox_only_from_the_session_it_names(self):
+        # Daybreak Blue on b700267: without $CLAUDE_CODE_SESSION_ID, bind can't show which session owns the socket.
+        code, out = self.run_helper(wake.bind_main, "reviewer", "--claude-socket", str(self.inbox_path),
+                                    "--agent", "claude", "--session", "self", "--json")
+        self.assertEqual("BOUND", json.loads(out)["status"])
+        self.assertFalse(wake.INBOXES.exists(), "the binding is recorded; the inbox waits for the session's report")
+        self.assertEqual("NOT RUNNING", self.wake_inbox()["status"])
+        self.assertTrue(wake.remember_inbox("self", str(self.inbox_path)))
+        self.assertEqual("DELIVERED TO INBOX", self.wake_inbox()["status"])
+
+    def test_a_switch_that_cannot_be_written_removes_every_report(self):
+        # Sol on b700267: a full disk kept A's entry through /clear, so A's wakes would reach B on A's process.
+        self.bind_inbox()  # A is "self"
+        full = OSError(errno.ENOSPC, "No space left on device")
+        with mock.patch.object(wake.tempfile, "mkstemp", side_effect=full):
+            self.assertFalse(wake.forget_inbox("self", str(self.inbox_path)))
+            self.assertFalse(wake.INBOXES.exists(), "A's end fails closed")
+        self.assertTrue(wake.remember_inbox("self", str(self.inbox_path), claim=True))
+        with mock.patch.object(wake.tempfile, "mkstemp", side_effect=full):
+            self.assertFalse(wake.remember_inbox("switched-to", str(self.inbox_path), claim=True))
+        self.assertFalse(wake.INBOXES.exists(), "so does B's claim")
+        result = self.wake_inbox()
+        self.assertEqual("NOT RUNNING", result["status"])
+        self.assertIn("Multithread set every session's inbox report aside at", result["happened"], "and says so")
+        self.assertEqual([], self.inbox.lines)
+        self.assertEqual(2, len(list(wake.INBOXES.parent.glob(wake.INBOXES.name + ".failed-*"))), "kept to inspect")
+
+    def test_a_hook_that_sets_the_map_aside_warns_the_session_and_the_person(self):
+        self.bind_inbox()
+        full = OSError(errno.ENOSPC, "No space left on device")
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_MESSAGING_SOCKET": str(self.inbox_path)}), \
+                mock.patch.object(wake.tempfile, "mkstemp", side_effect=full), redirect_stderr(io.StringIO()) as err:
+            self.assertIsNone(runtime_cli._report_inbox("SessionStart", "self"), "unchanged: nothing written")
+            warning = runtime_cli._report_inbox("SessionStart", "switched-to")
+        self.assertIn("MULTITHREAD WARNING: a write to the Claude Code inbox map failed", warning)
+        self.assertIn("Every Claude role is NOT RUNNING", warning)
+        self.assertIn(warning, err.getvalue())
+        args = argparse.Namespace(provider_payload={"hook_event_name": "UserPromptSubmit", "session_id": "self"},
+                                  repo="/srv/checkout", client="claude", inbox_warning=warning)
+        with mock.patch.object(runtime_cli.RelayStore, "open_readonly") as opener, \
+                mock.patch.object(runtime_cli, "_provider_contract", return_value="CONTRACT\n"), \
+                mock.patch.object(runtime_cli.core_cli, "_render_brief", return_value="BRIEF"), \
+                redirect_stdout(io.StringIO()) as out:
+            opener.return_value.__enter__.return_value.brief.return_value = {}
+            self.assertEqual(0, runtime_cli._provider_worker(args))
+        shown = json.loads(out.getvalue())
+        self.assertEqual(warning, shown["systemMessage"])
+        self.assertEqual(warning + "\n\nCONTRACT\nBRIEF", shown["hookSpecificOutput"]["additionalContext"])
+        args.provider_event = "UserPromptSubmit"
+        with redirect_stdout(io.StringIO()) as out:
+            runtime_cli._hook_warning(args, "ledger", enrolled=True)
+        shown = json.loads(out.getvalue())
+        self.assertTrue(shown["systemMessage"].startswith(warning + "\n"), "a failed brief still carries it")
+        self.assertTrue(shown["hookSpecificOutput"]["additionalContext"].startswith(warning + "\n\n"))
+
     def test_a_process_id_reused_while_connecting_receives_nothing(self):
         # Opus on 6dc7d72: the start-time check after connecting is the only guard against reuse in that moment.
         self.bind_inbox()
@@ -1962,10 +2023,40 @@ class ClaudeTests(WakeCase):
                 mock.patch.object(wake, "forget_inbox") as forget:
             for event in ("SessionStart", "UserPromptSubmit", "PostToolUse", "Stop", "SessionEnd"):
                 runtime_cli._report_inbox(event, "self")
-        self.assertEqual([mock.call("self", str(self.inbox_path), claim=True, wait=wake._HOOK_WAIT),
+        self.assertEqual([mock.call("self", str(self.inbox_path), claim=True, wait=wake._SWITCH_WAIT),
                           mock.call("self", str(self.inbox_path), claim=False, wait=wake._HOOK_WAIT)],
                          remember.call_args_list)
-        forget.assert_called_once_with("self", str(self.inbox_path))
+        forget.assert_called_once_with("self", str(self.inbox_path), wait=wake._SWITCH_WAIT)
+
+    def test_a_hook_payload_refused_for_admission_still_reports_the_inbox(self):
+        # Opus on b700267: the cwd veto or an identity check raised before the report, so a start could be lost
+        # on every attempt and leave the socket with the session before it.
+        def hook(session):
+            payload = json.dumps({"hook_event_name": "SessionStart", "session_id": session, "cwd": "/"})
+            environ = {k: v for k, v in os.environ.items() if k != "RELAY_HOME"}
+            environ["CLAUDE_CODE_MESSAGING_SOCKET"] = str(self.inbox_path)
+            with mock.patch.dict(os.environ, environ, clear=True), \
+                    mock.patch.object(sys, "stdin", io.TextIOWrapper(io.BytesIO(payload.encode()))), \
+                    mock.patch.object(wake, "remember_inbox") as remember, \
+                    redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()) as err:
+                runtime_cli.main(["provider-hook", "--client", "claude"])
+            return out.getvalue() + err.getvalue(), remember.call_args_list
+        said, calls = hook("self")
+        self.assertIn("hook input could not be used", said, "the session directory isn't this one")
+        self.assertEqual([mock.call("self", str(self.inbox_path), claim=True, wait=wake._SWITCH_WAIT)], calls)
+        self.assertEqual([], hook("not an identifier\n")[1], "the session id is checked as the payload's is")
+
+    def test_an_end_waits_for_a_busy_map_then_leaves_it(self):
+        self.bind_inbox()
+        lock = os.open(wake.INBOXES.with_suffix(".lock"), os.O_RDWR | os.O_CREAT, 0o600)
+        self.addCleanup(os.close, lock)
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        started = time.monotonic()
+        self.assertFalse(wake.forget_inbox("self", str(self.inbox_path), wait=0.3))
+        self.assertGreaterEqual(time.monotonic() - started, 0.3)
+        self.assertLess(time.monotonic() - started, 2)
+        self.assertIn("self", json.loads(wake.INBOXES.read_text()), "an end that can't lock changes nothing")
+        self.assertEqual(2.0, wake._SWITCH_WAIT)
 
     def test_a_session_end_forgets_only_its_own_inbox(self):
         self.bind_inbox()
@@ -2139,7 +2230,7 @@ class SignalWakeTests(ClaudeTests):
         # signal recorded here never reached it. The signal stays here; the wake goes where it is bound.
         other = self.other_checkout()
         out = io.StringIO()
-        with redirect_stdout(out):
+        with redirect_stdout(out), mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "self"}):
             code = wake.bind_main(["reviewer", "--repo", str(other), "--claude-socket", str(self.inbox_path),
                                    "--agent", "claude", "--session", "self", "--json"], ledger=self.ledger)
         self.assertEqual(0, code, out.getvalue())
@@ -2191,7 +2282,7 @@ class SignalWakeTests(ClaudeTests):
             with self.subTest(index=name):
                 if index is None:
                     out = io.StringIO()
-                    with redirect_stdout(out):
+                    with redirect_stdout(out), mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "self"}):
                         wake.bind_main(["reviewer", "--repo", str(other), "--claude-socket", str(self.inbox_path),
                                         "--agent", "claude", "--session", "self", "--json"], ledger=self.ledger)
                 else:
@@ -2204,7 +2295,7 @@ class SignalWakeTests(ClaudeTests):
     def test_a_wake_names_the_primary_checkout_that_outlives_a_linked_worktree(self):
         # A task worktree is removed after merge; the ledger it shares, and every pointer into it, must not be.
         other = self.other_checkout()
-        with redirect_stdout(io.StringIO()):
+        with redirect_stdout(io.StringIO()), mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "self"}):
             wake.bind_main(["reviewer", "--repo", str(other), "--claude-socket", str(self.inbox_path),
                             "--agent", "claude", "--session", "self", "--json"], ledger=self.ledger)
         linked = self.base / "task-worktree"
@@ -2225,7 +2316,7 @@ class SignalWakeTests(ClaudeTests):
     def test_rebuild_adds_bindings_the_index_never_saw_and_removes_nothing(self):
         # A role bound before 0.4.28 is in no index until its holder binds again; rebuild reads every ledger once.
         other = self.other_checkout()
-        with redirect_stdout(io.StringIO()):
+        with redirect_stdout(io.StringIO()), mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "self"}):
             wake.bind_main(["reviewer", "--repo", str(other), "--claude-socket", str(self.inbox_path),
                             "--agent", "claude", "--session", "self", "--json"], ledger=self.ledger)
         self.bound()  # and a Codex role here

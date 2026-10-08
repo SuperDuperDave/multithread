@@ -104,7 +104,7 @@ def _provider_input(client, *, from_cwd=False, seen=None):
     if name not in _PROVIDER_EVENTS or (name == "Interrupt" and client != "codex"):
         return None
     if seen is not None:
-        seen["event"] = name
+        seen.update(event=name, session_id=payload.get("session_id"))
     if from_cwd and "cwd" in payload:
         # The process directory selects enrollment; the provider's stated
         # session directory can only veto a mismatch, never select a checkout.
@@ -136,17 +136,32 @@ def _provider_input(client, *, from_cwd=False, seen=None):
 def _report_inbox(event, session):
     """Tell later wakes where this Claude Code session's inbox is now. Its process id, and so its socket, changes on
     every restart; the session id a binding names doesn't. Only a session's start may take a socket from another
-    session in the same process (/clear, /resume), and its end forgets it. Observation only: a failure never
-    affects the hook, and a busy map is skipped rather than waited for."""
+    session in the same process (/clear, /resume), and its end forgets it. It runs whether or not the rest of the
+    payload is accepted, since a lost start or end leaves the socket with the session before it. Observation only:
+    a failure never affects the hook, and a busy map is waited for briefly, longest at a start or an end. Returns a
+    warning when a failed write set every session's report aside, since every Claude role is then NOT RUNNING."""
     try:
-        from .wake import _HOOK_WAIT, forget_inbox, remember_inbox
+        from .wake import _HOOK_WAIT, _SWITCH_WAIT, forget_inbox, inboxes_set_aside, remember_inbox
+        if _identifier("session_id", session) != session:
+            return None
         inbox = os.environ.get("CLAUDE_CODE_MESSAGING_SOCKET")
         if event == "SessionEnd":
-            forget_inbox(session, inbox)
+            written = forget_inbox(session, inbox, wait=_SWITCH_WAIT)
         elif event in ("SessionStart", "UserPromptSubmit"):
-            remember_inbox(session, inbox, claim=event == "SessionStart", wait=_HOOK_WAIT)
+            start = event == "SessionStart"
+            written = remember_inbox(session, inbox, claim=start, wait=_SWITCH_WAIT if start else _HOOK_WAIT)
+        else:
+            return None
+        if written is not None:
+            return None
+        aside = inboxes_set_aside()
+        warning = ("MULTITHREAD WARNING: a write to the Claude Code inbox map failed, so Multithread set it aside"
+                   + (f" ({aside[1]})" if aside else "") + ". Every Claude role is NOT RUNNING to wakes until its "
+                   "session's next prompt reports again; check free disk space. Tell the person.")
+        print("multithread: " + warning, file=sys.stderr)
+        return warning
     except Exception:  # noqa: BLE001 - nonblocking by contract
-        pass
+        return None
 
 
 def _provider_contract(client, session, repo):
@@ -268,8 +283,12 @@ def _hook_warning(args, reason, *, enrolled=None, registry=None):
     context = ("MULTITHREAD WARNING: this checkout is enrolled, but Multithread's " + event + " hook could not "
                "deliver verified ledger context this time (" + because + "). This session's Multithread record may "
                "be incomplete, and this step shows no brief. Tell the person; the fix starts with: " + fix)
-    print(json.dumps({"systemMessage": "Multithread could not deliver verified ledger context for this step ("
-                      + because + "); this session's record may be incomplete. Run: " + fix,
+    shown = ("Multithread could not deliver verified ledger context for this step (" + because + "); this "
+             "session's record may be incomplete. Run: " + fix)
+    inboxes = getattr(args, "inbox_warning", None)
+    if inboxes:
+        context, shown = inboxes + "\n\n" + context, inboxes + "\n" + shown
+    print(json.dumps({"systemMessage": shown,
                       "hookSpecificOutput": {"hookEventName": event, "additionalContext": context}},
                      ensure_ascii=False, separators=(",", ":")))
 
@@ -328,9 +347,12 @@ def _provider_worker(args):
             context = _provider_contract(args.client, payload["session_id"], repo) + core_cli._render_brief(brief)
         if len(context.encode("utf-8")) > _MAX_PROVIDER_CONTEXT:
             raise StateError("provider context exceeded its bound")
-    print(json.dumps({"hookSpecificOutput": {
-        "hookEventName": name, "additionalContext": context,
-    }}, ensure_ascii=False, separators=(",", ":")))
+    output = {"hookSpecificOutput": {"hookEventName": name, "additionalContext": context}}
+    warning = getattr(args, "inbox_warning", None)
+    if warning and name != "PostToolUse":
+        output = {"systemMessage": warning, "hookSpecificOutput": {
+            "hookEventName": name, "additionalContext": warning + "\n\n" + context}}
+    print(json.dumps(output, ensure_ascii=False, separators=(",", ":")))
     return 0
 
 
@@ -732,10 +754,10 @@ def main(argv=None, *, registry=None, command_alias_check=None):
                 args.provider_payload = _provider_input(args.client, from_cwd=args.repo is None, seen=seen)
             finally:
                 args.provider_event = seen.get("event")
+                if args.client == "claude":
+                    args.inbox_warning = _report_inbox(args.provider_event, seen.get("session_id"))
             if args.provider_payload is None:
                 return 0
-            if args.client == "claude":
-                _report_inbox(args.provider_event, args.provider_payload.get("session_id"))
         stage = "admission"
         if threading.active_count() != 1:
             raise StateError("installed dispatcher requires a single-threaded fresh process")
