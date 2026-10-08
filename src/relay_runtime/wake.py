@@ -1239,8 +1239,10 @@ def _read_places(path):
     place = lambda item: (isinstance(item, dict) and set(item) == {"checkout", "role"}
                           and isinstance(item["checkout"], str) and item["checkout"].startswith("/")
                           and isinstance(item["role"], str))
-    return {key: [item for item in items if place(item)][:_RECIPIENT_PLACES]
-            for key, items in value.items() if isinstance(key, str) and isinstance(items, list)}, True
+    if not all(isinstance(key, str) and isinstance(items, list) and all(place(item) for item in items)
+               for key, items in value.items()):
+        return {}, False  # set aside whole, never partly kept
+    return {key: items[:_RECIPIENT_PLACES] for key, items in value.items()}, True
 
 
 def _places():
@@ -1276,7 +1278,7 @@ def _remember(recipient, checkout, role):
         try:
             with os.fdopen(fd, "w") as stream:
                 os.fchmod(stream.fileno(), 0o600)
-                json.dump(places, stream, sort_keys=True)
+                json.dump(places, stream)  # insertion order is recency: oldest first
                 stream.flush()
                 os.fsync(stream.fileno())
             os.replace(temporary, path)

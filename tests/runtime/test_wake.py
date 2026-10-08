@@ -2010,11 +2010,11 @@ class SignalWakeTests(ClaudeTests):
 
     def test_the_index_keeps_recent_recipients_and_sets_an_unusable_file_aside(self):
         with mock.patch.object(wake, "_RECIPIENTS_KEPT", 3):
-            for number in range(5):
-                self.assertTrue(wake._remember(wake._recipient("claude", "claude", f"s{number}", None),
+            for name in ("z", "y", "a", "b", "y"):  # recency, not alphabetical order, decides what stays
+                self.assertTrue(wake._remember(wake._recipient("claude", "claude", name, None),
                                                str(self.repo), "reviewer"))
         kept = json.loads(wake.RECIPIENTS.read_text())
-        self.assertEqual([json.dumps(["claude", "claude", f"s{number}"]) for number in (2, 3, 4)], list(kept))
+        self.assertEqual([json.dumps(["claude", "claude", name]) for name in ("a", "b", "y")], list(kept))
         # A colon inside an identifier no longer folds two recipients into one key.
         self.assertNotEqual(wake._recipient("claude", "a:b", "c", None), wake._recipient("claude", "a", "b:c", None))
         wake.RECIPIENTS.chmod(0o644)
@@ -2022,6 +2022,13 @@ class SignalWakeTests(ClaudeTests):
         aside = sorted(self.base.glob("recipients.json.unusable-*"))
         self.assertEqual(1, len(aside), "the unusable index is kept for inspection, not overwritten")
         self.assertEqual(kept, json.loads(aside[0].read_text()))
+        # Valid JSON with one malformed place is set aside whole too, not partly kept.
+        partly = {**json.loads(wake.RECIPIENTS.read_text()), json.dumps(["claude", "x", "y"]): [{"checkout": "relative"}]}
+        wake.RECIPIENTS.write_text(json.dumps(partly))
+        wake.RECIPIENTS.chmod(0o600)
+        self.assertTrue(wake._remember(wake._recipient("claude", "claude", "later", None), str(self.repo), "reviewer"))
+        self.assertEqual(2, len(list(self.base.glob("recipients.json.unusable-*"))))
+        self.assertEqual([json.dumps(["claude", "claude", "later"])], list(json.loads(wake.RECIPIENTS.read_text())))
         with mock.patch.object(wake, "RECIPIENTS", None), \
                 mock.patch.dict(os.environ, {"RELAY_HOME": str(self.base / "relay-home")}):
             self.assertEqual(self.base / "relay-home" / "wake-recipients.json", wake._recipients_path())

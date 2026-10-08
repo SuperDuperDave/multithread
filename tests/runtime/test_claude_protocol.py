@@ -609,9 +609,11 @@ class ClaudeProtocolTests(unittest.TestCase):
 
     def test_session_mismatch_returns_no_answer_and_advertises_no_target(self):
         control = Control()
+        # One atomic write, so the result is captured with the init that faults: the driver stops reading at
+        # the fault, and under load a separate later write could arrive after its final snapshot.
+        frames = (json.dumps(init(session=OTHER_SESSION)) + "\n" + json.dumps(result(session=OTHER_SESSION)) + "\n")
         envelope, directory, _ = self.run_native(
-            [{"read": 1}, {"emit": init(session=OTHER_SESSION)},
-             {"emit": result(session=OTHER_SESSION)}], control=control)
+            [{"read": 1}, {"raw": frames.encode().hex()}], control=control)
         self.assertEqual("uncertain", envelope["state"])
         self.assertIsNone(envelope["result"])
         self.assertTrue(envelope["needs_attention"])
