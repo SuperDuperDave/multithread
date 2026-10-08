@@ -1975,6 +1975,34 @@ class ClaudeTests(WakeCase):
         self.assertEqual([], self.inbox.lines)
         self.assertEqual(2, len(list(wake.INBOXES.parent.glob(wake.INBOXES.name + ".failed-*"))), "kept to inspect")
 
+    def test_a_map_that_can_be_neither_written_nor_set_aside_is_reported(self):
+        # Sol on ef135c2: when the set-aside fails too, A's entry stays, so the hook must not be silent about it.
+        self.bind_inbox()
+        denied = PermissionError(errno.EACCES, "Permission denied")
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_MESSAGING_SOCKET": str(self.inbox_path)}), \
+                mock.patch.object(wake.tempfile, "mkstemp", side_effect=OSError(errno.EIO, "I/O error")), \
+                mock.patch.object(wake.os, "replace", side_effect=denied), \
+                mock.patch.object(wake.os, "unlink", side_effect=denied), redirect_stderr(io.StringIO()):
+            with self.assertRaises(OSError):
+                wake.remember_inbox("switched-to", str(self.inbox_path), claim=True)
+            warning = runtime_cli._report_inbox("SessionStart", "switched-to")
+        self.assertIn("could neither update nor set aside the Claude Code inbox map (Permission denied)", warning)
+        self.assertIn("can reach the one that replaced it", warning)
+        with mock.patch.object(wake, "remember_inbox", side_effect=denied):
+            self.assertEqual("ALREADY BOUND", self.bind_inbox()[1]["status"], "bind leaves reporting to the hook")
+
+    def test_a_lock_that_fails_never_touches_the_map(self):
+        # Sol on ef135c2: an flock error other than contention isn't ownership of the lock, so nothing is set aside.
+        self.bind_inbox()
+        before = wake.INBOXES.read_text()
+        with mock.patch.object(wake.fcntl, "flock", side_effect=OSError(errno.ENOLCK, "No locks available")):
+            with self.assertRaises(OSError):
+                wake.remember_inbox("switched-to", str(self.inbox_path), claim=True)
+            with self.assertRaises(OSError):
+                wake.forget_inbox("self", str(self.inbox_path))
+        self.assertEqual(before, wake.INBOXES.read_text())
+        self.assertEqual([], list(wake.INBOXES.parent.glob(wake.INBOXES.name + ".failed-*")))
+
     def test_a_hook_that_sets_the_map_aside_warns_the_session_and_the_person(self):
         self.bind_inbox()
         full = OSError(errno.ENOSPC, "No space left on device")
@@ -2097,8 +2125,10 @@ class ClaudeTests(WakeCase):
         with mock.patch.dict(os.environ, {"CLAUDE_CODE_MESSAGING_SOCKET": str(self.inbox_path)}):
             runtime_cli._report_inbox("SessionStart", "self")
             self.assertEqual(str(self.inbox_path), wake.live_inbox("self")["inbox"])
-            with mock.patch.object(wake, "remember_inbox", side_effect=OSError("synthetic")):
-                runtime_cli._report_inbox("UserPromptSubmit", "self")
+            with mock.patch.object(wake, "remember_inbox", side_effect=OSError("synthetic")), \
+                    redirect_stderr(io.StringIO()) as err:
+                self.assertIn("MULTITHREAD WARNING", runtime_cli._report_inbox("UserPromptSubmit", "self"))
+            self.assertIn("MULTITHREAD WARNING", err.getvalue())
 
     def test_show_names_the_inbox(self):
         self.bind_inbox()

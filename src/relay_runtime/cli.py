@@ -139,25 +139,34 @@ def _report_inbox(event, session):
     session in the same process (/clear, /resume), and its end forgets it. It runs whether or not the rest of the
     payload is accepted, since a lost start or end leaves the socket with the session before it. Observation only:
     a failure never affects the hook, and a busy map is waited for briefly, longest at a start or an end. Returns a
-    warning when a failed write set every session's report aside, since every Claude role is then NOT RUNNING."""
+    warning when a failed write set every session's report aside, since every Claude role is then NOT RUNNING, or
+    when the map could be neither updated nor set aside, since a wake can then reach the wrong session."""
     try:
         from .wake import _HOOK_WAIT, _SWITCH_WAIT, forget_inbox, inboxes_set_aside, remember_inbox
         if _identifier("session_id", session) != session:
             return None
         inbox = os.environ.get("CLAUDE_CODE_MESSAGING_SOCKET")
-        if event == "SessionEnd":
-            written = forget_inbox(session, inbox, wait=_SWITCH_WAIT)
-        elif event in ("SessionStart", "UserPromptSubmit"):
-            start = event == "SessionStart"
-            written = remember_inbox(session, inbox, claim=start, wait=_SWITCH_WAIT if start else _HOOK_WAIT)
+        try:
+            if event == "SessionEnd":
+                written = forget_inbox(session, inbox, wait=_SWITCH_WAIT)
+            elif event in ("SessionStart", "UserPromptSubmit"):
+                start = event == "SessionStart"
+                written = remember_inbox(session, inbox, claim=start, wait=_SWITCH_WAIT if start else _HOOK_WAIT)
+            else:
+                return None
+        except OSError as exc:
+            warning = ("MULTITHREAD WARNING: Multithread could neither update nor set aside the Claude Code inbox "
+                       f"map ({exc.strerror or type(exc).__name__}). Until a later report succeeds, a wake for a "
+                       "session that ended in this Claude Code process can reach the one that replaced it. Tell "
+                       "the person.")
         else:
-            return None
-        if written is not None:
-            return None
-        aside = inboxes_set_aside()
-        warning = ("MULTITHREAD WARNING: a write to the Claude Code inbox map failed, so Multithread set it aside"
-                   + (f" ({aside[1]})" if aside else "") + ". Every Claude role is NOT RUNNING to wakes until its "
-                   "session's next prompt reports again; check free disk space. Tell the person.")
+            if written is not None:
+                return None
+            aside = inboxes_set_aside()
+            warning = ("MULTITHREAD WARNING: a write to the Claude Code inbox map failed, so Multithread set it "
+                       "aside" + (f" ({aside[1]})" if aside else "") + ". Every Claude role is NOT RUNNING to "
+                       "wakes until its session's next prompt reports again; check free disk space. Tell the "
+                       "person.")
         print("multithread: " + warning, file=sys.stderr)
         return warning
     except Exception:  # noqa: BLE001 - nonblocking by contract

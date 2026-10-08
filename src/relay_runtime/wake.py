@@ -1280,18 +1280,21 @@ def _private_read(path, valid):
 
 
 def _private_update(path, read_file, change, wait=5, discard=False):
-    """Replace the file with change(value) under its lock, waiting at most wait seconds for it; False when it could
-    not be written. change may return None to leave the file untouched. With discard, a write that fails once the
-    lock is held sets the file aside instead (None), so a stale entry can't outlive the change that should have
-    ended it; the set-aside file is the diagnostic."""
+    """Replace the file with change(value) under its lock, waiting at most wait seconds for it; False when its lock
+    stayed busy or, without discard, when it could not be written. change may return None to leave the file
+    untouched. With discard, a write that fails once the lock is held sets the file aside instead (None), so a
+    stale entry can't outlive the change that should have ended it, and the set-aside file is the diagnostic; any
+    other failure is raised for the caller to report, and the file is never touched without its lock."""
     try:
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         directory = os.lstat(path.parent)
         if not stat.S_ISDIR(directory.st_mode) or directory.st_uid != os.getuid():
-            return False  # a symbolic link or someone else's directory
+            raise PermissionError(f"{path.parent} is a symbolic link or someone else's directory")
         lock = os.open(path.with_suffix(".lock"),
                        os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK, 0o600)
     except OSError:
+        if discard:
+            raise
         return False
     try:
         deadline = time.monotonic() + wait
@@ -1303,6 +1306,12 @@ def _private_update(path, read_file, change, wait=5, discard=False):
                 if time.monotonic() >= deadline:
                     return False
                 time.sleep(0.02)
+    except OSError:
+        os.close(lock)
+        if discard:
+            raise
+        return False
+    try:
         value, usable = read_file(path)
         changed = change(value)
         if changed is None:
@@ -1327,12 +1336,9 @@ def _private_update(path, read_file, change, wait=5, discard=False):
         try:
             os.replace(path, path.with_name(f"{path.name}.failed-{time.time_ns()}"))  # a rename needs no space
         except FileNotFoundError:
-            return False
+            return False  # nothing there to go stale
         except OSError:
-            try:
-                os.unlink(path)
-            except OSError:
-                return False
+            os.unlink(path)  # raises when even that fails
         return None
     finally:
         os.close(lock)
@@ -1429,7 +1435,7 @@ def remember_inbox(session, inbox, claim=False, wait=5):
     one. One process can switch sessions (/clear, /resume), so only a session's start claims a socket another live
     session holds. Any other report that finds one fails closed: it drops that holder and records nothing this
     time, so a lost claim alone heals at the next prompt and costs NOT RUNNING. False when nothing was recorded,
-    None when a failed write set the whole map aside; a failure costs only the lookup."""
+    None when a failed write set the whole map aside; OSError when the map could be neither written nor set aside."""
     pid = _inbox_owner(inbox)
     claude = os.environ.get("CLAUDE_PID")
     if claude is not None and str(pid) != claude:
@@ -1461,7 +1467,7 @@ def remember_inbox(session, inbox, claim=False, wait=5):
 
 def forget_inbox(session, inbox, wait=_SWITCH_WAIT):
     """A session ended in this process (exit, /clear, /resume elsewhere): its entry no longer names a reachable
-    session. Only the entry for this exact inbox is removed."""
+    session. Only the entry for this exact inbox is removed. Returns and raises as remember_inbox does."""
     def change(entries):
         if entries.get(session, {}).get("inbox") != inbox:
             return None
@@ -1933,7 +1939,10 @@ def bind(args, ledger=launcher_ledger):
     # Re-running bind records an older binding here too, so the index fills without a migration.
     base["index_recorded"] = _remember(_recipient(provider, agent, session, thread), shown["ledger"], role)
     if inbox is not None and this_session == session:
-        remember_inbox(session, inbox)  # only from inside the session it names; its hook reports otherwise
+        try:
+            remember_inbox(session, inbox)  # only from inside the session it names; its hook reports otherwise
+        except OSError:
+            pass  # the binding is recorded; the session's next prompt reports, and warns if this persists
     if recorded["duplicate"]:
         return _outcome("ALREADY BOUND", f"{role} already wakes {target} (binding {binding['generation']}); "
                         "nothing was recorded.", "Nothing.", **base, **extra)
