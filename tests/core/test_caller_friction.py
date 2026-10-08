@@ -30,6 +30,24 @@ class CallerFrictionTests(unittest.TestCase):
         help_text = cli.build_parser()._subparsers._group_actions[0].choices["signal"].format_help()
         self.assertIn("at most 500 characters; put detail in the artifact", " ".join(help_text.split()))
 
+    def test_the_bearer_scheme_can_be_named_while_a_bearer_credential_is_refused(self):
+        # Sentinel (system-sentinel 861): reviewing the native app's pairing boundary, a claim purpose and a handoff
+        # summary (a claim's purpose is recorded inside its summary) were refused for naming the scheme.
+        base = {"kind": "work.intent", "agent": "claude", "session": "s1", "work_id": "w"}
+        token = "A" * 21 + "-_" * 11  # 43 base64url characters, artificial
+        for credential in ("Bearer " + "B" * 32, "Bearer very-secret-value", "Bearer TOPSECRET_CANARY_0123456789",
+                           "Authorization: Bearer " + token, "bearer " + "abc.DEF_123~+/" * 3 + "==",
+                           "token in a sentence (Bearer abcdefghijklmnopqrstuvwxyz)."):
+            with self.subTest(credential=credential), \
+                    self.assertRaisesRegex(ValidationError, "appears to contain a credential"):
+                normalize_event({**base, "summary": credential})
+        for prose in ("Review the pairing boundary: bearer token issuance and device revocation",
+                      "Claim: audit bearer auth on the pairing endpoint before slice 2 ships",
+                      "Bearer tokens expire after 30 days; the bearer header is checked server-side",
+                      "Store the bearer credential in the keychain, never in logs"):
+            with self.subTest(prose=prose):
+                self.assertEqual(prose, normalize_event({**base, "summary": prose}).summary)
+
     def test_an_uncontrolled_ancestor_is_named_with_its_remedy(self):
         directory = enrollment._Directory(custody=mock.Mock(), path=Path("/mapped/home"), fd=-1, parent=None,
                                           initial=os.stat("/"))
