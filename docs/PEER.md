@@ -573,6 +573,7 @@ and do not establish consumption. `--status` cannot take expectation flags.
 | `STATUS` | 0 | Read original-binding attempts and recorded consumption evidence; nothing sent, and recipient reachability/current turn state were not probed |
 | `ALREADY SENT` | 3 | This message id went out, or its earlier outcome is unknown; nothing sent |
 | `NOT SENT` | 4 | Nothing reached the conversation: the daemon was unreachable, refused to list the conversation's turns, or answered the turn list unreadably; the conversation is unknown; Codex couldn't be found or run, or `codex queue` refused before sending; the inbox is gone, failed its checks or refused the connection; the role is paused or unbound; or the arguments, expected binding, reference or ledger couldn't be used. Follow the stated remedy before deliberately retrying |
+| `NOT RUNNING` | 4 | The bound Claude Code session isn't running: no inbox it reported is still owned by its process, and the stored one isn't the process that was bound. It is reachable again at its next prompt; send then with the same id |
 | `UNCERTAIN` | 5 | Sent, with no receipt that it arrived: the daemon didn't answer the steer, or `codex queue` didn't finish; the steer drew an unreadable reply, an error that doesn't show it was refused before acceptance, or no receipt for the expected turn; `codex queue` printed no receipt for the bound conversation, or failed after starting; or the inbox connection dropped while sending. The id stays blocked; check with the recipient before sending again |
 
 Every result names the next step, as text or with `--json`.
@@ -669,9 +670,23 @@ separate steer, so `--steer` changes nothing there and the result says so.
 shows it as sent by another Claude session, not by the person, and says a peer
 cannot approve anything; the text names the real sender. The session's inbound
 settings (`crossSessionInbound`) may still hold or refuse it, and Claude Code
-drops identical repeats sent close together. When the session ends or restarts
-its inbox goes away: wake reports `NOT SENT` and names the binding recovery
-route. The same owner can refresh its inbox; a new holder needs release or
+drops identical repeats sent close together.
+
+A binding names the session, which survives `claude --resume`; its inbox is
+named after the session's process and moves on every restart. So each
+session's Multithread hook reports its current inbox at start and on every
+prompt, with that process's identity (boot, process id and start time), into
+an owner-only map beside the recipient index (`claude-inboxes.json`; only a
+process the inbox is named after, running above the hook, can report it). A
+wake goes to the inbox the bound session last reported while that exact
+process still runs, so a restarted or resumed session is reachable again from
+its first prompt without binding again. A binding made before any report is
+used only while the process behind its stored inbox started before the
+binding. Anything else is `NOT RUNNING` (exit 4, nothing sent, the message
+id stays unused): a process id that comes round again belongs to another
+session, which never receives a wake meant for this one. An inbox that is
+gone, fails its checks or refuses the connection is still `NOT SENT`. The
+same owner can refresh its binding; a new holder needs release or
 [authorized handover](#inspect-pending-work-and-role-handovers). In one live test before this command existed, an idle Claude
 Code session started a turn within 8 seconds of such a message.
 

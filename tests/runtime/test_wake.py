@@ -314,8 +314,26 @@ class WakeCase(unittest.TestCase):
         self.task.write_text("synthetic task\n")
         self.ledger_calls = []
         self.failing = set()
+        # Claude Code inboxes are owned by processes: a synthetic /proc where this test runs under Claude Code 7739.
+        self.proc = self.base / "proc"
+        (self.proc / "sys/kernel/random").mkdir(parents=True)
+        (self.proc / "sys/kernel/random/boot_id").write_text("boot-fixture\n")
+        (self.proc / "stat").write_text("cpu 0\nbtime 1000\n")
+        for pid in (7739, 7740, 7741):
+            self.fake_process(pid)
+        self.fake_process(os.getpid(), ppid=7739)
+        for patcher in (mock.patch.object(wake, "PROC", self.proc),
+                        mock.patch.object(wake, "INBOXES", self.base / "inboxes.json")):
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     # --- Fixtures ---------------------------------------------------------------
+
+    def fake_process(self, pid, ppid=1, start=100):
+        """A live process in the synthetic /proc; start is in clock ticks after boot (btime 1000)."""
+        directory = self.proc / str(pid)
+        directory.mkdir(exist_ok=True)
+        (directory / "stat").write_text(f"{pid} (claude) S {ppid} " + " ".join(["0"] * 17) + f" {start} 0\n")
 
     def codex_mode(self, mode):
         (self.bin / "mode").write_text(mode)
@@ -485,7 +503,7 @@ class SenderContextTests(WakeCase):
         self.assertEqual(expected, self.events("wake.attempted")[-1]["meta"]["sender"])
 
     def test_codex_recipient_identity_not_binding_recorder_supplies_claude_inbox_header(self):
-        inbox = FakeInbox(self.codex_home / "source-context.sock")
+        inbox = FakeInbox(self.codex_home / "7741.sock")
         self.inbox = inbox
         self.addCleanup(inbox.close)
         code, out = self.run_helper(wake.bind_main, "reviewer", "--claude-socket", str(inbox.path),
@@ -1799,6 +1817,7 @@ class ClaudeTests(WakeCase):
         self.assertEqual("inbox_unsafe", self.conclusion()["reason"])
         restarted = FakeInbox(self.codex_home / "7740.sock")
         self.addCleanup(restarted.close)
+        shutil.rmtree(self.proc / "7739")  # the session restarted: its old process is gone
         self.assertEqual(0, self.bind_inbox(path=restarted.path)[0])
         delivered = self.wake_inbox()
         self.assertEqual("DELIVERED TO INBOX", delivered["status"], "following the next step delivers it")
@@ -1818,6 +1837,68 @@ class ClaudeTests(WakeCase):
         self.assertEqual(("uncertain", "dropped", "inbox"),
                          tuple(self.conclusion()[key] for key in ("outcome", "reason", "transport")))
         self.assertEqual("ALREADY SENT", self.wake_inbox()["status"])
+
+    def test_a_restarted_session_is_woken_where_it_now_is_without_binding_again(self):
+        # After a restart, 5 of 7 Claude roles were unreachable until each bound again from inside itself.
+        self.bind_inbox()
+        bindings = len(self.events("wake.bound"))
+        restarted = FakeInbox(self.codex_home / "8840.sock")
+        self.addCleanup(restarted.close)
+        shutil.rmtree(self.proc / "7739")
+        self.fake_process(8840)
+        self.fake_process(os.getpid(), ppid=8840)
+        self.assertTrue(wake.remember_inbox("self", str(restarted.path)), "its hook reports the new inbox")
+        result = self.wake_inbox()
+        self.assertEqual("DELIVERED TO INBOX", result["status"], result)
+        self.assertEqual(1, len(restarted.lines))
+        self.assertEqual([], self.inbox.lines, "the old socket, still listening, is not the session")
+        self.assertEqual(bindings, len(self.events("wake.bound")), "nothing was bound again")
+
+    def test_a_reused_process_id_is_not_running_and_reaches_no_one(self):
+        # The coordinator's case: A dies, B gets A's process id and so its socket path; a wake for A reaches no one.
+        self.bind_inbox()
+        later = int((time.time() - 1000 + 60) * 100)  # B started after A's binding
+        for mapped in (False, True):
+            with self.subTest(b_reported=mapped):
+                self.fake_process(7739, start=later)
+                if mapped:
+                    self.fake_process(os.getpid(), ppid=7739)
+                    self.assertTrue(wake.remember_inbox("another-session", str(self.inbox_path)))
+                    self.assertNotIn("self", json.loads(wake.INBOXES.read_text()), "one owner per socket path")
+                result = self.wake_inbox()
+                self.assertEqual(("NOT RUNNING", 4), (result["status"], result["exit_code"]), result)
+                self.assertIn("isn't running", result["happened"])
+                self.assertIn("is still unused", result["next"])
+                self.assertEqual([], self.inbox.lines, "B received nothing")
+                self.assertEqual(("not_sent", "inbox_missing", "not running"),
+                                 tuple(self.conclusion()[key] for key in ("outcome", "reason", "detail")))
+
+    def test_a_binding_from_before_sessions_reported_wakes_only_its_own_process(self):
+        self.bind_inbox()
+        wake.INBOXES.unlink()  # bound by a release that kept no map
+        self.assertEqual("DELIVERED TO INBOX", self.wake_inbox()["status"], "the bound process still runs")
+        self.fake_process(7739, start=int((time.time() - 1000 + 60) * 100))
+        self.assertEqual("NOT RUNNING", self.wake_inbox("--id", "after-reuse")["status"],
+                         "a younger process is not the one bound")
+        self.assertEqual(1, len(self.inbox.lines))
+
+    def test_only_a_session_can_report_its_own_inbox(self):
+        self.assertFalse(wake.remember_inbox("self", str(self.codex_home / "7740.sock")), "7740 isn't an ancestor")
+        self.assertFalse(wake.remember_inbox("self", str(self.codex_home / "not-a-process.sock")))
+        self.assertFalse(wake.remember_inbox("", str(self.inbox_path)))
+        self.assertTrue(wake.remember_inbox("self", str(self.inbox_path)))
+        self.assertEqual({"self": {"inbox": str(self.inbox_path), "boot_id": "boot-fixture", "pid": 7739,
+                                   "start": 100}}, json.loads(wake.INBOXES.read_text()))
+        self.assertEqual(0o600, wake.INBOXES.stat().st_mode & 0o777)
+        (self.proc / "sys/kernel/random/boot_id").write_text("boot-later\n")
+        self.assertIsNone(wake.live_inbox("self"), "a report from an earlier boot names no live process")
+
+    def test_the_hook_reports_its_session_inbox_and_never_fails_for_it(self):
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_MESSAGING_SOCKET": str(self.inbox_path)}):
+            runtime_cli._report_inbox("self")
+            self.assertEqual(str(self.inbox_path), wake.live_inbox("self"))
+            with mock.patch.object(wake, "remember_inbox", side_effect=OSError("synthetic")):
+                runtime_cli._report_inbox("self")
 
     def test_show_names_the_inbox(self):
         self.bind_inbox()

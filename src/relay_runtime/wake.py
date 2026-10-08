@@ -12,8 +12,8 @@ not the recipient reading it: acknowledgement stays the recipient's own act.
 
 import argparse
 import base64
-import fcntl
 from datetime import datetime, timezone
+import fcntl
 import hashlib
 import json
 import os
@@ -39,7 +39,7 @@ from .enrollment import EnrollmentError, NotEnrolled, Registry
 SOCKET = Path("app-server-control") / "app-server-control.sock"
 EXIT_CODES = {"STEERED": 0, "QUEUED": 0, "DELIVERED TO INBOX": 0, "DRY RUN": 0, "STATUS": 0,
               "BOUND": 0, "ALREADY BOUND": 0,
-              "ALREADY SENT": 3, "NOT SENT": 4, "NOT BOUND": 4, "UNCERTAIN": 5}
+              "ALREADY SENT": 3, "NOT SENT": 4, "NOT BOUND": 4, "NOT RUNNING": 4, "UNCERTAIN": 5}
 _CLIENT_INFO = {"name": "multithread-wake", "title": "Multithread wake", "version": "1"}
 _WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 _MAX_MESSAGE = 1024 * 1024
@@ -945,7 +945,7 @@ def wake(args, ledger=launcher_ledger):
         return result
 
     if binding["provider"] == "claude":
-        return _wake_inbox(args, role, path, text, message_id, base, conclude)
+        return _wake_inbox(args, role, binding, path, text, message_id, base, conclude)
     try:
         daemon = Daemon(path)
     except DaemonUnavailable as exc:
@@ -1099,13 +1099,30 @@ def _refused_before_sending(completed):
         return False
 
 
-def _wake_inbox(args, role, path, text, message_id, base, conclude):
-    """Claude Code: one line into the session's inbox. There is no separate steer."""
+def _wake_inbox(args, role, binding, stored, text, message_id, base, conclude):
+    """Claude Code: one line into the session's inbox. There is no separate steer.
+
+    The binding names a session; its inbox is the one that session last reported from inside itself, while the
+    process that reported it still runs. A binding made before such reports is used only while the process behind
+    its stored inbox is the one that was bound. Anything else is a session that isn't running here, never a
+    delivery to whichever session took over its process id."""
     unsteered = " Claude Code has no separate steer, so --steer changed nothing." if args.steer else ""
     rebind = (f"Have the exact holder refresh {role} from its own Claude Code session with "
               "--claude-socket \"$CLAUDE_CODE_MESSAGING_SOCKET\". Moving it to another owner requires an explicitly "
               "authorized handover with --replace, --expected-generation, --reason and --approval-ref. "
               "Then run this wake again.")
+    session = binding.get("bound_session")
+    path = live_inbox(session)
+    if path is None and inbox_problem(stored) is None and bound_process_alive(stored, binding.get("bound_at")):
+        path = stored
+    if path is None:
+        base["recipient_state"] = {"reachability": "unavailable", "turn_state": "unknown", "source": "inbox_owner"}
+        return conclude(_outcome(
+            "NOT RUNNING", f"The Claude Code session {session} bound to {role} isn't running: no inbox it reported is "
+            "still owned by its process, and the stored one isn't the process that was bound. Nothing was sent.",
+            f"It becomes reachable at its next prompt, when it reports its inbox; a session resumed with `claude "
+            f"--resume` keeps {role}. Send again then; message id {message_id} is still unused.", **base),
+            "not_sent", "inbox_missing", detail="not running")
     problem = inbox_problem(path)
     if problem is not None:
         reason, why = problem
@@ -1195,29 +1212,22 @@ def _receives(binding, agent, session):
     return binding.get("bound_agent") == agent and binding.get("bound_session") == session
 
 
-# Where each recipient holds a role, so a signal recorded in one checkout's ledger can wake it in its own. A hint
-# only: every use is verified against that ledger's binding, so the index never decides who is woken.
-# It lives beside the ledgers it describes: RELAY_HOME when one names their state, else the account's.
-RECIPIENTS = None  # tests set an exact path
-_RECIPIENT_PLACES = 8
-_RECIPIENTS_KEPT = 256  # most recently bound recipients; sessions come and go
+# --- Owner-only hint files beside the ledgers' state: the recipient index and the inbox map ---------
+# Both are hints that every use verifies, so a failure costs a lookup, never a wrong action. A file that is
+# unreadable, loosely held, oversized or malformed reads as empty and is set aside whole by its next writer.
+
+_PRIVATE_MAX_BYTES = 1 << 20
 
 
-def _recipients_path():
-    if RECIPIENTS is not None:
-        return Path(RECIPIENTS)
+def _state_dir():
+    """Beside the ledgers it describes: RELAY_HOME when one names their state, else the account's."""
     if os.environ.get("RELAY_HOME"):
-        return Path(os.path.abspath(os.path.expanduser(os.environ["RELAY_HOME"]))) / "wake-recipients.json"
-    return Path(os.path.expanduser("~/.local/share/relay/wake-recipients.json"))
+        return Path(os.path.abspath(os.path.expanduser(os.environ["RELAY_HOME"])))
+    return Path(os.path.expanduser("~/.local/share/relay"))
 
 
-def _recipient(provider, agent, session, thread):
-    return json.dumps(["codex", thread] if provider == "codex" else ["claude", agent, session])
-
-
-def _read_places(path):
-    """The index and whether it was usable: absent is usable and empty; unreadable, loosely held, oversized
-    or malformed is not."""
+def _private_read(path, valid):
+    """(value, usable): absent is usable and empty; valid(value) returns the normalized value, or None to refuse."""
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
     except FileNotFoundError:
@@ -1227,32 +1237,20 @@ def _read_places(path):
     try:
         status = os.fstat(fd)
         if (not stat.S_ISREG(status.st_mode) or status.st_uid != os.getuid() or status.st_mode & 0o077
-                or status.st_size > 1 << 20):
+                or status.st_size > _PRIVATE_MAX_BYTES):
             return {}, False
         value = json.loads(os.read(fd, status.st_size + 1))
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
         return {}, False
     finally:
         os.close(fd)
-    if not isinstance(value, dict):
-        return {}, False
-    place = lambda item: (isinstance(item, dict) and set(item) == {"checkout", "role"}
-                          and isinstance(item["checkout"], str) and item["checkout"].startswith("/")
-                          and isinstance(item["role"], str))
-    if not all(isinstance(key, str) and isinstance(items, list) and all(place(item) for item in items)
-               for key, items in value.items()):
-        return {}, False  # set aside whole, never partly kept
-    return {key: items[:_RECIPIENT_PLACES] for key, items in value.items()}, True
+    value = valid(value) if isinstance(value, dict) else None
+    return ({}, False) if value is None else (value, True)
 
 
-def _places():
-    return _read_places(_recipients_path())[0]
-
-
-def _rewrite_places(change):
-    """Replace the index with change(places) under its lock; False when it could not be written, which costs only
-    the cross-ledger lookup. An unusable index is set aside, never overwritten."""
-    path = _recipients_path()
+def _private_update(path, read_file, change):
+    """Replace the file with change(value) under its lock; False when it could not be written. change may return
+    None to leave the file untouched."""
     try:
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         lock = os.open(path.with_suffix(".lock"), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
@@ -1268,15 +1266,17 @@ def _rewrite_places(change):
                 if time.monotonic() >= deadline:
                     return False
                 time.sleep(0.02)
-        places, usable = _read_places(path)
+        value, usable = read_file(path)
+        changed = change(value)
+        if changed is None:
+            return True
         if not usable:
             os.replace(path, path.with_name(f"{path.name}.unusable-{time.time_ns()}"))
-        places = change(places)
-        fd, temporary = tempfile.mkstemp(prefix=".recipients-", dir=path.parent)
+        fd, temporary = tempfile.mkstemp(prefix=f".{path.stem}-", dir=path.parent)
         try:
             with os.fdopen(fd, "w") as stream:
                 os.fchmod(stream.fileno(), 0o600)
-                json.dump(places, stream)  # insertion order is recency: oldest first
+                json.dump(changed, stream)  # insertion order is recency: oldest first
                 stream.flush()
                 os.fsync(stream.fileno())
             os.replace(temporary, path)
@@ -1288,6 +1288,154 @@ def _rewrite_places(change):
         return False
     finally:
         os.close(lock)
+
+
+# --- Claude Code inboxes by session -----------------------------------------------------------
+# Where each Claude Code session's inbox is now, and whether the process that owns it is still that session.
+#
+# A role binding names a session, which survives `claude --resume`. Its inbox socket is named after the session's
+# process id, so it moves on every restart and, once process ids start over, can belong to another session. Each
+# session's Multithread hook therefore reports its inbox together with its process's identity (boot, pid and start
+# time), and a wake delivers only to a socket whose process is still exactly that one. The map is a hint like the
+# recipient index: a wrong entry can only be refused, never deliver to a session it doesn't name.
+
+INBOXES = None  # tests set an exact path
+PROC = Path("/proc")  # tests point this at a synthetic tree
+_INBOXES_KEPT = 256  # most recently reporting sessions
+_SOCKET_NAME = re.compile(r"([1-9][0-9]{0,9})\.sock")
+_INBOX_ANCESTRY = 16  # hook → shell → … → Claude Code
+
+
+def _inboxes_path():
+    return Path(INBOXES) if INBOXES is not None else _state_dir() / "claude-inboxes.json"
+
+
+def _valid_inboxes(value):
+    entry = lambda item: (isinstance(item, dict) and set(item) == {"inbox", "boot_id", "pid", "start"}
+                          and isinstance(item["inbox"], str) and item["inbox"].startswith("/")
+                          and isinstance(item["boot_id"], str) and type(item["pid"]) is int
+                          and type(item["start"]) is int)
+    return value if all(isinstance(key, str) and entry(item) for key, item in value.items()) else None
+
+
+def _read_inboxes(path):
+    return _private_read(path, _valid_inboxes)
+
+
+def _stat_fields(pid):
+    text = (PROC / str(pid) / "stat").read_text()
+    return text[text.rindex(")") + 2:].split()  # fields from the third on; the name may hold spaces and ')'
+
+
+def _process(pid):
+    """(boot id, start time in clock ticks) of a live process, or None."""
+    try:
+        boot = (PROC / "sys/kernel/random/boot_id").read_text().strip()
+        return boot, int(_stat_fields(pid)[19])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _inbox_owner(inbox):
+    match = _SOCKET_NAME.fullmatch(Path(inbox).name) if isinstance(inbox, str) and os.path.isabs(inbox) else None
+    return int(match[1]) if match else None
+
+
+def _ancestors():
+    pid, seen = os.getpid(), []
+    for _ in range(_INBOX_ANCESTRY):
+        try:
+            pid = int(_stat_fields(pid)[1])
+        except (OSError, ValueError, IndexError):
+            break
+        if pid <= 1:
+            break
+        seen.append(pid)
+    return seen
+
+
+def remember_inbox(session, inbox):
+    """Record that session's inbox is now inbox, as reported from inside it: the process the socket is named after
+    must be an ancestor of this one. False when nothing was recorded; a failure costs only the lookup."""
+    pid = _inbox_owner(inbox)
+    identity = _process(pid) if pid is not None and pid in _ancestors() else None
+    if not isinstance(session, str) or not session or identity is None:
+        return False
+    entry = {"inbox": inbox, "boot_id": identity[0], "pid": pid, "start": identity[1]}
+
+    def change(entries):
+        if entries.get(session) == entry:
+            return None  # unchanged: a prompt costs one read
+        # One owner per path: when a process id comes round again, the newest report owns its socket.
+        kept = {key: item for key, item in entries.items() if key != session and item["inbox"] != inbox}
+        return {**dict(list(kept.items())[-(_INBOXES_KEPT - 1):]), session: entry}
+    return _private_update(_inboxes_path(), _read_inboxes, change)
+
+
+def live_inbox(session):
+    """The session's reported inbox if the process that reported it still owns it, else None."""
+    entry = _read_inboxes(_inboxes_path())[0].get(session) if isinstance(session, str) else None
+    if entry is None or _process(entry["pid"]) != (entry["boot_id"], entry["start"]):
+        return None
+    return entry["inbox"]
+
+
+def bound_process_alive(inbox, bound_at):
+    """Whether the process now behind a binding's stored inbox started at least a second before the binding, so it
+    is the process that was bound: a process id belongs to one live process at a time."""
+    pid = _inbox_owner(inbox)
+    identity = _process(pid) if pid is not None else None
+    try:
+        bound = datetime.fromisoformat(str(bound_at).replace("Z", "+00:00")).timestamp()
+        boot = int(next(line.split()[1] for line in (PROC / "stat").read_text().splitlines()
+                        if line.startswith("btime ")))
+    except (OSError, ValueError, StopIteration, IndexError):
+        return False
+    return identity is not None and boot + identity[1] / os.sysconf("SC_CLK_TCK") <= bound - 1
+
+
+# Where each recipient holds a role, so a signal recorded in one checkout's ledger can wake it in its own. A hint
+# only: every use is verified against that ledger's binding, so the index never decides who is woken.
+# It lives beside the ledgers it describes: RELAY_HOME when one names their state, else the account's.
+RECIPIENTS = None  # tests set an exact path
+_RECIPIENT_PLACES = 8
+_RECIPIENTS_KEPT = 256  # most recently bound recipients; sessions come and go
+
+
+def _recipients_path():
+    if RECIPIENTS is not None:
+        return Path(RECIPIENTS)
+    return _state_dir() / "wake-recipients.json"
+
+
+def _recipient(provider, agent, session, thread):
+    return json.dumps(["codex", thread] if provider == "codex" else ["claude", agent, session])
+
+
+def _valid_places(value):
+    place = lambda item: (isinstance(item, dict) and set(item) == {"checkout", "role"}
+                          and isinstance(item["checkout"], str) and item["checkout"].startswith("/")
+                          and isinstance(item["role"], str))
+    if not all(isinstance(key, str) and isinstance(items, list) and all(place(item) for item in items)
+               for key, items in value.items()):
+        return None  # set aside whole, never partly kept
+    return {key: items[:_RECIPIENT_PLACES] for key, items in value.items()}
+
+
+def _read_places(path):
+    """The index and whether it was usable: absent is usable and empty; unreadable, loosely held, oversized
+    or malformed is not."""
+    return _private_read(path, _valid_places)
+
+
+def _places():
+    return _read_places(_recipients_path())[0]
+
+
+def _rewrite_places(change):
+    """Replace the index with change(places) under its lock; False when it could not be written, which costs only
+    the cross-ledger lookup. An unusable index is set aside, never overwritten."""
+    return _private_update(_recipients_path(), _read_places, change)
 
 
 def _placed(places, recipient, place):
@@ -1697,6 +1845,8 @@ def bind(args, ledger=launcher_ledger):
     base.update(generation=binding["generation"], binding_state=binding["state"], coverage=coverage)
     # Re-running bind records an older binding here too, so the index fills without a migration.
     base["index_recorded"] = _remember(_recipient(provider, agent, session, thread), shown["ledger"], role)
+    if inbox is not None:
+        remember_inbox(session, inbox)  # run from inside the session, as the inbox check above requires
     if recorded["duplicate"]:
         return _outcome("ALREADY BOUND", f"{role} already wakes {target} (binding {binding['generation']}); "
                         "nothing was recorded.", "Nothing.", **base, **extra)

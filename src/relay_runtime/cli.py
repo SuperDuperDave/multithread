@@ -133,6 +133,16 @@ def _provider_input(client, *, from_cwd=False, seen=None):
     return selected
 
 
+def _report_inbox(session):
+    """Tell later wakes where this Claude Code session's inbox is now. Its process id, and so its socket, changes on
+    every restart; the session id a binding names doesn't. Observation only: a failure never affects the hook."""
+    try:
+        from .wake import remember_inbox
+        remember_inbox(session, os.environ.get("CLAUDE_CODE_MESSAGING_SOCKET"))
+    except Exception:  # noqa: BLE001 - nonblocking by contract
+        pass
+
+
 def _provider_contract(client, session, repo):
     # Static reviewed instructions are separate from the untrusted projection.
     # JSON quoting is for context, never shell interpolation or authentication.
@@ -718,6 +728,8 @@ def main(argv=None, *, registry=None, command_alias_check=None):
                 args.provider_event = seen.get("event")
             if args.provider_payload is None:
                 return 0
+            if args.client == "claude" and args.provider_event in ("SessionStart", "UserPromptSubmit"):
+                _report_inbox(args.provider_payload.get("session_id"))
         stage = "admission"
         if threading.active_count() != 1:
             raise StateError("installed dispatcher requires a single-threaded fresh process")
