@@ -1367,7 +1367,9 @@ class PeerTests(unittest.TestCase):
             self.assertEqual(1, peak, "never two launches at once")
             self.assertEqual(0o600, cache.stat().st_mode & 0o777)
             # A stale, foreign-boot or loosely permissioned record is not reused.
-            for name, change in (("stale", lambda value: {**value, "clean": {**value["clean"], "at": value["clean"]["at"] - 31}}),
+            aged = lambda value, by: {**value, "parents": {parent: {**entry, "at": entry["at"] - by, "wall": entry["wall"] - by}
+                                                           for parent, entry in value["parents"].items()}}
+            for name, change in (("stale", lambda value: aged(value, 31)),
                                  ("another boot", lambda value: {**value, "boot": "another"}),
                                  ("another reg.exe", lambda value: {**value, "reg": "/elsewhere/reg.exe"}),
                                  ("readable by others", None)):
@@ -1382,9 +1384,10 @@ class PeerTests(unittest.TestCase):
             # The record is dated by when its first query began.
             cache.unlink()
             before = reads()
-            with mock.patch.object(peer, "_boot_clock", side_effect=lambda: ("boot-x", 100.0 + reads())):
+            boot = peer._clock()[0]
+            with mock.patch.object(peer, "_clock", side_effect=lambda: (boot, 100.0 + reads(), 200.0 + reads())):
                 self.assertEqual([], peer._managed_claude_sources(self.repo))
-            self.assertEqual(100.0 + before, json.loads(cache.read_text())["clean"]["at"])
+            self.assertEqual(100.0 + before, json.loads(cache.read_text())["parents"]["HKLM\\SOFTWARE\\Policies"]["at"])
             # A failed read refuses, and the calls queued behind it refuse with it rather than each retrying in turn;
             # once it is a few seconds old the next call reads again.
             cache.unlink()
@@ -1399,18 +1402,14 @@ class PeerTests(unittest.TestCase):
             with mock.patch.object(peer, "_POLICY_FAILURE_SECONDS", -1):
                 self.assertEqual([], peer._managed_claude_sources(self.repo))
             self.assertEqual(before + 8 + 2, reads())
-            # A malformed clean read is never used, nor a failure that names no failed parent.
-            for forged in ({"clean": {"reads": {"HKLM\\SOFTWARE\\Policies": None}}},
-                           {"failed": {"reads": {"HKLM\\SOFTWARE\\Policies": [["x"], None],
-                                                 "HKCU\\SOFTWARE\\Policies": [["y"], None]}}}):
-                with self.subTest(record=forged):
-                    value = json.loads(cache.read_text())
-                    for key, part in forged.items():
-                        value[key] = {**(value.get(key) or {"at": value["clean"]["at"]}),
-                                      "reads": {**((value.get(key) or {}).get("reads") or {}), **part["reads"]}}
-                    if "failed" in forged:  # past the clean read's 30 seconds, so only the failure could answer
-                        value["clean"]["at"] -= 31
-                    cache.write_text(json.dumps(value))
+            # A malformed read is never used, nor a failure that names no failed parent.
+            for name, forge in (("lines not a list", lambda value: {**value, "parents": {
+                                    **value["parents"], "HKLM\\SOFTWARE\\Policies": {**value["parents"]["HKLM\\SOFTWARE\\Policies"], "lines": None}}}),
+                                ("failure without a failed parent", lambda value: {**aged(value, 31), "failed": {
+                                    "at": value["parents"]["HKLM\\SOFTWARE\\Policies"]["at"], "wall": value["parents"]["HKLM\\SOFTWARE\\Policies"]["wall"],
+                                    "reads": {parent: [["x"], None] for parent in peer._WSL_POLICY_PARENTS}}})):
+                with self.subTest(record=name):
+                    cache.write_text(json.dumps(forge(json.loads(cache.read_text()))))
                     before = reads()
                     self.assertEqual([], peer._managed_claude_sources(self.repo))
                     self.assertEqual(before + 2, reads())
@@ -1427,50 +1426,78 @@ class PeerTests(unittest.TestCase):
             self.assertEqual(2, len(found))
             self.assertIn("another policy read did not finish", found[0])
 
-    def test_a_clean_policy_read_stands_in_for_a_failed_one_for_six_hours_and_says_so(self):
-        # A WSL interop outage fails every fresh read. The last clean read of this boot stands in, bounded and
-        # visible, and never hides a key a fresh read just found.
+    def test_a_parents_last_read_stands_in_only_when_interop_failed_it_and_says_so(self):
+        # A WSL interop outage fails every fresh read. A parent's last successful read of this boot stands in,
+        # bounded by both clocks and visible; it never hides a key, and nothing else that fails is excused.
         reg, answers = self.base / "reg.exe", self.base / "reg-answers.json"
         reg.write_text(f"#!{sys.executable}\nimport json,sys\na=json.load(open({str(answers)!r}))[sys.argv[2][:4]]\n"
                        "full={'HKLM':'HKEY_LOCAL_MACHINE','HKCU':'HKEY_CURRENT_USER'}[sys.argv[2][:4]]+sys.argv[2][4:]\n"
-                       "sys.stdout.write(''.join('\\r\\n'+full+'\\\\'+k for k in a[1])+'\\r\\n' if a[0]==0 else '');sys.exit(a[0])\n")
+                       "if a=='vsock': sys.stderr.write('<3>WSL (1 - ) ERROR: UtilAcceptVsock:271: accept4 failed 110\\n'); sys.exit(1)\n"
+                       "if a=='denied': sys.exit(1)\n"
+                       "sys.stdout.write(''.join('\\r\\n'+full+'\\\\'+k for k in a)+'\\r\\n')\n")
         reg.chmod(0o700)
         cache = self.base / "state" / "policy-read.json"
-        def answer(hklm, hkcu):
-            answers.write_text(json.dumps({"HKLM": hklm, "HKCU": hkcu}))
-        def sources():
+        hklm, hkcu = peer._WSL_POLICY_PARENTS
+        real = peer._clock
+        offset = {"boot": 0.0, "wall": 0.0}
+        def answer(first, second):
+            answers.write_text(json.dumps({"HKLM": first, "HKCU": second}))
+        def sources(**later):
+            offset.update({"boot": 0.0, "wall": 0.0, **later})
             reused = []
             return peer._managed_claude_sources(self.repo, reused), reused
-        clean, failing = [0, ["Microsoft"]], [1, []]
+        ok, dropped = ["Microsoft"], "vsock"
         with (mock.patch.object(peer, "_MANAGED_CLAUDE_SETTINGS", {}), mock.patch.object(peer, "_WSL_REG", reg),
               mock.patch.object(peer, "_WSL_CLAUDE_POLICY", self.base / "no-policy"),
               mock.patch.object(peer, "_is_wsl", return_value=True), mock.patch.object(peer, "_REG_BACKOFF", (0, 0, 0)),
               mock.patch.object(peer, "_POLICY_CACHE", cache), mock.patch.object(peer, "_POLICY_CACHE_SECONDS", -1),
-              mock.patch.object(peer, "_POLICY_FAILURE_SECONDS", -1),
+              mock.patch.object(peer, "_clock", side_effect=lambda: (lambda b, t, w: (b, t + offset["boot"], w + offset["wall"]))(*real())),
               mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.base / "claude-home")})):
-            answer(failing, failing)
-            found, reused = sources()
-            self.assertEqual((2, []), (len(found), reused), "with no clean read this boot, a failure refuses")
-            answer(clean, clean)
-            self.assertEqual(([], []), sources())
-            answer(failing, failing)
-            found, reused = sources()
-            self.assertEqual([], found)
-            self.assertRegex(reused[0]["read_at"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
-            self.assertGreaterEqual(reused[0]["age_seconds"], 0)
-            self.assertIn("HKCU\\SOFTWARE\\Policies: exit 1", reused[0]["because"])
-            self.assertIsNotNone(json.loads(cache.read_text())["clean"], "a failure keeps the last clean read")
-            # A key found fresh refuses, whatever the older read said about it.
-            answer([0, ["ClaudeCode"]], failing)
-            found, reused = sources()
-            self.assertEqual(["HKLM\\SOFTWARE\\Policies\\ClaudeCode"], found)
-            self.assertNotIn("HKLM", reused[0]["because"], "only the failed parent was filled in")
-            # Older than six hours, it no longer stands in.
-            answer(failing, failing)
-            with mock.patch.object(peer, "_POLICY_STALE_SECONDS", -1):
+            with mock.patch.object(peer, "_POLICY_FAILURE_SECONDS", -1):
+                answer(dropped, dropped)
                 found, reused = sources()
-            self.assertEqual((2, []), (len(found), reused))
-            # A reader that never finishes leaves the others on the last clean read too.
+                self.assertEqual((2, []), (len(found), reused), "with no successful read this boot, a failure refuses")
+                answer(ok, ok)
+                self.assertEqual(([], []), sources())
+                answer(dropped, dropped)
+                found, reused = sources()
+                self.assertEqual([], found)
+                self.assertRegex(reused[0]["read_at"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
+                self.assertIn(f"{hkcu}: interop dropped the launch", reused[0]["because"])
+                # Six hours by both clocks: a host that slept stops the boot clock, not the wall clock.
+                for name, later, admitted in (("just inside", {"boot": 6 * 3600 - 5, "wall": 6 * 3600 - 5}, True),
+                                              ("just past", {"boot": 6 * 3600 + 5, "wall": 6 * 3600 + 5}, False),
+                                              ("host slept", {"boot": 10, "wall": 6 * 3600 + 5}, False),
+                                              ("clock ran back", {"wall": -60}, False)):
+                    with self.subTest(age=name):
+                        found, reused = sources(**later)
+                        self.assertEqual((admitted, admitted), (found == [], bool(reused)))
+                # Only interop is excused: a read reg.exe itself fails refuses, a recent success notwithstanding.
+                answer("denied", "denied")
+                found, reused = sources()
+                self.assertEqual((2, []), (len(found), reused))
+                # A key found fresh refuses, and is remembered: a later outage cannot erase it with an older absence.
+                answer(["ClaudeCode"], dropped)
+                found, reused = sources()
+                self.assertEqual([f"{hklm}\\ClaudeCode"], found)
+                answer(dropped, dropped)
+                found, reused = sources()
+                self.assertEqual([f"{hklm}\\ClaudeCode"], found, "the last successful read found the key")
+                # An empty listing is too easily a glitch to stand in.
+                cache.unlink()
+                answer([], [])
+                self.assertEqual(([], []), sources())
+                answer(dropped, dropped)
+                self.assertEqual(2, len(sources()[0]))
+            # The calls queued behind a failure get the same stand-in.
+            cache.unlink()
+            answer(ok, ok)
+            sources()
+            answer(dropped, dropped)
+            first, second = sources(), sources()
+            self.assertEqual([], second[0])
+            self.assertIn("read by another call", second[1][0]["because"])
+            # A reader that never finishes leaves the others refusing: no read failed, so nothing stands in.
             import fcntl
             holder = os.open(cache.with_suffix(".lock"), os.O_RDWR)
             fcntl.flock(holder, fcntl.LOCK_EX)
@@ -1479,10 +1506,10 @@ class PeerTests(unittest.TestCase):
                     found, reused = sources()
             finally:
                 os.close(holder)
-            self.assertEqual([], found)
-            self.assertIn("another policy read did not finish", reused[0]["because"])
+            self.assertEqual((2, []), (len(found), reused))
+            self.assertIn("another policy read did not finish", found[0])
         # The call's record and its display name the stand-in.
-        stand_in = {"read_at": "2026-10-08T01:12:00Z", "age_seconds": 9600, "because": "HKCU\\SOFTWARE\\Policies: timed out"}
+        stand_in = {"read_at": "2026-10-08T01:12:00Z", "age_seconds": 9600, "because": f"{hkcu}: timed out"}
         def preflight(cwd, reused=None):
             reused.append(stand_in)
             return []
@@ -1492,7 +1519,8 @@ class PeerTests(unittest.TestCase):
             output = io.StringIO()
             with redirect_stdout(output), redirect_stderr(io.StringIO()):
                 peer._display_peer({**result, "state": "returned", "result": "ok"})
-        self.assertIn("Windows policy: reused a clean read from 2026-10-08T01:12:00Z (9600 s old); interop failing", output.getvalue())
+        self.assertIn("Windows policy: reused the last successful read, from 2026-10-08T01:12:00Z (9600 s old), "
+                      "because interop failed", output.getvalue())
         self.assertIsNone(self.invoke("--dry-run")[1]["windows_policy_reused"], "every record carries the field")
 
     def test_the_cli_keywords_for_every_tool_are_not_tool_names(self):
