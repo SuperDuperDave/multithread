@@ -38,5 +38,6 @@
   "state": "unavailable",
   "unavailable_stage": "relay_configuration",
   "usage": null,
+  "windows_policy_reused": null,
   "workflow_completion": "not_checked"
 }

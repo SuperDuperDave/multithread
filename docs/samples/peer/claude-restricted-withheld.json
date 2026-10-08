@@ -139,5 +139,6 @@
   },
   "usage_scope": "latest related native result; main loop only, not the whole call",
   "usage_scope_id": "latest_related_native_result",
+  "windows_policy_reused": null,
   "workflow_completion": "not_checked"
 }

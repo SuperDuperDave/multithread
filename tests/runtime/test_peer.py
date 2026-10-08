@@ -1206,6 +1206,7 @@ class PeerTests(unittest.TestCase):
                   mock.patch.object(peer, "_POLICY_CACHE", self.base / "policy-read.json"),
                   mock.patch.object(peer, "_POLICY_CACHE_SECONDS", -1),  # every case here reads afresh
                   mock.patch.object(peer, "_POLICY_FAILURE_SECONDS", -1),
+                  mock.patch.object(peer, "_POLICY_STALE_SECONDS", -1),
                   mock.patch.dict(os.environ, environ or {"CLAUDE_CONFIG_DIR": str(home)})):
                 return peer._managed_claude_sources(cwd or self.repo)
         self.assertEqual([], sources())
@@ -1366,7 +1367,7 @@ class PeerTests(unittest.TestCase):
             self.assertEqual(1, peak, "never two launches at once")
             self.assertEqual(0o600, cache.stat().st_mode & 0o777)
             # A stale, foreign-boot or loosely permissioned record is not reused.
-            for name, change in (("stale", lambda value: {**value, "at": value["at"] - 31}),
+            for name, change in (("stale", lambda value: {**value, "clean": {**value["clean"], "at": value["clean"]["at"] - 31}}),
                                  ("another boot", lambda value: {**value, "boot": "another"}),
                                  ("another reg.exe", lambda value: {**value, "reg": "/elsewhere/reg.exe"}),
                                  ("readable by others", None)):
@@ -1383,7 +1384,7 @@ class PeerTests(unittest.TestCase):
             before = reads()
             with mock.patch.object(peer, "_boot_clock", side_effect=lambda: ("boot-x", 100.0 + reads())):
                 self.assertEqual([], peer._managed_claude_sources(self.repo))
-            self.assertEqual(100.0 + before, json.loads(cache.read_text())["at"])
+            self.assertEqual(100.0 + before, json.loads(cache.read_text())["clean"]["at"])
             # A failed read refuses, and the calls queued behind it refuse with it rather than each retrying in turn;
             # once it is a few seconds old the next call reads again.
             cache.unlink()
@@ -1398,11 +1399,18 @@ class PeerTests(unittest.TestCase):
             with mock.patch.object(peer, "_POLICY_FAILURE_SECONDS", -1):
                 self.assertEqual([], peer._managed_claude_sources(self.repo))
             self.assertEqual(before + 8 + 2, reads())
-            # A clean read is never mistaken for a failure, nor a failure for a clean read.
-            for forged in ({"HKLM\\SOFTWARE\\Policies": [None, None]}, {"HKLM\\SOFTWARE\\Policies": [["x"], "timed out"]}):
+            # A malformed clean read is never used, nor a failure that names no failed parent.
+            for forged in ({"clean": {"reads": {"HKLM\\SOFTWARE\\Policies": None}}},
+                           {"failed": {"reads": {"HKLM\\SOFTWARE\\Policies": [["x"], None],
+                                                 "HKCU\\SOFTWARE\\Policies": [["y"], None]}}}):
                 with self.subTest(record=forged):
                     value = json.loads(cache.read_text())
-                    cache.write_text(json.dumps({**value, "reads": {**value["reads"], **forged}}))
+                    for key, part in forged.items():
+                        value[key] = {**(value.get(key) or {"at": value["clean"]["at"]}),
+                                      "reads": {**((value.get(key) or {}).get("reads") or {}), **part["reads"]}}
+                    if "failed" in forged:  # past the clean read's 30 seconds, so only the failure could answer
+                        value["clean"]["at"] -= 31
+                    cache.write_text(json.dumps(value))
                     before = reads()
                     self.assertEqual([], peer._managed_claude_sources(self.repo))
                     self.assertEqual(before + 2, reads())
@@ -1418,6 +1426,74 @@ class PeerTests(unittest.TestCase):
                 os.close(holder)
             self.assertEqual(2, len(found))
             self.assertIn("another policy read did not finish", found[0])
+
+    def test_a_clean_policy_read_stands_in_for_a_failed_one_for_six_hours_and_says_so(self):
+        # A WSL interop outage fails every fresh read. The last clean read of this boot stands in, bounded and
+        # visible, and never hides a key a fresh read just found.
+        reg, answers = self.base / "reg.exe", self.base / "reg-answers.json"
+        reg.write_text(f"#!{sys.executable}\nimport json,sys\na=json.load(open({str(answers)!r}))[sys.argv[2][:4]]\n"
+                       "full={'HKLM':'HKEY_LOCAL_MACHINE','HKCU':'HKEY_CURRENT_USER'}[sys.argv[2][:4]]+sys.argv[2][4:]\n"
+                       "sys.stdout.write(''.join('\\r\\n'+full+'\\\\'+k for k in a[1])+'\\r\\n' if a[0]==0 else '');sys.exit(a[0])\n")
+        reg.chmod(0o700)
+        cache = self.base / "state" / "policy-read.json"
+        def answer(hklm, hkcu):
+            answers.write_text(json.dumps({"HKLM": hklm, "HKCU": hkcu}))
+        def sources():
+            reused = []
+            return peer._managed_claude_sources(self.repo, reused), reused
+        clean, failing = [0, ["Microsoft"]], [1, []]
+        with (mock.patch.object(peer, "_MANAGED_CLAUDE_SETTINGS", {}), mock.patch.object(peer, "_WSL_REG", reg),
+              mock.patch.object(peer, "_WSL_CLAUDE_POLICY", self.base / "no-policy"),
+              mock.patch.object(peer, "_is_wsl", return_value=True), mock.patch.object(peer, "_REG_BACKOFF", (0, 0, 0)),
+              mock.patch.object(peer, "_POLICY_CACHE", cache), mock.patch.object(peer, "_POLICY_CACHE_SECONDS", -1),
+              mock.patch.object(peer, "_POLICY_FAILURE_SECONDS", -1),
+              mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.base / "claude-home")})):
+            answer(failing, failing)
+            found, reused = sources()
+            self.assertEqual((2, []), (len(found), reused), "with no clean read this boot, a failure refuses")
+            answer(clean, clean)
+            self.assertEqual(([], []), sources())
+            answer(failing, failing)
+            found, reused = sources()
+            self.assertEqual([], found)
+            self.assertRegex(reused[0]["read_at"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
+            self.assertGreaterEqual(reused[0]["age_seconds"], 0)
+            self.assertIn("HKCU\\SOFTWARE\\Policies: exit 1", reused[0]["because"])
+            self.assertIsNotNone(json.loads(cache.read_text())["clean"], "a failure keeps the last clean read")
+            # A key found fresh refuses, whatever the older read said about it.
+            answer([0, ["ClaudeCode"]], failing)
+            found, reused = sources()
+            self.assertEqual(["HKLM\\SOFTWARE\\Policies\\ClaudeCode"], found)
+            self.assertNotIn("HKLM", reused[0]["because"], "only the failed parent was filled in")
+            # Older than six hours, it no longer stands in.
+            answer(failing, failing)
+            with mock.patch.object(peer, "_POLICY_STALE_SECONDS", -1):
+                found, reused = sources()
+            self.assertEqual((2, []), (len(found), reused))
+            # A reader that never finishes leaves the others on the last clean read too.
+            import fcntl
+            holder = os.open(cache.with_suffix(".lock"), os.O_RDWR)
+            fcntl.flock(holder, fcntl.LOCK_EX)
+            try:
+                with mock.patch.object(peer, "_POLICY_LOCK_SECONDS", 0.2):
+                    found, reused = sources()
+            finally:
+                os.close(holder)
+            self.assertEqual([], found)
+            self.assertIn("another policy read did not finish", reused[0]["because"])
+        # The call's record and its display name the stand-in.
+        stand_in = {"read_at": "2026-10-08T01:12:00Z", "age_seconds": 9600, "because": "HKCU\\SOFTWARE\\Policies: timed out"}
+        def preflight(cwd, reused=None):
+            reused.append(stand_in)
+            return []
+        with mock.patch.object(peer, "_managed_claude_sources", side_effect=preflight):
+            code, result, _ = self.invoke("--tools", "none", "--dry-run")
+            self.assertEqual((0, stand_in), (code, result["windows_policy_reused"]))
+            output = io.StringIO()
+            with redirect_stdout(output), redirect_stderr(io.StringIO()):
+                peer._display_peer({**result, "state": "returned", "result": "ok"})
+        self.assertIn("Windows policy: reused a clean read from 2026-10-08T01:12:00Z (9600 s old); interop failing", output.getvalue())
+        self.assertIsNone(self.invoke("--dry-run")[1]["windows_policy_reused"], "every record carries the field")
 
     def test_the_cli_keywords_for_every_tool_are_not_tool_names(self):
         for word in ("default", "all", "Read,ALL"):

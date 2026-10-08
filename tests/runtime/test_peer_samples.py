@@ -36,6 +36,16 @@ def normalize(value, base):
     return value
 
 
+def keep(old, new):
+    """The new record, keeping each old value whose key path and type are unchanged, so a regeneration's diff
+    shows only what changed shape."""
+    if isinstance(old, dict) and isinstance(new, dict):
+        return {key: keep(old[key], item) if key in old else item for key, item in new.items()}
+    if isinstance(old, list) and isinstance(new, list) and len(old) == len(new):
+        return [keep(before, after) for before, after in zip(old, new)]
+    return old if shape(old) == shape(new) else new
+
+
 def shape(value):
     """Key paths and value types; numbers are one type, and a list is described by its first item."""
     if isinstance(value, dict):
@@ -84,7 +94,10 @@ class PeerSampleTests(unittest.TestCase):
         sample = SAMPLES / f"{name}.json"
         if WRITE:
             SAMPLES.mkdir(parents=True, exist_ok=True)
-            sample.write_text(json.dumps(normalize(record, self.base), indent=2, sort_keys=True, ensure_ascii=False) + "\n")
+            fresh = normalize(record, self.base)
+            if sample.exists():
+                fresh = keep(json.loads(sample.read_text()), fresh)
+            sample.write_text(json.dumps(fresh, indent=2, sort_keys=True, ensure_ascii=False) + "\n")
             return
         published = json.loads(sample.read_text())
         live, kept = paths(shape(record)), paths(shape(published))
