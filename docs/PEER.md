@@ -457,11 +457,14 @@ the recipient reads, acknowledges and replies there with
 --target-session S` records the signal here, then wakes S through its binding
 here or, when S holds a role in another checkout, through that checkout's
 binding, pointing back at the signal. `bind` records where each recipient holds
-a role in an account index (`~/.local/share/relay/wake-recipients.json`, owner
-only); the index is only a hint, and a wake goes out only when that checkout's
+a role in an account index (`wake-recipients.json` beside the ledgers' state:
+`RELAY_HOME`, else `~/.local/share/relay`; owner only); the index is only a hint, and a wake goes out only when that checkout's
 own binding names the exact session. Running `bind` again records an existing
 binding. A recipient bound nowhere reachable is reported `NOT BOUND` with the
-command that wakes it by hand. The recipient's brief in its own checkout lists
+command that wakes it by hand. A ledger is named by its primary checkout, which
+outlives the linked worktrees that share it. As with a local rebind, sending the
+same signal again after its recipient binds in another checkout wakes it there
+again. The recipient's brief in its own checkout lists
 wakes pointing at other ledgers from the last 24 hours, so a lost wake does not
 leave it unaware. An older Multithread reads such a ledger's events, briefs
 and inbox, but refuses its wake bindings until this release is reinstalled.
