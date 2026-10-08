@@ -1058,6 +1058,19 @@ class WakeOutcomeTests(WakeCase):
         self.assertEqual(0, code, out)
         self.assertTrue(out.startswith("DRY RUN: Would queue for operator"))
 
+    def test_a_dry_run_needs_no_identity_and_previews_no_unnamed_sender(self):
+        # The restart #2 resume check, `wake ROLE --ref 1 --dry-run`, was NOT SENT for want of --agent.
+        self.bound()
+        code, out = self.run_helper(wake.wake_main, "operator", "--ref", str(self.task), "--codex", str(self.codex),
+                                    "--dry-run", "--json")
+        result = json.loads(out)
+        self.assertEqual((0, "DRY RUN"), (code, result["status"]), out)
+        self.assertNotIn("text", result, "no sender, so no preview of what a sender would say")
+        self.assertEqual([], self.events("wake.attempted"), "nothing recorded")
+        code, out = self.run_helper(wake.wake_main, "operator", "--ref", str(self.task), "--codex", str(self.codex),
+                                    "--json")
+        self.assertEqual("NOT SENT", json.loads(out)["status"], "a real wake still names its sender")
+
 
 class QueuedReadinessTests(WakeCase):
     def assert_observation_only(self, methods):

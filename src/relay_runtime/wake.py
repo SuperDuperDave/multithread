@@ -447,12 +447,13 @@ def _emit(result, as_json):
     return result["exit_code"]
 
 
-def _actor(args, *, session_required=True):
+def _actor(args, *, session_required=True, agent_required=True):
     agent = args.agent or os.environ.get("RELAY_AGENT")
     session = args.session or os.environ.get("RELAY_SESSION")
-    if not agent or (session_required and not session):
+    if (agent_required and not agent) or (session_required and not session):
         raise ValidationError("pass --agent and --session (or set RELAY_AGENT and RELAY_SESSION)")
-    canonical_agent(agent)
+    if agent:
+        canonical_agent(agent)
     if session:
         canonical_agent(session)
     return agent, session
@@ -862,7 +863,9 @@ def wake(args, ledger=launcher_ledger):
         sender_role = getattr(args, "sender_role", None)
         if sender_role is not None:
             sender_role = canonical_wake_role(sender_role)
-        agent, session = _actor(args, session_required=not args.dry_run or sender_role is not None)
+        # A dry run records nothing, so it needs no identity; a named sender only labels the text preview.
+        agent, session = _actor(args, session_required=not args.dry_run or sender_role is not None,
+                                agent_required=not args.dry_run)
         role = canonical_wake_role(args.role)
         ref = canonical_wake_ref(args.ref)
         if args.message_id is not None:
@@ -943,8 +946,9 @@ def wake(args, ledger=launcher_ledger):
                         f"Check the recipient's conversation first. If it didn't arrive, send it with --id {again}.",
                         prior=prior, **base)
 
-    text = message_text(agent, ref, decision["ledger"], sender)
-    base.update(text=text)
+    text = message_text(agent, ref, decision["ledger"], sender) if agent else None
+    if text is not None:
+        base.update(text=text)
     endpoint = binding["endpoint"]
     path = endpoint.removeprefix("unix://")
     attempt = decision.get("attempt_seq")
