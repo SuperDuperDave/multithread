@@ -587,6 +587,8 @@ def _policy_record():
                  and all(isinstance(read, list) and len(read) == 2 and ((lines(read[0]) and read[1] is None)
                          or (read[0] is None and isinstance(read[1], str))) for read in reads.values())
                  and any(read[0] is None for read in reads.values()))
+    if failed is not None and not failed_ok:
+        return {"parents": {}, "failed": None}  # a record with a malformed part is not used at all
     return {"parents": {parent: entry for parent, entry in parents.items()
                         if parent in _WSL_POLICY_PARENTS and stamped(entry) and lines(entry.get("lines"))},
             "failed": failed if failed_ok else None}
@@ -623,7 +625,12 @@ def _policy_listings():
         _POLICY_CACHE.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         lock = os.open(_POLICY_CACHE.with_suffix(".lock"), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
     except OSError:
-        return {parent: _reg_query(parent) for parent in _WSL_POLICY_PARENTS}, None  # nowhere to coordinate
+        # Nowhere to coordinate: read alone, and leave no older record to stand in for what this read finds.
+        try:
+            os.unlink(_POLICY_CACHE)
+        except OSError:
+            pass
+        return {parent: _reg_query(parent) for parent in _WSL_POLICY_PARENTS}, None
     try:
         deadline = time.monotonic() + _POLICY_LOCK_SECONDS
         while True:

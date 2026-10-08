@@ -1511,8 +1511,31 @@ class PeerTests(unittest.TestCase):
                 self.assertFalse(cache.exists())
                 answer(dropped, dropped)
                 self.assertEqual((2, []), (len(sources()[0]), sources()[1]))
+            # A record with a malformed failure is not used at all, its successes included.
+            with mock.patch.object(peer, "_POLICY_CACHE_SECONDS", 30):
+                cache.unlink()
+                answer(ok, ok)
+                sources()
+                value = json.loads(cache.read_text())
+                cache.write_text(json.dumps({**value, "failed": {"at": 1.0, "wall": 1.0, "reads": {hklm: [None, "timed out"]}}}))
+                answer("denied", "denied")
+                self.assertEqual(2, len(sources()[0]), "the malformed record was not reused")
+            # A call that cannot take the lock reads alone and discards the record rather than leave it standing.
+            with mock.patch.object(peer, "_POLICY_FAILURE_SECONDS", -1):
+                cache.unlink()
+                answer(ok, ok)
+                sources()
+                real_open = os.open
+                def no_lock(path, *arguments, **options):
+                    if str(path).endswith(".lock"):
+                        raise PermissionError("artificial")
+                    return real_open(path, *arguments, **options)
+                answer(["ClaudeCode"], ok)
+                with mock.patch.object(peer.os, "open", side_effect=no_lock):
+                    self.assertEqual([f"{hklm}\\ClaudeCode"], sources()[0])
+                self.assertFalse(cache.exists())
             # The calls queued behind a failure get the same stand-in.
-            cache.unlink()
+            cache.unlink(missing_ok=True)
             answer(ok, ok)
             sources()
             answer(dropped, dropped)
