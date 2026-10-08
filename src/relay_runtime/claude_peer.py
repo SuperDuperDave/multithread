@@ -335,12 +335,9 @@ class _Driver:
         for record in self.results:
             record["result_excerpt"], record["result_excerpt_truncated"] = None, False
         try:
-            # The provider leads its own session; once the leader is reaped its group ID may be reused, so only
-            # an unreaped leader's group is signalled (the ordinary cleanup handles what remains).
-            # Once the leader is reaped its group ID may be reused; the restricted cleanup's immediate stop then
-            # handles any descendants that remain.
-            if self.process.returncode is None and self.process.poll() is None:
-                os.killpg(self.process.pid, signal.SIGKILL)
+            # The provider leads its own group, and descendants that outlive the leader keep it. The kernel never
+            # reissues a number still used as a group ID, so this reaches only this call's processes.
+            os.killpg(self.process.pid, signal.SIGKILL)
         except (ProcessLookupError, PermissionError, AttributeError, TypeError):
             pass
 

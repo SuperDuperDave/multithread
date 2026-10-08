@@ -1300,23 +1300,31 @@ class PeerTests(unittest.TestCase):
         self.assertEqual("the other writer", (record / "result.json").read_text())
         self.assertEqual(["result.json"], sorted(path.name for path in record.iterdir()), "no temporary left behind")
 
-    def test_a_late_fault_drops_a_stored_partial_and_never_signals_a_reaped_group(self):
+    def test_a_late_fault_drops_a_stored_partial_and_kills_what_outlives_the_leader(self):
         from relay_runtime import claude_peer
-        for name, returncode, polled, signalled in (("live leader", None, None, True),
-                                                    ("reaped leader", 0, 0, False),
-                                                    ("exited, not yet reaped", None, 0, False)):
-            with self.subTest(case=name):
-                process = mock.Mock(pid=424242, returncode=returncode)
-                process.poll.return_value = polled
-                envelope = {"partial_result": "words written before the fault"}
-                driver = claude_peer._Driver(process, b"task", str(self.repo), None, envelope, 1, None, tools=[])
-                driver.results = [{"result_excerpt": "THE ANSWER", "result_excerpt_truncated": False}]
-                with mock.patch.object(claude_peer.os, "killpg") as killpg:
-                    self.assertIsInstance(driver.fault("outside the registry"), claude_peer.ProtocolError)
-                    driver.problem("outside the registry")  # every fault of a restricted call ends here
-                self.assertNotIn("partial_result", envelope)
-                self.assertIsNone(driver.results[0]["result_excerpt"])
-                self.assertEqual(signalled, killpg.called)
+        # The leader exits and is reaped while a descendant keeps running in its group: a restricted fault kills the
+        # descendant at once, with no shutdown grace.
+        process = subprocess.Popen(["sh", "-c", "sleep 30 & exit 0"], start_new_session=True,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        process.wait()
+        os.killpg(process.pid, 0)  # the descendant still holds the group
+        envelope = {"partial_result": "words written before the fault"}
+        driver = claude_peer._Driver(process, b"task", str(self.repo), None, envelope, 1, None, tools=[])
+        driver.results = [{"result_excerpt": "THE ANSWER", "result_excerpt_truncated": False}]
+        self.assertIsInstance(driver.fault("outside the registry"), claude_peer.ProtocolError)
+        driver.problem("outside the registry")  # every fault of a restricted call ends here
+        self.assertNotIn("partial_result", envelope)
+        self.assertIsNone(driver.results[0]["result_excerpt"])
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                os.killpg(process.pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.02)
+        else:
+            os.killpg(process.pid, signal.SIGKILL)
+            self.fail("the descendant outlived the restricted fault")
 
     def test_the_cli_keywords_for_every_tool_are_not_tool_names(self):
         for word in ("default", "all", "Read,ALL"):

@@ -991,7 +991,9 @@ class ClaudeProtocolTests(unittest.TestCase):
         # Faults outside the registry check took the ordinary grace before (independent Claude review, 0.4.23).
         cases = {"cwd outside the checkout": [{"emit": self.restricted(cwd="/elsewhere", tools=["Bash"])}],
                  "server tool block": [{"emit": self.restricted()}, {"emit": self.tool_frame("server_tool_use", "web_search")}],
-                 "mcp tool block": [{"emit": self.restricted()}, {"emit": self.tool_frame("mcp_tool_use", "send")}]}
+                 "mcp tool block": [{"emit": self.restricted()}, {"emit": self.tool_frame("mcp_tool_use", "send")}],
+                 "another session's frame": [{"emit": self.restricted()}, {"emit": assistant("x", session=OTHER_SESSION)}],
+                 "malformed frame": [{"emit": self.restricted()}, {"raw": b"{broken\n".hex()}]}
         for name, frames in cases.items():
             with self.subTest(case=name):
                 started = time.monotonic()
