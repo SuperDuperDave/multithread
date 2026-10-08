@@ -40,7 +40,8 @@ class CallerFrictionTests(unittest.TestCase):
                            "token in a sentence (Bearer abcdefghijklmnopqrstuvwxyz).",
                            # Sol on 7669656: a quote, a JSON-escaped slash, a quoted JWT with short segments.
                            'Bearer "' + "Q" * 32 + '"', "Bearer ab\\/" + "c" * 20,
-                           'Bearer "eyJ' + "a" * 5 + ".e30." + "s" * 10 + '"', "Bearer `" + "Q" * 32 + "`"):
+                           'Bearer "eyJ' + "a" * 5 + ".e30." + "s" * 10 + '"', "Bearer `" + "Q" * 32 + "`",
+                           '{"Authorization":"Bearer ab\\u002B' + "c" * 31 + '"}'):
             with self.subTest(credential=credential), \
                     self.assertRaisesRegex(ValidationError, "appears to contain a credential"):
                 normalize_event({**base, "summary": credential})
