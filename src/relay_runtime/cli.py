@@ -6,6 +6,7 @@ internal Registry instance; this is not a supported public installation switch.
 """
 
 import argparse
+import errno
 import fcntl
 from contextlib import contextmanager
 import hashlib
@@ -156,9 +157,9 @@ def _report_inbox(event, session):
                 written = remember_inbox(session, inbox, claim=start, wait=_SWITCH_WAIT if start else _HOOK_WAIT)
             else:
                 return None
-        except OSError as exc:
+        except OSError as exc:  # its errno symbol, from a fixed table: no system or path text reaches context
             warning = ("MULTITHREAD WARNING: Multithread could neither update nor set aside the Claude Code inbox "
-                       f"map ({exc.strerror or type(exc).__name__}). Until a later report succeeds, a wake for a "
+                       f"map ({errno.errorcode.get(exc.errno, 'OSError')}). Until a later report succeeds, a wake for a "
                        "session that ended in this Claude Code process can reach the one that replaced it. Tell "
                        "the person.")
         else:
@@ -168,9 +169,9 @@ def _report_inbox(event, session):
                 return _inbox_problem(inbox, written)
             aside = inboxes_set_aside()
             warning = ("MULTITHREAD WARNING: a write to the Claude Code inbox map failed, so Multithread set it "
-                       "aside" + (f" ({aside[1]})" if aside else "") + ". Every Claude role is NOT RUNNING to "
-                       "wakes until its session's next prompt reports again; check free disk space. Tell the "
-                       "person.")
+                       "aside" + (f" as {Path(aside[1]).name}" if aside else "") + ". Every Claude role is NOT "
+                       "RUNNING to wakes until its session's next prompt reports again; check free disk space. Tell "
+                       "the person.")
         print("multithread: " + warning, file=sys.stderr)
         return warning
     except Exception:  # noqa: BLE001 - nonblocking by contract

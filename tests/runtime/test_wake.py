@@ -1986,7 +1986,8 @@ class ClaudeTests(WakeCase):
             with self.assertRaises(OSError):
                 wake.remember_inbox("switched-to", str(self.inbox_path), claim=True)
             warning = runtime_cli._report_inbox("SessionStart", "switched-to")
-        self.assertIn("could neither update nor set aside the Claude Code inbox map (Permission denied)", warning)
+        self.assertIn("could neither update nor set aside the Claude Code inbox map (EACCES)", warning)
+        self.assertNotIn("Permission denied", warning, "Daybreak Blue on 324e548: no system text in context")
         self.assertIn("can reach the one that replaced it", warning)
         with mock.patch.object(wake, "remember_inbox", side_effect=denied):
             self.assertEqual("ALREADY BOUND", self.bind_inbox()[1]["status"], "bind leaves reporting to the hook")
@@ -2012,6 +2013,8 @@ class ClaudeTests(WakeCase):
             warning = runtime_cli._report_inbox("SessionStart", "switched-to")
         self.assertIn("MULTITHREAD WARNING: a write to the Claude Code inbox map failed", warning)
         self.assertIn("Every Claude role is NOT RUNNING", warning)
+        self.assertRegex(warning, r"set it aside as inboxes\.json\.failed-[0-9]+\. ")
+        self.assertNotIn("/", warning, "Daybreak Blue on 324e548: the file's name, never its path")
         self.assertIn(warning, err.getvalue())
         args = argparse.Namespace(provider_payload={"hook_event_name": "UserPromptSubmit", "session_id": "self"},
                                   repo="/srv/checkout", client="claude", inbox_warning=warning)
