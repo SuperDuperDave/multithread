@@ -1,0 +1,42 @@
+{
+  "actual_billed_cost": "unknown",
+  "attachments": [],
+  "authentication": "inherited from provider; not verified",
+  "effective_effort": "unknown",
+  "elapsed_seconds": null,
+  "evidence_directory": "/path/to/stream-evidence",
+  "hook_delivery": "unknown",
+  "message": "Managed Claude settings were found (/etc/claude-code); they stay in force under --restricted, hooks included, so a --tools call cannot establish its registry. No provider was started. This refusal's record is in /path/to/stream-evidence; a retry needs a new --output-dir.",
+  "model_observation": {
+    "relation": "unknown",
+    "reported_model": null,
+    "source": "unavailable"
+  },
+  "native_output_mode": "stream_json",
+  "needs_attention": true,
+  "process_exit_code": null,
+  "producer_runtime": {
+    "runtime_manifest_sha256": null,
+    "status": "unavailable"
+  },
+  "provider": "claude",
+  "provider_started": false,
+  "provider_tools": {
+    "mcp_servers": null,
+    "reported": null,
+    "requested": [],
+    "source": "not_observed"
+  },
+  "relay_acknowledgement": "not_checked",
+  "requested_effort": null,
+  "requested_model": null,
+  "requested_session_id": "00000000-0000-4000-8000-000000000000",
+  "result": null,
+  "resumed": false,
+  "schema": 1,
+  "session_id": null,
+  "state": "unavailable",
+  "unavailable_stage": "relay_configuration",
+  "usage": null,
+  "workflow_completion": "not_checked"
+}

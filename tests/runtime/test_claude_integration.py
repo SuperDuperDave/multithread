@@ -35,7 +35,8 @@ class ClaudeIntegrationTests(unittest.TestCase):
                      'REQUESTS_PATH': str(self.requests)}
         self.executable(self.provider, ''.join(f'{key} = {value!r}\n' for key, value in constants.items()) + source)
 
-    def invoke(self, steps, *, update=False, closure_fault=False, progress_only=False, restricted=False, recorded=True):
+    def invoke(self, steps, *, update=False, closure_fault=False, progress_only=False, restricted=False, recorded=True,
+               extra=()):
         self.plan_claude()
         self.specification.write_text(json.dumps(steps))
         directory = self.base / 'stream-evidence'
@@ -59,7 +60,7 @@ class ClaudeIntegrationTests(unittest.TestCase):
         arguments = ['claude', *(['--tools', 'none'] if restricted else ['--stream-progress' if progress_only else '--live-input']),
                      '--repo', str(self.repo), '--multithread', str(self.relay),
                      '--provider', str(self.provider), '--task-file', str(self.task),
-                     '--output-dir', str(directory), '--timeout', '2', '--json']
+                     '--output-dir', str(directory), '--timeout', '2', *extra, '--json']
         output, errors = io.StringIO(), io.StringIO()
         from contextlib import nullcontext
         fault = (mock.patch.object(control.CallControl, 'stop_accepting', side_effect=OSError('synthetic receipt failure'))

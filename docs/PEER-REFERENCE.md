@@ -4,6 +4,7 @@ Use the [peer guide](PEER.md) for a first collaboration, result assessment and
 deliberate follow-up. This reference covers:
 
 - [Receipt fields and capture limits](#receipt-fields-and-capture-limits)
+- [Sample records](samples/peer/README.md) of each restricted call shape, kept in step with the source by a test
 - [Usage measurements](#usage-measurements)
 - [Support reports from retained calls](#prepare-a-support-report-from-an-existing-call)
 - [Frozen review packets](#freeze-a-review-packet)

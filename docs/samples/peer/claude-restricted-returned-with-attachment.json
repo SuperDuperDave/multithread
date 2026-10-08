@@ -1,0 +1,167 @@
+{
+  "actual_billed_cost": "unknown",
+  "attachments": [
+    {
+      "bytes": 69,
+      "media_type": "image/png",
+      "path": "/path/to/sample.png",
+      "sha256": "0d241b0667c6ffc3e6c2c21c9c329f10d6b8a5f3405f94164240d0e651f48895"
+    }
+  ],
+  "authentication": "inherited from provider; not verified",
+  "cost_scope": "cumulative through the latest native result; an estimate, not billing",
+  "cost_scope_id": "cumulative_through_latest_native_result",
+  "effective_effort": "unknown",
+  "elapsed_seconds": 0.022,
+  "estimated_cost_usd": 0.5,
+  "evidence_directory": "/path/to/stream-evidence",
+  "follow_up_preparation": {
+    "argv_prefix": [
+      "/path/to/relay entry",
+      "peer",
+      "claude",
+      "--repo",
+      "/path/to/checkout 雪 ;$(touch injected)",
+      "--provider",
+      "/path/to/codex entry",
+      "--resume=00000000-0000-4000-8000-000000000000",
+      "--timeout",
+      "2",
+      "--tools",
+      "none",
+      "--dry-run",
+      "--json",
+      "--task-file"
+    ]
+  },
+  "hook_delivery": "unknown",
+  "initial_message_uuid": "00000000-0000-4000-8000-000000000000",
+  "message": "Assess the answer and durable Multithread evidence; a returned turn is not workflow completion.",
+  "model_observation": {
+    "relation": "not_requested",
+    "reported_model": "fixture-effective-model",
+    "source": "claude_system_init"
+  },
+  "model_usage": {},
+  "model_usage_scope": "latest cumulative query-stream totals; includes native subagents and compaction, not all provider helper calls",
+  "model_usage_scope_id": "native_query_cumulative",
+  "native_initialization_count": 1,
+  "native_input": [
+    {
+      "bytes": 436,
+      "consumption": "consumed",
+      "echoed": false,
+      "kind": "task",
+      "result_covered": true,
+      "uuid": "00000000-0000-4000-8000-000000000000",
+      "written": true
+    }
+  ],
+  "native_input_unwritten_bytes": 0,
+  "native_model": "fixture-effective-model",
+  "native_output_mode": "stream_json",
+  "native_permission_mode": "default",
+  "native_progress": {
+    "assistant_messages": 0,
+    "last_event": "native_result",
+    "observed_at_seconds": 0.015,
+    "result_frames": 1,
+    "subagent_frames": 0,
+    "tool_requests": 0
+  },
+  "native_results": [
+    {
+      "answered": [
+        "00000000-0000-4000-8000-000000000000"
+      ],
+      "cumulative_cost_usd": 0.5,
+      "duration_ms": 12,
+      "has_result_text": true,
+      "is_error": false,
+      "num_turns": 1,
+      "origin_kind": null,
+      "related": true,
+      "result_excerpt": "Scoped final answer 雪",
+      "result_excerpt_truncated": false,
+      "stop_reason": "end_turn",
+      "subtype": "success",
+      "terminal_reason": "completed",
+      "usage": {
+        "input_tokens": 3,
+        "output_tokens": 4
+      },
+      "usage_scope": "this native turn",
+      "uuid": "00000000-0000-4000-8000-000000000000"
+    }
+  ],
+  "native_results_truncated": false,
+  "native_subagent_frames": 0,
+  "native_version": "2.1.292",
+  "needs_attention": false,
+  "permission_denials": [],
+  "process_exit_code": 0,
+  "producer_runtime": {
+    "runtime_manifest_sha256": null,
+    "status": "unavailable"
+  },
+  "provider": "claude",
+  "provider_duration_ms": 12,
+  "provider_errors": [],
+  "provider_errors_truncated": false,
+  "provider_is_error": false,
+  "provider_review": {
+    "binary_path": "/path/to/codex entry",
+    "binary_sha256": "292d4dd694d9922b90132e99401bfe60088018f679fcb19cb2a74fdddc5c20e0",
+    "source": "built_in",
+    "version": "2.1.292"
+  },
+  "provider_started": true,
+  "provider_subtype": "success",
+  "provider_tools": {
+    "agents": [
+      "Explore",
+      "claude"
+    ],
+    "claude_code_version": "2.1.292",
+    "mcp_servers": [],
+    "plugins": [
+      "cc-plugin-telemetry"
+    ],
+    "reported": [],
+    "requested": [],
+    "skills": [],
+    "slash_commands": [],
+    "source": "claude_system_init"
+  },
+  "provider_turns": 1,
+  "provider_version": {
+    "source": "claude_system_init",
+    "status": "reported",
+    "version": "2.1.292"
+  },
+  "relay_acknowledgement": "not_checked",
+  "repo": "/path/to/checkout 雪 ;$(touch injected)",
+  "requested_effort": null,
+  "requested_model": null,
+  "requested_session_id": "00000000-0000-4000-8000-000000000000",
+  "result": "Scoped final answer 雪",
+  "resumed": false,
+  "schema": 1,
+  "session_id": "00000000-0000-4000-8000-000000000000",
+  "state": "returned",
+  "stdout_observation": {
+    "bytes": 1131,
+    "sha256": "40d2e5907105f7997e98ceafaeb24ac284219840309be1e0c34b191c1d08c330",
+    "truncated": false
+  },
+  "task_delivery": "written",
+  "terminal_reason": "completed",
+  "unsupported_native_requests": [],
+  "usage": {
+    "input_tokens": 3,
+    "output_tokens": 4
+  },
+  "usage_scope": "latest related native result; main loop only, not the whole call",
+  "usage_scope_id": "latest_related_native_result",
+  "workflow_completion": "not_checked"
+}
