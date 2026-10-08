@@ -145,7 +145,7 @@ def _report_inbox(event, session):
     start or prompt, an InboxProblem when this report leaves the session unreachable or checked without
     $CLAUDE_PID, which the worker tells only a session holding a Claude role."""
     try:
-        from .wake import _HOOK_WAIT, _SWITCH_WAIT, forget_inbox, inboxes_set_aside, remember_inbox
+        from .wake import _HOOK_WAIT, _SWITCH_WAIT, forget_inbox, remember_inbox
         if _identifier("session_id", session) != session:
             return None
         inbox = os.environ.get("CLAUDE_CODE_MESSAGING_SOCKET")
@@ -167,11 +167,11 @@ def _report_inbox(event, session):
                 if event == "SessionEnd" or (written and os.environ.get("CLAUDE_PID")):
                     return None
                 return _inbox_problem(inbox, written)
-            aside = inboxes_set_aside()
+            # Fixed text: the set-aside file sits beside the map, and a sender's NOT RUNNING names it.
             warning = ("MULTITHREAD WARNING: a write to the Claude Code inbox map failed, so Multithread set it "
-                       "aside" + (f" as {Path(aside[1]).name}" if aside else "") + ". Every Claude role is NOT "
-                       "RUNNING to wakes until its session's next prompt reports again; check free disk space. Tell "
-                       "the person.")
+                       "aside beside the map as claude-inboxes.json.failed-<time>. Every Claude role is NOT RUNNING "
+                       "to wakes until its session's next prompt reports again; check free disk space. Tell the "
+                       "person.")
         print("multithread: " + warning, file=sys.stderr)
         return warning
     except Exception:  # noqa: BLE001 - nonblocking by contract
