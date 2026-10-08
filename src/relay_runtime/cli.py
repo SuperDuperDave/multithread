@@ -140,7 +140,9 @@ def _report_inbox(event, session):
     payload is accepted, since a lost start or end leaves the socket with the session before it. Observation only:
     a failure never affects the hook, and a busy map is waited for briefly, longest at a start or an end. Returns a
     warning when a failed write set every session's report aside, since every Claude role is then NOT RUNNING, or
-    when the map could be neither updated nor set aside, since a wake can then reach the wrong session."""
+    when the map could be neither updated nor set aside, since a wake can then reach the wrong session; or, at a
+    start or prompt, an InboxProblem when this report leaves the session unreachable or checked without
+    $CLAUDE_PID, which the worker tells only a session holding a Claude role."""
     try:
         from .wake import _HOOK_WAIT, _SWITCH_WAIT, forget_inbox, inboxes_set_aside, remember_inbox
         if _identifier("session_id", session) != session:
@@ -161,7 +163,9 @@ def _report_inbox(event, session):
                        "the person.")
         else:
             if written is not None:
-                return None
+                if event == "SessionEnd" or (written and os.environ.get("CLAUDE_PID")):
+                    return None
+                return _inbox_problem(inbox, written)
             aside = inboxes_set_aside()
             warning = ("MULTITHREAD WARNING: a write to the Claude Code inbox map failed, so Multithread set it "
                        "aside" + (f" ({aside[1]})" if aside else "") + ". Every Claude role is NOT RUNNING to "
@@ -171,6 +175,43 @@ def _report_inbox(event, session):
         return warning
     except Exception:  # noqa: BLE001 - nonblocking by contract
         return None
+
+
+class InboxProblem(str):
+    """Why this session's report leaves it unreachable, or weaker than usual: told only to a session holding a role."""
+
+    reachable = False
+
+
+def _inbox_problem(inbox, written):
+    from .wake import _ancestors, _inbox_owner
+    claude, pid = os.environ.get("CLAUDE_PID"), _inbox_owner(inbox)
+    if inbox is None:
+        why = "Claude Code gave this session no inbox ($CLAUDE_CODE_MESSAGING_SOCKET is unset)"
+    elif pid is None:
+        why = f"its inbox {inbox} isn't named after a Claude Code process"
+    elif claude is not None and str(pid) != claude:
+        why = f"its inbox {inbox} belongs to another Claude Code process (this one is {claude})"
+    elif pid not in _ancestors():
+        why = f"the process its inbox {inbox} is named after isn't running this hook"
+    elif not written:
+        why = ("the inbox map stayed busy, or another session's report holds this socket after a /clear or /resume; "
+               "the next prompt reports again")
+    else:
+        problem = InboxProblem("$CLAUDE_PID wasn't set for this hook, so its inbox was checked by its name and "
+                               "process ancestry only")
+        problem.reachable = True
+        return problem
+    return InboxProblem(why)
+
+
+def _role_warning(problem, roles):
+    """The warning a session holding Claude roles sees when its inbox report has a problem."""
+    held = ", ".join(roles)
+    if problem.reachable:
+        return f"MULTITHREAD NOTE: this session holds {held}; {problem}. Wakes still reach it."
+    return (f"MULTITHREAD WARNING: this session holds {held}, but {problem}. Wakes to it say NOT RUNNING until a "
+            "prompt reports its inbox. Tell the person if this repeats.")
 
 
 def _provider_contract(client, session, repo):
@@ -354,6 +395,13 @@ def _provider_worker(args):
             )
         else:
             context = _provider_contract(args.client, payload["session_id"], repo) + core_cli._render_brief(brief)
+            problem = getattr(args, "inbox_problem", None)
+            if problem is not None and not getattr(args, "inbox_warning", None):
+                roles = [item["role"] for item in ledger.wake_bindings()["bindings"]
+                         if item["state"] != "unbound" and item["provider"] == "claude"
+                         and item["bound_session"] == payload["session_id"]]
+                if roles:
+                    args.inbox_warning = _role_warning(problem, roles)
         if len(context.encode("utf-8")) > _MAX_PROVIDER_CONTEXT:
             raise StateError("provider context exceeded its bound")
     output = {"hookSpecificOutput": {"hookEventName": name, "additionalContext": context}}
@@ -764,7 +812,11 @@ def main(argv=None, *, registry=None, command_alias_check=None):
             finally:
                 args.provider_event = seen.get("event")
                 if args.client == "claude":
-                    args.inbox_warning = _report_inbox(args.provider_event, seen.get("session_id"))
+                    reported = _report_inbox(args.provider_event, seen.get("session_id"))
+                    if isinstance(reported, InboxProblem):
+                        args.inbox_problem = reported  # shown only to a session holding a Claude role
+                    else:
+                        args.inbox_warning = reported
             if args.provider_payload is None:
                 return 0
         stage = "admission"

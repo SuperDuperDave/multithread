@@ -1709,8 +1709,9 @@ class ClaudeTests(WakeCase):
                          bound["meta"])
         self.assertEqual(f"reviewer now wakes the Claude Code session whose inbox is {self.inbox_path}, as binding "
                          f"{bound['seq']} in the ledger at {self.repo}.", result["happened"])
-        self.assertEqual("Send a wake with: multithread wake reviewer --ref <task file>. If that session ends or "
-                         "restarts, bind again from the new one.", result["next"])
+        self.assertEqual("Send a wake with: multithread wake reviewer --ref <task file>. It stays reachable across "
+                         "restarts and `claude --resume`: each prompt reports the session's current inbox. Bind again "
+                         "only to move the role to another session.", result["next"])
         self.assertEqual(0, self.daemon.connections)
         self.assertEqual([], self.inbox.lines, "binding sends nothing")
         self.assertEqual("ALREADY BOUND", self.bind_inbox()[1]["status"])
@@ -1803,10 +1804,9 @@ class ClaudeTests(WakeCase):
 
     def test_an_ended_session_or_a_refused_connection_sends_nothing_and_names_the_rebind(self):
         self.bind_inbox()
-        rebind = ('Have the exact holder refresh reviewer from its own Claude Code session with --claude-socket '
-                  '"$CLAUDE_CODE_MESSAGING_SOCKET". Moving it to another owner requires an explicitly authorized '
-                  'handover with --replace, --expected-generation, --reason and --approval-ref. Then run this wake '
-                  'again.')
+        rebind = ("The session reports its new inbox at its next prompt; send again then. Moving the role to "
+                  "another session requires an explicitly authorized handover with --replace, --expected-generation, "
+                  "--reason and --approval-ref.")  # never "bind again": the session follows its binding
         self.inbox.close()  # The listener is gone but its socket file remains: a refused connection.
         refused = self.wake_inbox()
         self.assertEqual(("NOT SENT", 4), (refused["status"], refused["exit_code"]))
@@ -2006,7 +2006,7 @@ class ClaudeTests(WakeCase):
     def test_a_hook_that_sets_the_map_aside_warns_the_session_and_the_person(self):
         self.bind_inbox()
         full = OSError(errno.ENOSPC, "No space left on device")
-        with mock.patch.dict(os.environ, {"CLAUDE_CODE_MESSAGING_SOCKET": str(self.inbox_path)}), \
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_MESSAGING_SOCKET": str(self.inbox_path), "CLAUDE_PID": "7739"}), \
                 mock.patch.object(wake.tempfile, "mkstemp", side_effect=full), redirect_stderr(io.StringIO()) as err:
             self.assertIsNone(runtime_cli._report_inbox("SessionStart", "self"), "unchanged: nothing written")
             warning = runtime_cli._report_inbox("SessionStart", "switched-to")
@@ -2130,12 +2130,76 @@ class ClaudeTests(WakeCase):
                 self.assertIn("MULTITHREAD WARNING", runtime_cli._report_inbox("UserPromptSubmit", "self"))
             self.assertIn("MULTITHREAD WARNING", err.getvalue())
 
-    def test_show_names_the_inbox(self):
+    def test_a_session_holding_a_role_hears_why_its_report_left_it_unreachable(self):
+        def report(**environ):
+            with mock.patch.dict(os.environ, environ):
+                return runtime_cli._report_inbox("UserPromptSubmit", "self")
+        socket_path = str(self.inbox_path)
+        weaker = report(CLAUDE_CODE_MESSAGING_SOCKET=socket_path)
+        self.assertTrue(weaker.reachable, "recorded, but checked without $CLAUDE_PID")
+        self.assertIn("$CLAUDE_PID wasn't set for this hook", weaker)
+        self.assertIsNone(report(CLAUDE_CODE_MESSAGING_SOCKET=socket_path, CLAUDE_PID="7739"), "the usual case")
+        other = report(CLAUDE_CODE_MESSAGING_SOCKET=socket_path, CLAUDE_PID="7740")
+        self.assertFalse(other.reachable)
+        self.assertIn("belongs to another Claude Code process (this one is 7740)", other)
+        self.assertIn("$CLAUDE_CODE_MESSAGING_SOCKET is unset", report(CLAUDE_PID="7739"))
+        self.assertIsNone(runtime_cli._report_inbox("SessionEnd", "self"), "an ending session has no one to tell")
+
+        def shown(problem, bindings):
+            args = argparse.Namespace(provider_payload={"hook_event_name": "UserPromptSubmit", "session_id": "self"},
+                                      repo="/srv/checkout", client="claude", inbox_problem=problem)
+            with mock.patch.object(runtime_cli.RelayStore, "open_readonly") as opener, \
+                    mock.patch.object(runtime_cli, "_provider_contract", return_value="CONTRACT\n"), \
+                    mock.patch.object(runtime_cli.core_cli, "_render_brief", return_value="BRIEF"), \
+                    redirect_stdout(io.StringIO()) as out:
+                ledger = opener.return_value.__enter__.return_value
+                ledger.brief.return_value = {}
+                ledger.wake_bindings.return_value = {"bindings": bindings}
+                runtime_cli._provider_worker(args)
+            return json.loads(out.getvalue())
+        held = [{"role": "reviewer", "state": "active", "provider": "claude", "bound_session": "self"},
+                {"role": "other", "state": "active", "provider": "claude", "bound_session": "someone-else"},
+                {"role": "gone", "state": "unbound", "provider": "claude", "bound_session": "self"}]
+        warned = shown(other, held)
+        self.assertTrue(warned["systemMessage"].startswith("MULTITHREAD WARNING: this session holds reviewer, but "
+                                                           "its inbox"), warned)
+        self.assertIn("Wakes to it say NOT RUNNING", warned["hookSpecificOutput"]["additionalContext"])
+        self.assertTrue(shown(weaker, held)["systemMessage"].startswith("MULTITHREAD NOTE: this session holds "
+                                                                        "reviewer; $CLAUDE_PID"))
+        self.assertNotIn("systemMessage", shown(other, held[1:]), "a session holding no Claude role isn't told")
+
+    def test_an_old_set_aside_map_is_pruned_when_another_is_set_aside(self):
         self.bind_inbox()
-        code, out = self.run_helper(wake.bind_main, "reviewer")
+        old = wake.INBOXES.with_name(f"{wake.INBOXES.name}.failed-{time.time_ns() - 2 * 86400 * 10**9}")
+        recent = wake.INBOXES.with_name(f"{wake.INBOXES.name}.failed-{time.time_ns() - 3600 * 10**9}")
+        old.write_text("{}"), recent.write_text("{}")
+        with mock.patch.object(wake.tempfile, "mkstemp", side_effect=OSError(errno.ENOSPC, "No space left")):
+            self.assertIsNone(wake.remember_inbox("switched-to", str(self.inbox_path), claim=True))
+        kept = sorted(wake.INBOXES.parent.glob(wake.INBOXES.name + ".failed-*"))
+        self.assertNotIn(old, kept)
+        self.assertIn(recent, kept)
+        self.assertEqual(2, len(kept), "the recent one and the one just set aside")
+
+    def test_show_names_the_session_and_the_inbox_a_wake_would_use(self):
+        # The restart drill: the listing showed the socket from bind time, so three working roles looked broken
+        # and were bound again.
+        self.bind_inbox()
         bound = self.events("wake.bound")[-1]
-        self.assertEqual([f"reviewer: active, bound to the Claude Code inbox {self.inbox_path} (binding "
-                          f"{bound['seq']}, by claude:self at {bound['recorded_at']})"], out.splitlines())
+        head = f"reviewer: active, bound to Claude Code session self (binding {bound['seq']}, by claude:self at "
+        self.assertEqual([head + f"{bound['recorded_at']})", f"  inbox now: {self.inbox_path}, reported by its "
+                          "running process"], self.run_helper(wake.bind_main, "reviewer")[1].splitlines())
+        restarted = FakeInbox(self.codex_home / "7740.sock")  # the same session in a new process
+        self.addCleanup(restarted.close)
+        self.fake_process(os.getpid(), ppid=7740)
+        self.assertTrue(wake.remember_inbox("self", str(restarted.path), claim=True))
+        self.assertEqual([head + f"{bound['recorded_at']})", f"  inbox now: {restarted.path}, reported by its "
+                          "running process", f"  inbox when bound: {self.inbox_path}"],
+                         self.run_helper(wake.bind_main, "reviewer")[1].splitlines())
+        self.assertEqual(str(restarted.path), json.loads(self.run_helper(wake.bind_main, "reviewer", "--json")[1])
+                         ["bindings"][0]["reported_inbox"], "the same truth for an agent reading JSON")
+        self.fake_process(7740, start=999)  # that process is gone and its id came round again
+        self.assertEqual("  inbox now: none reported by a running process; it reports at its next prompt, and wakes "
+                         "say NOT RUNNING until then", self.run_helper(wake.bind_main, "reviewer")[1].splitlines()[1])
 
 
 class InboxListenerTests(unittest.TestCase):

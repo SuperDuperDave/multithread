@@ -1130,10 +1130,9 @@ def _wake_inbox(args, role, binding, text, message_id, base, conclude):
     process that reported it still runs, and that process must be the one listening when the line is sent. Anything
     else is a session that isn't running here, never a delivery to whichever session took over its socket."""
     unsteered = " Claude Code has no separate steer, so --steer changed nothing." if args.steer else ""
-    rebind = (f"Have the exact holder refresh {role} from its own Claude Code session with "
-              "--claude-socket \"$CLAUDE_CODE_MESSAGING_SOCKET\". Moving it to another owner requires an explicitly "
-              "authorized handover with --replace, --expected-generation, --reason and --approval-ref. "
-              "Then run this wake again.")
+    resend = ("The session reports its new inbox at its next prompt; send again then. Moving the role to another "
+              "session requires an explicitly authorized handover with --replace, --expected-generation, --reason "
+              "and --approval-ref.")
     session = binding.get("bound_session")
 
     def not_running(why):
@@ -1156,7 +1155,7 @@ def _wake_inbox(args, role, binding, text, message_id, base, conclude):
         gone = (f"The Claude Code inbox at {path} is missing; the session's state is unknown."
                 if reason == "inbox_missing" else f"The Claude Code inbox at {path} failed its checks: {why}.")
         base["recipient_state"] = {"reachability": "unavailable", "turn_state": "unknown", "source": "inbox_path"}
-        return conclude(_outcome("NOT SENT", gone + " Nothing was sent.", rebind, **base), "not_sent", reason)
+        return conclude(_outcome("NOT SENT", gone + " Nothing was sent.", resend, **base), "not_sent", reason)
     if args.dry_run:
         return _outcome("DRY RUN", f"Would deliver to the Claude Code inbox at {path} for {role}. Nothing was "
                         "sent." + unsteered, "Run again without --dry-run to send.", **base)
@@ -1167,7 +1166,7 @@ def _wake_inbox(args, role, binding, text, message_id, base, conclude):
         return not_running(f"the inbox it reported, {path}, is now held by another process ({exc})")
     except InboxRefused as exc:
         return conclude(_outcome("NOT SENT", f"The Claude Code inbox at {path} refused the connection ({exc}), so "
-                                 "that session may have ended. Nothing was sent.", rebind, **base),
+                                 "that session may have ended. Nothing was sent.", resend, **base),
                         "not_sent", "inbox_refused", "inbox")
     except NoAnswer as exc:
         base["recipient_state"] = {"reachability": "reachable", "turn_state": "unknown", "source": "inbox_connection"}
@@ -1339,6 +1338,7 @@ def _private_update(path, read_file, change, wait=5, discard=False):
             return False  # nothing there to go stale
         except OSError:
             os.unlink(path)  # raises when even that fails
+        _prune_set_aside(path)
         return None
     finally:
         os.close(lock)
@@ -1364,6 +1364,17 @@ _SWITCH_WAIT = 2.0  # a lost start or end leaves the socket with the session bef
 
 def _inboxes_path():
     return Path(INBOXES) if INBOXES is not None else _state_dir() / "claude-inboxes.json"
+
+
+def _prune_set_aside(path, within=86400):
+    """Remove this file's failed set-asides older than a day, which no NOT RUNNING names any more."""
+    for item in path.parent.glob(f"{path.name}.failed-*"):
+        stamp = item.name.rsplit("-", 1)[1]
+        if stamp.isdigit() and time.time_ns() - int(stamp) > within * 10**9:
+            try:
+                os.unlink(item)
+            except OSError:
+                pass
 
 
 def inboxes_set_aside(within=86400):
@@ -1805,8 +1816,17 @@ def _target(binding):
 
 
 def _describe(binding):
-    lines = [f"{binding['role']}: {binding['state']}, bound to {_target(binding)} "
+    claude = binding["provider"] == "claude"
+    target = f"Claude Code session {binding['bound_session']}" if claude else _target(binding)
+    lines = [f"{binding['role']}: {binding['state']}, bound to {target} "
              f"(binding {binding['generation']}, by {binding['bound_by']} at {binding['bound_at']})"]
+    if claude:  # a wake follows the session to the inbox it last reported, not the socket it was bound with
+        now, bound = binding.get("reported_inbox"), binding["endpoint"].removeprefix("unix://")
+        lines.append(f"  inbox now: {now}, reported by its running process" if now else
+                     "  inbox now: none reported by a running process; it reports at its next prompt, and wakes "
+                     "say NOT RUNNING until then")
+        if now != bound:
+            lines.append(f"  inbox when bound: {bound}")
     if binding["provider"] == "codex":
         lines.append(f"  cwd when bound: {binding['cwd']}; daemon: {binding['endpoint']}")
     if binding.get("role_scope") is not None:
@@ -1958,8 +1978,10 @@ def bind(args, ledger=launcher_ledger):
     if inbox is not None:
         return _outcome("BOUND", f"{role} now wakes the Claude Code session whose inbox is {inbox}, as binding "
                         f"{binding['generation']} in the ledger at {shown['ledger']}." + replaces,
-                        next_wake or (f"Send a wake with: multithread wake {role} --ref <task file>. If that session "
-                                      "ends or restarts, bind again from the new one."), **base)
+                        next_wake or (f"Send a wake with: multithread wake {role} --ref <task file>. It stays "
+                                      "reachable across restarts and `claude --resume`: each prompt reports the "
+                                      "session's current inbox. Bind again only to move the role to another "
+                                      "session."), **base)
     return _outcome("BOUND", f"{role} now wakes Codex conversation {thread} ({status}; cwd {base['cwd']}) as "
                     f"binding {binding['generation']} in the ledger at {shown['ledger']}." + replaces,
                     next_wake or f"Send a wake with: multithread wake {role} --ref <task file>", **base, **extra)
@@ -2006,6 +2028,9 @@ def bind_main(argv=None, *, ledger=launcher_ledger):
         print(_printable(f"multithread bind: {exc}" + (f". Next: {exc.next_step}" if isinstance(exc, LedgerRefused)
                                                         else "")), file=sys.stderr)
         return 1
+    for item in shown["bindings"]:
+        if item.get("provider") == "claude":
+            item["reported_inbox"] = (live_inbox(item.get("bound_session")) or {}).get("inbox")
     if args.json:
         print(json.dumps({"schema": 1, **shown}, ensure_ascii=False, sort_keys=True))
         return 0

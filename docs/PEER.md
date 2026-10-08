@@ -710,10 +710,22 @@ still reach the new conversation of a `/clear` or `/resume`, even after the new
 session's start report commits; a suspended sender or a full inbox can lengthen
 that interval. A stalled filesystem stalls the hook's report, as it stalls the
 ledger. An inbox that is
-gone, fails its checks or refuses the connection is still `NOT SENT`. The
-same owner can refresh its binding; a new holder needs release or
-[authorized handover](#inspect-pending-work-and-role-handovers). In one live test before this command existed, an idle Claude
-Code session started a turn within 8 seconds of such a message.
+gone, fails its checks or refuses the connection is still `NOT SENT`; the
+session reports its new inbox at its next prompt. Don't bind again after a
+restart or `claude --resume`: that is never needed. Bind again only to move a
+role to another session, which needs release or an
+[authorized handover](#inspect-pending-work-and-role-handovers). In one live
+test before this command existed, an idle Claude Code session started a turn
+within 8 seconds of such a message.
+
+`multithread bind` with no target lists each Claude role by the session it
+names, with the inbox a wake would use now: the one its running process last
+reported, or none until its next prompt. The socket it was bound with follows
+as history (`inbox when bound`), and `--json` gives the same answer as
+`reported_inbox`. A session holding a Claude role is warned in its own context
+when its report leaves it unreachable, and noted when `$CLAUDE_PID` was missing
+for its hook. Set-aside maps older than a day are removed when another is set
+aside.
 
 A Codex desktop turn that wakes a Claude Code session runs inside Codex's
 sandbox. There the installed launcher refuses by design ("unsafe launcher
@@ -778,7 +790,7 @@ an acknowledgeable ledger signal can show
 `acknowledged_elsewhere`. A later turn alone does not establish consumption.
 
 The binding owner or its Codex recipient can pause, resume or unbind its own
-role; a same-owner Claude binding can refresh its inbox. A different holder or
+role. A Claude binding needs no refresh: its session reports its inbox. A different holder or
 recipient needs the holder's release, or actual user authorization for the
 handover. For that authorized replacement, add `--replace
 --expected-generation N --reason 'why this handover is authorized'
