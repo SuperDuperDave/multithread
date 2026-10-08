@@ -1302,27 +1302,30 @@ def _remember(recipient, checkout, role):
 
 
 def rebuild_index(ledger=launcher_ledger, checkouts=None):
-    """Record every active or paused binding in every enrolled checkout's ledger, so bindings made before the
-    index existed are found without each holder binding again. One read per ledger; only the index is written.
-    A ledger that answers replaces its places; one that doesn't keeps them, since unavailable is not empty."""
+    """Add every active or paused binding in every enrolled checkout's ledger to the index, so bindings made before
+    it existed are found without each holder binding again. One read per ledger; only the index is written.
+
+    Additive only: the index is a hint verified at every use, so a stale place costs one read, while removing one
+    from a snapshot could erase a bind made during the scan. A recipient's places found now come first, newest
+    binding first, then its earlier ones; the bounds apply once, at the end."""
     skipped = []
     if checkouts is None:
         try:
             checkouts, unreadable = Registry.for_account().checkouts()
         except EnrollmentError as exc:
-            return {"schema": 1, "status": "NOT REBUILT", "exit_code": 1, "ledgers": 0, "places": 0,
+            return {"schema": 1, "status": "NOT REBUILT", "exit_code": 1, "ledgers": 0, "places": 0, "dropped": 0,
                     "skipped": [], "happened": f"The account's enrollments could not be read ({exc}); the index "
                                                "is unchanged."}
         skipped += [{"checkout": None, "problem": f"enrollment record {name}: {problem}"}
                     for name, problem in unreadable]
-    answered, found = set(), []
+    read, found = 0, []
     for checkout in checkouts:
         code, shown, problem = ledger(Path(checkout), "wake-ledger", "show")
         if (code != 0 or not isinstance(shown, dict) or not isinstance(shown.get("bindings"), list)
                 or not isinstance(shown.get("ledger"), str)):
             skipped.append({"checkout": str(checkout), "problem": problem or "its answer listed no bindings"})
             continue
-        answered.add(shown["ledger"])
+        read += 1
         for binding in shown["bindings"]:
             if not isinstance(binding, dict) or binding.get("state") not in ("active", "paused"):
                 continue
@@ -1334,23 +1337,36 @@ def rebuild_index(ledger=launcher_ledger, checkouts=None):
             if all(isinstance(name, str) and name for name in names) and isinstance(binding.get("role"), str):
                 found.append((str(binding.get("bound_at") or ""), recipient,
                               {"checkout": shown["ledger"], "role": binding["role"]}))
+    fresh, newest = {}, {}
+    for bound_at, recipient, place in sorted(found, key=lambda item: item[0], reverse=True):
+        if place not in fresh.setdefault(recipient, []):
+            fresh[recipient].append(place)
+        newest.setdefault(recipient, bound_at)
+    dropped = 0
 
     def change(places):
-        places = {key: kept for key, items in places.items()
-                  if (kept := [item for item in items if item["checkout"] not in answered])}
-        for _, recipient, place in sorted(found, key=lambda item: item[0]):  # oldest first, so the newest ends last
-            places = _placed(places, recipient, place)
-        return places
+        nonlocal dropped
+        merged = dict(places)  # a recipient already indexed keeps its recency; a new one joins by its newest binding
+        for recipient in sorted(fresh, key=newest.get):
+            merged[recipient] = fresh[recipient] + [item for item in places.get(recipient, [])
+                                                    if item not in fresh[recipient]]
+        bounded = {key: items[:_RECIPIENT_PLACES] for key, items in list(merged.items())[-_RECIPIENTS_KEPT:]}
+        dropped = sum(map(len, merged.values())) - sum(map(len, bounded.values()))
+        return bounded
 
     written = _rewrite_places(change)
     status = "NOT REBUILT" if not written else "PARTIAL" if skipped else "REBUILT"
-    happened = (f"Read {len(answered)} ledger(s) and recorded {len(found)} binding(s) in {_recipients_path()}."
-                if written else f"Read {len(answered)} ledger(s), but {_recipients_path()} could not be written; "
-                "it is unchanged.")
-    if skipped and written:
-        happened += f" {len(skipped)} could not be read; places in their ledgers are kept."
-    return {"schema": 1, "status": status, "exit_code": 0 if status == "REBUILT" else 1, "ledgers": len(answered),
-            "places": len(found), "skipped": skipped, "happened": happened}
+    if written:
+        happened = f"Read {read} ledger(s) and recorded {len(found)} binding(s) in {_recipients_path()}."
+        if dropped:
+            happened += (f" {dropped} older place(s) fell outside the bounds ({_RECIPIENT_PLACES} per recipient, "
+                         f"{_RECIPIENTS_KEPT} recipients).")
+        if skipped:
+            happened += f" {len(skipped)} could not be read; their bindings were not added."
+    else:
+        happened = f"Read {read} ledger(s), but {_recipients_path()} could not be written; it is unchanged."
+    return {"schema": 1, "status": status, "exit_code": 0 if status == "REBUILT" else 1, "ledgers": read,
+            "places": len(found), "dropped": dropped, "skipped": skipped, "happened": happened}
 
 
 def wake_index_main(argv=None, *, ledger=launcher_ledger):

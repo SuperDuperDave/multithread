@@ -79,6 +79,8 @@ class EnrollmentTests(unittest.TestCase):
         found, unreadable = self.registry.checkouts()
         self.assertEqual([self.repo.resolve()], [path.resolve() for path in found], "one bad record spoils no other")
         self.assertEqual([damaged.name], [name for name, _ in unreadable])
+        with mock.patch.object(subject, "_MAX_REGISTRY_ENTRIES", 1), self.assertRaises(subject.EnrollmentError):
+            self.registry.checkouts()
 
     def test_unknown_lookup_does_not_create_anything(self):
         self.assert_refusal_unchanged(lambda: self.registry.lookup(self.repo))

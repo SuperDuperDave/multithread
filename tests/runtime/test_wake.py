@@ -2008,7 +2008,7 @@ class SignalWakeTests(ClaudeTests):
         self.assertIn(f"ledger sequence {seq} in {self.repo.resolve()}", b"".join(self.inbox.lines).decode())
         self.assertNotIn(str(linked), b"".join(self.inbox.lines).decode())
 
-    def test_rebuild_finds_bindings_the_index_never_saw_and_keeps_what_it_could_not_read(self):
+    def test_rebuild_adds_bindings_the_index_never_saw_and_removes_nothing(self):
         # A role bound before 0.4.28 is in no index until its holder binds again; rebuild reads every ledger once.
         other = self.other_checkout()
         with redirect_stdout(io.StringIO()):
@@ -2035,9 +2035,11 @@ class SignalWakeTests(ClaudeTests):
         self.assertEqual([("wake-ledger", "show")] * 2, [arguments for _, arguments in self.ledger_calls[calls:]],
                          "one read per ledger and no write")
         self.assertEqual({claude: [{"checkout": there, "role": "reviewer"},
+                                   {"checkout": there, "role": "unbound-since"},
                                    {"checkout": str(unreachable), "role": "kept"}],
                           codex: [{"checkout": here, "role": "operator"}]}, json.loads(wake.RECIPIENTS.read_text()),
-                         "an answering ledger's places are replaced; an unanswering one's are kept")
+                         "what was found now comes first; a stale place stays, since every use verifies it")
+        self.assertIn("1 could not be read; their bindings were not added", result["happened"])
         self.assertEqual("DELIVERED TO INBOX", self.signal_wake()["status"])
         self.assertEqual("REBUILT", wake.rebuild_index(self.ledger, checkouts=[self.repo, other])["status"])
         with mock.patch.object(wake, "_rewrite_places", return_value=False):
@@ -2353,6 +2355,81 @@ class BindTests(WakeCase):
                           "Next: multithread bind reviewer --thread <codex conversation id>"], out.splitlines())
 
 
+class WakeIndexRebuildTests(unittest.TestCase):
+    """Rebuild against synthetic ledger answers: ordering, both bounds, and a bind made during the scan."""
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="relay-wake-index-")
+        self.addCleanup(temporary.cleanup)
+        patcher = mock.patch.object(wake, "RECIPIENTS", Path(temporary.name) / "recipients.json")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    @staticmethod
+    def claude(session, role, bound_at, state="active"):
+        return {"provider": "claude", "bound_agent": "claude", "bound_session": session, "role": role,
+                "bound_at": bound_at, "state": state}
+
+    @staticmethod
+    def key(session):
+        return json.dumps(["claude", "claude", session])
+
+    def index(self):
+        return json.loads(wake.RECIPIENTS.read_text())
+
+    def test_found_places_lead_bounds_apply_once_and_a_concurrent_bind_survives(self):
+        wake.RECIPIENTS.write_text(json.dumps({self.key("r"): [{"checkout": "/old", "role": "w"}],
+                                               self.key("x"): [{"checkout": "/x", "role": "x"}]}))
+        wake.RECIPIENTS.chmod(0o600)
+        answers = {
+            "/a": {"ledger": "/a-primary", "bindings": [
+                self.claude("r", "early", "2026-01-01T00:00:00Z"), self.claude("s", "s", "2026-02-01T00:00:00Z"),
+                {"provider": "codex", "thread": THREAD, "role": "paused", "bound_at": "2026-03-01T00:00:00Z",
+                 "state": "paused"},
+                self.claude("gone", "gone", "2026-05-01T00:00:00Z", state="unbound")]},
+            "/b": {"ledger": "/b", "bindings": [
+                self.claude("r", "late", "2026-04-01T00:00:00Z"), self.claude("u", "u", "2026-01-15T00:00:00Z")]}}
+
+        def ledger(repo, *arguments):
+            if str(repo) == "/b":  # another session binds after /a was read, before the index is written
+                self.assertTrue(wake._remember(self.key("h"), "/a-primary", "fresh"))
+            return 0, answers[str(repo)], ""
+        with mock.patch.object(wake, "_RECIPIENT_PLACES", 2), mock.patch.object(wake, "_RECIPIENTS_KEPT", 6):
+            result = wake.rebuild_index(ledger, checkouts=["/a", "/b"])
+        self.assertEqual(("REBUILT", 0, 2, 5, 1), tuple(result[name] for name in (
+            "status", "exit_code", "ledgers", "places", "dropped")), result)
+        self.assertIn("1 older place(s) fell outside the bounds (2 per recipient", result["happened"])
+        index = self.index()
+        self.assertEqual([self.key(name) for name in ("r", "x", "h", "u", "s")] + [json.dumps(["codex", THREAD])],
+                         list(index), "indexed recipients keep their recency; new ones join by their newest binding")
+        self.assertEqual([{"checkout": "/b", "role": "late"}, {"checkout": "/a-primary", "role": "early"}],
+                         index[self.key("r")], "newest binding first, under the place bound")
+        self.assertEqual([{"checkout": "/a-primary", "role": "fresh"}], index[self.key("h")],
+                         "a bind made during the scan is not erased by the snapshot")
+        self.assertEqual([{"checkout": "/a-primary", "role": "paused"}], index[json.dumps(["codex", THREAD])],
+                         "a paused binding is indexed under its thread, at the ledger its answer names")
+        self.assertNotIn(self.key("gone"), index)
+
+    def test_a_recipient_found_twice_keeps_both_places_when_others_fill_the_bound(self):
+        # Sol on b2f63e8: trimming as each place went in evicted the recipient, then restored only its newest place.
+        bindings = [self.claude("r", "old", "2026-01-01T00:00:00Z"), self.claude("a", "a", "2026-02-01T00:00:00Z"),
+                    self.claude("b", "b", "2026-03-01T00:00:00Z"), self.claude("r", "new", "2026-04-01T00:00:00Z")]
+        with mock.patch.object(wake, "_RECIPIENTS_KEPT", 3):
+            result = wake.rebuild_index(lambda *_: (0, {"ledger": "/l", "bindings": bindings}, ""), checkouts=["/l"])
+        self.assertEqual(0, result["dropped"])
+        self.assertEqual([{"checkout": "/l", "role": "new"}, {"checkout": "/l", "role": "old"}],
+                         self.index()[self.key("r")])
+
+    def test_unreadable_enrollments_change_nothing(self):
+        registry = mock.Mock()
+        registry.checkouts.side_effect = wake.EnrollmentError("account binding inventory exceeds its supported bound")
+        with mock.patch.object(wake.Registry, "for_account", return_value=registry):
+            result = wake.rebuild_index(lambda *_: self.fail("no ledger is read"))
+        self.assertEqual(("NOT REBUILT", 1), (result["status"], result["exit_code"]))
+        self.assertIn("exceeds its supported bound", result["happened"])
+        self.assertFalse(wake.RECIPIENTS.exists())
+
+
 class LauncherLedgerTests(unittest.TestCase):
     """The real ledger path: one installed-launcher run per step, read by exit code and JSON."""
 
@@ -2465,6 +2542,11 @@ class RoutingTests(unittest.TestCase):
             self.assertEqual(1, wake.wake_index_main(["rebuild"]))
         self.assertEqual("PARTIAL: Read 2 ledger(s) and recorded 3 binding(s).\n"
                          "Not read: /srv/gone: it didn't answer within 30 s\n", out.getvalue())
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, {"RELAY_HOME": "/srv/synthetic-state"}), redirect_stderr(err), \
+             mock.patch("relay_runtime.wake.wake_index_main", side_effect=AssertionError("override reached helper")):
+            self.assertNotEqual(0, runtime_cli.main(["wake-index", "rebuild"]))
+        self.assertIn("refuses state-directory overrides", err.getvalue())
 
     def test_read_only_worker_profile_covers_exactly_the_wake_reads(self):
         parser = runtime_cli._parser()
