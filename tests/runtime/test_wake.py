@@ -7,6 +7,7 @@ conversation or account configuration is touched.
 """
 
 import base64
+import fcntl
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timezone
 import hashlib
@@ -322,6 +323,11 @@ class WakeCase(unittest.TestCase):
         for pid in (7739, 7740, 7741):
             self.fake_process(pid)
         self.fake_process(os.getpid(), ppid=7739)
+        environment = mock.patch.dict(os.environ)
+        environment.start()
+        self.addCleanup(environment.stop)
+        for name in ("CLAUDE_PID", "CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_MESSAGING_SOCKET"):
+            os.environ.pop(name, None)  # the session running these tests is not the one under test
         named_listener = lambda connection: (int(Path(connection.getpeername()).stem), os.getuid())
         for patcher in (mock.patch.object(wake, "PROC", self.proc),
                         mock.patch.object(wake, "INBOXES", self.base / "inboxes.json"),
@@ -1890,11 +1896,12 @@ class ClaudeTests(WakeCase):
         # Sol on f353f6a: /clear or /resume puts session B on A's process and socket.
         self.bind_inbox()  # A is "self"
         self.assertTrue(wake.remember_inbox("switched-to", str(self.inbox_path), claim=True), "B's start claims it")
-        self.assertFalse(wake.remember_inbox("self", str(self.inbox_path)), "a late report from A is refused")
-        self.assertEqual(["switched-to"], list(json.loads(wake.INBOXES.read_text())))
         result = self.wake_inbox()
         self.assertEqual("NOT RUNNING", result["status"], result)
         self.assertEqual([], self.inbox.lines, "A's wake never reaches B")
+        self.assertFalse(wake.remember_inbox("self", str(self.inbox_path)), "a late report from A records nothing")
+        self.assertEqual({}, json.loads(wake.INBOXES.read_text()), "it fails closed: B waits for its next report")
+        self.assertTrue(wake.remember_inbox("switched-to", str(self.inbox_path)), "B's next prompt records it")
         self.assertTrue(wake.remember_inbox("self", str(self.inbox_path), claim=True), "/resume back to A claims it")
         self.assertEqual("DELIVERED TO INBOX", self.wake_inbox()["status"])
 
@@ -1911,6 +1918,69 @@ class ClaudeTests(WakeCase):
         self.assertEqual("NOT RUNNING", result["status"], result)
         self.assertIn("another session took it over while connecting", result["happened"])
         self.assertEqual([], self.inbox.lines)
+
+    def test_a_lost_start_claim_fails_closed_and_heals_at_the_next_prompt(self):
+        # Opus on 6dc7d72: B's start claim was lost, so A kept the socket and B's prompts could never take it.
+        self.bind_inbox()  # A is "self"
+        self.assertFalse(wake.remember_inbox("switched-to", str(self.inbox_path)), "B's first prompt drops A")
+        self.assertEqual("NOT RUNNING", self.wake_inbox()["status"])
+        self.assertEqual([], self.inbox.lines)
+        self.assertTrue(wake.remember_inbox("switched-to", str(self.inbox_path)), "and its next one records B")
+
+    def test_a_socket_inherited_from_another_claude_process_is_not_reported(self):
+        with mock.patch.dict(os.environ, {"CLAUDE_PID": "7740"}):
+            self.assertFalse(wake.remember_inbox("self", str(self.inbox_path)))
+        with mock.patch.dict(os.environ, {"CLAUDE_PID": "7739"}):
+            self.assertTrue(wake.remember_inbox("self", str(self.inbox_path)))
+
+    def test_bind_names_this_claude_session(self):
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "the-real-session"}):
+            code, result = self.bind_inbox()
+        self.assertEqual(("NOT BOUND", 4), (result["status"], code))
+        self.assertIn("this Claude Code session is the-real-session", result["happened"])
+        self.assertEqual([], self.events("wake.bound"))
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "self"}):
+            self.assertEqual("BOUND", self.bind_inbox()[1]["status"])
+
+    def test_a_process_id_reused_while_connecting_receives_nothing(self):
+        # Opus on 6dc7d72: the start-time check after connecting is the only guard against reuse in that moment.
+        self.bind_inbox()
+        listener = wake._listener
+
+        def reused(connection):
+            self.fake_process(7739, start=999)
+            return listener(connection)
+        with mock.patch.object(wake, "_listener", side_effect=reused):
+            result = self.wake_inbox()
+        self.assertEqual("NOT RUNNING", result["status"], result)
+        self.assertIn("process 7739 is listening on it, not the session's process 7739", result["happened"])
+        self.assertEqual([], self.inbox.lines)
+
+    def test_the_hook_claims_at_start_refreshes_on_a_prompt_and_forgets_at_the_end(self):
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_MESSAGING_SOCKET": str(self.inbox_path)}), \
+                mock.patch.object(wake, "remember_inbox") as remember, \
+                mock.patch.object(wake, "forget_inbox") as forget:
+            for event in ("SessionStart", "UserPromptSubmit", "PostToolUse", "Stop", "SessionEnd"):
+                runtime_cli._report_inbox(event, "self")
+        self.assertEqual([mock.call("self", str(self.inbox_path), claim=True, wait=wake._HOOK_WAIT),
+                          mock.call("self", str(self.inbox_path), claim=False, wait=wake._HOOK_WAIT)],
+                         remember.call_args_list)
+        forget.assert_called_once_with("self", str(self.inbox_path))
+
+    def test_a_session_end_forgets_only_its_own_inbox(self):
+        self.bind_inbox()
+        self.assertTrue(wake.forget_inbox("self", str(self.codex_home / "7740.sock")))
+        self.assertIn("self", json.loads(wake.INBOXES.read_text()), "another inbox's end changes nothing")
+        self.assertTrue(wake.forget_inbox("self", str(self.inbox_path)))
+        self.assertEqual("NOT RUNNING", self.wake_inbox()["status"])
+
+    def test_a_busy_map_is_skipped_not_waited_for(self):
+        lock = os.open(wake.INBOXES.with_suffix(".lock"), os.O_RDWR | os.O_CREAT, 0o600)
+        self.addCleanup(os.close, lock)
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        started = time.monotonic()
+        self.assertFalse(wake.remember_inbox("self", str(self.inbox_path), wait=0.1))
+        self.assertLess(time.monotonic() - started, 1)
 
     def test_a_socket_taken_over_between_check_and_send_receives_nothing(self):
         # Sol on f353f6a: the path is checked, then connected; the listener is checked again after connecting.
@@ -1934,10 +2004,10 @@ class ClaudeTests(WakeCase):
 
     def test_the_hook_reports_its_session_inbox_and_never_fails_for_it(self):
         with mock.patch.dict(os.environ, {"CLAUDE_CODE_MESSAGING_SOCKET": str(self.inbox_path)}):
-            runtime_cli._report_inbox("self")
+            runtime_cli._report_inbox("SessionStart", "self")
             self.assertEqual(str(self.inbox_path), wake.live_inbox("self")["inbox"])
             with mock.patch.object(wake, "remember_inbox", side_effect=OSError("synthetic")):
-                runtime_cli._report_inbox("self")
+                runtime_cli._report_inbox("UserPromptSubmit", "self")
 
     def test_show_names_the_inbox(self):
         self.bind_inbox()

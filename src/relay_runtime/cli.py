@@ -133,14 +133,18 @@ def _provider_input(client, *, from_cwd=False, seen=None):
     return selected
 
 
-def _report_inbox(session, claim=False):
+def _report_inbox(event, session):
     """Tell later wakes where this Claude Code session's inbox is now. Its process id, and so its socket, changes on
     every restart; the session id a binding names doesn't. Only a session's start may take a socket from another
-    session in the same process (/clear, /resume). Observation only: a failure never affects the hook, and a busy
-    map is skipped rather than waited for."""
+    session in the same process (/clear, /resume), and its end forgets it. Observation only: a failure never
+    affects the hook, and a busy map is skipped rather than waited for."""
     try:
-        from .wake import _HOOK_WAIT, remember_inbox
-        remember_inbox(session, os.environ.get("CLAUDE_CODE_MESSAGING_SOCKET"), claim=claim, wait=_HOOK_WAIT)
+        from .wake import _HOOK_WAIT, forget_inbox, remember_inbox
+        inbox = os.environ.get("CLAUDE_CODE_MESSAGING_SOCKET")
+        if event == "SessionEnd":
+            forget_inbox(session, inbox)
+        elif event in ("SessionStart", "UserPromptSubmit"):
+            remember_inbox(session, inbox, claim=event == "SessionStart", wait=_HOOK_WAIT)
     except Exception:  # noqa: BLE001 - nonblocking by contract
         pass
 
@@ -730,8 +734,8 @@ def main(argv=None, *, registry=None, command_alias_check=None):
                 args.provider_event = seen.get("event")
             if args.provider_payload is None:
                 return 0
-            if args.client == "claude" and args.provider_event in ("SessionStart", "UserPromptSubmit"):
-                _report_inbox(args.provider_payload.get("session_id"), claim=args.provider_event == "SessionStart")
+            if args.client == "claude":
+                _report_inbox(args.provider_event, args.provider_payload.get("session_id"))
         stage = "admission"
         if threading.active_count() != 1:
             raise StateError("installed dispatcher requires a single-threaded fresh process")

@@ -677,11 +677,15 @@ named after the session's process and moves on every restart. So each
 session's Multithread hook reports its current inbox at start and on every
 prompt, with that process's identity (boot, process id and start time), into
 an owner-only map beside the recipient index (`claude-inboxes.json`, in the
-account's home, never an ambient `HOME`). Only a process the inbox is named
-after, running above the hook, can report it. One process can switch sessions
-(`/clear`, `/resume`), so only a session's start may take a socket another
-live session holds; a later report or a `bind` only creates or refreshes, and
-Claude Code runs these hooks to completion before continuing. A wake goes to
+account's home, never an ambient `HOME`). Only the Claude Code process the
+inbox is named after (`$CLAUDE_PID`), running above the hook, can report it,
+and a session's end forgets it. One process can switch sessions (`/clear`,
+`/resume`), so only a session's start may take a socket another live session
+holds. Any other report that finds one fails closed: it drops that entry and
+records nothing until the next report, so a lost start costs `NOT RUNNING`
+for a prompt, never a wake delivered to the wrong session. Binding a Claude
+Code inbox requires `--session "$CLAUDE_CODE_SESSION_ID"`, the session a wake
+will follow. A wake goes to
 the inbox the bound session last reported while that exact process still runs,
 and checks the process listening on the connected socket before sending. A
 restarted or resumed session is reachable again from its first prompt without

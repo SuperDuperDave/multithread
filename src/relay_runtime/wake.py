@@ -1394,11 +1394,15 @@ def _owns(entry):
 
 def remember_inbox(session, inbox, claim=False, wait=5):
     """Record that session's inbox is now inbox, as reported from inside it: the process the socket is named after
-    must be an ancestor of this one. Only a session's start may claim a socket another live session holds (one
-    process can switch sessions with /clear or /resume); a later report or a bind only creates or refreshes, so a
-    delayed report from a session that was switched away can't take its socket back. False when nothing was
-    recorded; a failure costs only the lookup."""
+    must be this Claude Code process ($CLAUDE_PID, which a nested session sets to its own) and an ancestor of this
+    one. One process can switch sessions (/clear, /resume), so only a session's start claims a socket another live
+    session holds. Any other report that finds one fails closed: it drops that holder and records nothing this
+    time, so a lost claim heals at the next prompt and costs NOT RUNNING, never a misdelivered wake. False when
+    nothing was recorded; a failure costs only the lookup."""
     pid = _inbox_owner(inbox)
+    claude = os.environ.get("CLAUDE_PID")
+    if claude is not None and str(pid) != claude:
+        return False  # a socket inherited from another Claude Code process
     identity = _process(pid) if pid is not None and pid in _ancestors() else None
     if not isinstance(session, str) or not session or identity is None:
         return False
@@ -1411,16 +1415,26 @@ def remember_inbox(session, inbox, claim=False, wait=5):
         if entries.get(session) == entry:
             return None
         holders = [key for key, item in entries.items() if key != session and item["inbox"] == inbox and _owns(item)]
+        kept = {key: item for key, item in entries.items() if key != session and item["inbox"] != inbox}
         if holders and not claim:
             refused.append(holders[0])
-            return None
-        kept = {key: item for key, item in entries.items() if key != session and item["inbox"] != inbox}
+            return kept  # neither session is recorded until one reports again
         if len(kept) >= _INBOXES_KEPT:  # make room from sessions whose process has gone before live ones
             dead = [key for key, item in kept.items() if not _owns(item)]
             for key in (dead + list(kept))[:len(kept) - _INBOXES_KEPT + 1]:
                 kept.pop(key, None)
         return {**kept, session: entry}
     return _private_update(_inboxes_path(), _read_inboxes, change, wait) and not refused
+
+
+def forget_inbox(session, inbox):
+    """A session ended in this process (exit, /clear, /resume elsewhere): its entry no longer names a reachable
+    session. Only the entry for this exact inbox is removed."""
+    def change(entries):
+        if entries.get(session, {}).get("inbox") != inbox:
+            return None
+        return {key: item for key, item in entries.items() if key != session}
+    return _private_update(_inboxes_path(), _read_inboxes, change, _HOOK_WAIT)
 
 
 def live_inbox(session):
@@ -1850,6 +1864,12 @@ def bind(args, ledger=launcher_ledger):
             args.expected_generation = current["generation"]
         if refresh:
             args.replace = True
+    this_session = os.environ.get("CLAUDE_CODE_SESSION_ID")
+    if inbox is not None and this_session is not None and this_session != session:
+        return _outcome("NOT BOUND", f"{role} names session {session}, but this Claude Code session is {this_session}; "
+                        "a wake follows the session it names. Nothing was recorded.",
+                        f"Run bind from the Claude Code session to wake, with --session \"$CLAUDE_CODE_SESSION_ID\".",
+                        **base)
     if inbox is not None:
         problem = inbox_problem(inbox)
         if problem is not None:
