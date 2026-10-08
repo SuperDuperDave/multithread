@@ -587,8 +587,8 @@ def _policy_listings():
             cached = _cached_policy()
             if cached is not None:
                 return cached
+        boot, now = _boot_clock()  # a reused read is as old as its first query, not its last
         listings = {parent: _reg_query(parent) for parent in _WSL_POLICY_PARENTS}
-        boot, now = _boot_clock()
         if lock is not None and boot is not None and all(listed is not None for listed, _ in listings.values()):
             try:
                 _atomic_record(_POLICY_CACHE.parent, _POLICY_CACHE.name,

@@ -1377,6 +1377,12 @@ class PeerTests(unittest.TestCase):
                         cache.write_text(json.dumps(change(json.loads(cache.read_text()))))
                     self.assertEqual([], peer._managed_claude_sources(self.repo))
                     self.assertEqual(before + 2, reads())
+            # The record is dated by when its first query began.
+            cache.unlink()
+            before = reads()
+            with mock.patch.object(peer, "_boot_clock", side_effect=lambda: ("boot-x", 100.0 + reads())):
+                self.assertEqual([], peer._managed_claude_sources(self.repo))
+            self.assertEqual(100.0 + before, json.loads(cache.read_text())["at"])
             # A failed read refuses and is never kept: the next call reads again.
             cache.unlink()
             answer.write_text("1")
