@@ -335,7 +335,8 @@ class WakeSenderLedgerTests(WakeLedgerCase):
         with RelayStore.open(repo=linked, state_home=self.home) as other:
             self.assertEqual("controller", self.store.wake_bindings()["project"])
             self.assertEqual("controller", other.wake_bindings()["project"])
-            self.assertEqual(str(linked), other.wake_bindings()["ledger"])
+            # The ledger is named by the primary checkout it lives beside, which outlives any linked worktree.
+            self.assertEqual(str(self.repo.resolve()), other.wake_bindings()["ledger"])
 
     def test_unsafe_or_unbounded_project_name_is_null(self):
         for name in ("Unsafe-Name", "unsafe_name", "a" * 81):

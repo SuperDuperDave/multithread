@@ -1197,44 +1197,63 @@ def _receives(binding, agent, session):
 
 # Where each recipient holds a role, so a signal recorded in one checkout's ledger can wake it in its own. A hint
 # only: every use is verified against that ledger's binding, so the index never decides who is woken.
-RECIPIENTS = Path(os.path.expanduser("~/.local/share/relay/wake-recipients.json"))
+# It lives beside the ledgers it describes: RELAY_HOME when one names their state, else the account's.
+RECIPIENTS = None  # tests set an exact path
 _RECIPIENT_PLACES = 8
+_RECIPIENTS_KEPT = 256  # most recently bound recipients; sessions come and go
+
+
+def _recipients_path():
+    if RECIPIENTS is not None:
+        return Path(RECIPIENTS)
+    if os.environ.get("RELAY_HOME"):
+        return Path(os.path.abspath(os.path.expanduser(os.environ["RELAY_HOME"]))) / "wake-recipients.json"
+    return Path(os.path.expanduser("~/.local/share/relay/wake-recipients.json"))
 
 
 def _recipient(provider, agent, session, thread):
-    return f"codex:{thread}" if provider == "codex" else f"claude:{agent}:{session}"
+    return json.dumps(["codex", thread] if provider == "codex" else ["claude", agent, session])
 
 
-def _places():
-    """The index, or {} when absent, unreadable, loosely held or malformed."""
+def _read_places(path):
+    """The index and whether it was usable: absent is usable and empty; unreadable, loosely held, oversized
+    or malformed is not."""
     try:
-        fd = os.open(RECIPIENTS, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except FileNotFoundError:
+        return {}, True
     except OSError:
-        return {}
+        return {}, False
     try:
         status = os.fstat(fd)
         if (not stat.S_ISREG(status.st_mode) or status.st_uid != os.getuid() or status.st_mode & 0o077
                 or status.st_size > 1 << 20):
-            return {}
+            return {}, False
         value = json.loads(os.read(fd, status.st_size + 1))
     except (OSError, ValueError):
-        return {}
+        return {}, False
     finally:
         os.close(fd)
     if not isinstance(value, dict):
-        return {}
+        return {}, False
     place = lambda item: (isinstance(item, dict) and set(item) == {"checkout", "role"}
                           and isinstance(item["checkout"], str) and item["checkout"].startswith("/")
                           and isinstance(item["role"], str))
     return {key: [item for item in items if place(item)][:_RECIPIENT_PLACES]
-            for key, items in value.items() if isinstance(key, str) and isinstance(items, list)}
+            for key, items in value.items() if isinstance(key, str) and isinstance(items, list)}, True
+
+
+def _places():
+    return _read_places(_recipients_path())[0]
 
 
 def _remember(recipient, checkout, role):
-    """Record where a recipient holds a role; a failure costs only the cross-ledger lookup."""
+    """Record where a recipient holds a role; a failure costs only the cross-ledger lookup. An unusable index is
+    set aside, never overwritten."""
+    path = _recipients_path()
     try:
-        RECIPIENTS.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        lock = os.open(RECIPIENTS.with_suffix(".lock"), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        lock = os.open(path.with_suffix(".lock"), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
     except OSError:
         return False
     try:
@@ -1247,16 +1266,20 @@ def _remember(recipient, checkout, role):
                 if time.monotonic() >= deadline:
                     return False
                 time.sleep(0.02)
-        places, place = _places(), {"checkout": checkout, "role": role}
-        places[recipient] = [place, *(item for item in places.get(recipient, []) if item != place)][:_RECIPIENT_PLACES]
-        fd, temporary = tempfile.mkstemp(prefix=".recipients-", dir=RECIPIENTS.parent)
+        places, usable = _read_places(path)
+        if not usable:
+            os.replace(path, path.with_name(f"{path.name}.unusable-{time.time_ns()}"))
+        place = {"checkout": checkout, "role": role}
+        kept = [place, *(item for item in places.pop(recipient, []) if item != place)][:_RECIPIENT_PLACES]
+        places = {**dict(list(places.items())[-(_RECIPIENTS_KEPT - 1):]), recipient: kept}  # newest last
+        fd, temporary = tempfile.mkstemp(prefix=".recipients-", dir=path.parent)
         try:
             with os.fdopen(fd, "w") as stream:
                 os.fchmod(stream.fileno(), 0o600)
                 json.dump(places, stream, sort_keys=True)
                 stream.flush()
                 os.fsync(stream.fileno())
-            os.replace(temporary, RECIPIENTS)
+            os.replace(temporary, path)
         finally:
             if os.path.exists(temporary):
                 os.unlink(temporary)
@@ -1289,8 +1312,8 @@ def _wake_where_bound(args, ledger, repo, here, seq, recorded, target_agent, tar
                                        dry_run=False, sender_repo=str(repo), sender_role=None, codex=args.codex,
                                        **_expectation(binding))
         result = wake(wake_args, ledger)
-        result["happened"] = (f"Recorded signal {seq} here; its recipient holds {binding['role']} in {checkout}, so "
-                              "the wake went there. " + result["happened"])
+        result["happened"] = (f"Recorded signal {seq} here; its recipient holds {binding['role']} in {checkout}, "
+                              "where the wake was tried. " + result["happened"])
         result["signal"], result["woken_in"] = recorded, checkout
         return result
     return None
@@ -1330,8 +1353,8 @@ def signal_wake(args, rest, ledger=launcher_ledger):
     event = reply["event"]
     seq = event["seq"]
     recorded = {"seq": seq, "id": event["id"], "duplicate": bool(reply.get("duplicate")), "target": event["target"]}
-    later = (f"The recipient sees signal {seq} at its next prompt; to wake it now, run multithread wake <role> "
-             f"--ref {seq} for a role bound to that session.")
+    later = (f"If the recipient works in this checkout it sees signal {seq} at its next prompt; to wake it now, "
+             f"run multithread wake <role> --ref {seq} for a role bound to that session.")
     code, shown, problem = ledger(repo, "wake-ledger", "show")
     if code != 0:
         return _outcome("NOT SENT", f"Recorded signal {seq}, but this ledger's bindings couldn't be read "
@@ -1520,11 +1543,11 @@ def bind(args, ledger=launcher_ledger):
         metadata_unchanged = (args.scope is None or args.scope == current.get("role_scope")) and (
             args.charter is None or args.charter == current.get("charter"))
         if unchanged and metadata_unchanged and args.expected_generation is None:
-            _remember(_recipient(provider, current.get("bound_agent"), current.get("bound_session"), thread),
-                      shown["ledger"], role)
+            indexed = _remember(_recipient(provider, current.get("bound_agent"), current.get("bound_session"),
+                                           thread), shown["ledger"], role)
             return _outcome("ALREADY BOUND", f"{role} already wakes {target} (binding {current['generation']}, "
                             f"{current['state']}); nothing was recorded.", "Nothing.",
-                            generation=current["generation"], **base)
+                            generation=current["generation"], index_recorded=indexed, **base)
         refresh = same_holder and same_recipient
         if not refresh and (not args.replace or args.expected_generation is None or not args.reason or not args.approval_ref):
             return _outcome("NOT BOUND", f"{role} is already bound to {_target(current)} (binding "
@@ -1566,7 +1589,7 @@ def bind(args, ledger=launcher_ledger):
     binding = recorded["binding"]
     base.update(generation=binding["generation"], binding_state=binding["state"], coverage=coverage)
     # Re-running bind records an older binding here too, so the index fills without a migration.
-    _remember(_recipient(provider, agent, session, thread), shown["ledger"], role)
+    base["index_recorded"] = _remember(_recipient(provider, agent, session, thread), shown["ledger"], role)
     if recorded["duplicate"]:
         return _outcome("ALREADY BOUND", f"{role} already wakes {target} (binding {binding['generation']}); "
                         "nothing was recorded.", "Nothing.", **base, **extra)

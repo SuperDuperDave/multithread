@@ -1476,9 +1476,10 @@ class WakeLedgerTests(WakeCase):
                          elsewhere["text"])
         self.assertNotIn("ref_sha256", elsewhere, "a sequence carries no file content")
         here = self.wake(ref=str(generation))
-        self.assertEqual("QUEUED", here["status"], "the same number in this ledger is another message")
+        self.assertEqual("QUEUED", here["status"], here["happened"])
         self.assertNotEqual(elsewhere["message_id"], here["message_id"])
-        for bad in ("ledger:relative#3", "ledger:/x#0", "ledger:/x#", "ledger:/x"):
+        for bad in ("ledger:relative#3", "ledger:/x#0", "ledger:/x#", "ledger:/x", "ledger:/x/#3", "ledger:/x/./y#3",
+                    "ledger:/x/../y#3", "ledger://x#3"):
             with self.subTest(ref=bad):
                 self.assertEqual("NOT SENT", self.wake(ref=bad)["status"])
 
@@ -1913,11 +1914,11 @@ class SignalWakeTests(ClaudeTests):
         code, result = self.bind_inbox()
         self.assertEqual(0, code, result)
         index = json.loads(wake.RECIPIENTS.read_text())
-        self.assertEqual({"claude:claude:self": [{"checkout": result["ledger"], "role": "reviewer"}]}, index)
+        self.assertEqual({json.dumps(["claude", "claude", "self"]): [{"checkout": result["ledger"], "role": "reviewer"}]}, index)
         self.assertEqual(0o600, wake.RECIPIENTS.stat().st_mode & 0o777)
         wake.RECIPIENTS.unlink()
         self.bind_inbox()  # already bound: running bind again records an older binding too
-        self.assertIn("claude:claude:self", json.loads(wake.RECIPIENTS.read_text()))
+        self.assertIn(json.dumps(["claude", "claude", "self"]), json.loads(wake.RECIPIENTS.read_text()))
 
     def test_a_signal_wakes_its_recipient_in_the_checkout_where_it_holds_a_role(self):
         # Foundry 2888/2889, Tools 848/849, Sentinel on #48: the recipient worked in another checkout, so a
@@ -1949,7 +1950,7 @@ class SignalWakeTests(ClaudeTests):
             core_cli.main(["--repo", str(other), "--home", str(self.other_home), "brief", "--agent", "claude",
                            "--session", "self"])
         self.assertIn("Wakes pointing at another checkout's ledger", out.getvalue())
-        self.assertIn(f'ref="ledger:{self.repo}#{seq}"', out.getvalue())
+        self.assertIn(f'at="{self.repo}" ref_seq={seq}', out.getvalue())
         with redirect_stdout(io.StringIO()):
             core_cli.main(["--repo", str(self.repo), "--home", str(self.home), "brief", "--agent", "claude",
                            "--session", "self"])
@@ -1962,7 +1963,7 @@ class SignalWakeTests(ClaudeTests):
         with redirect_stdout(io.StringIO()):
             wake.bind_main(["reviewer", "--repo", str(other), "--claude-socket", str(self.inbox_path),
                             "--agent", "claude", "--session", "someone-else", "--json"], ledger=self.ledger)
-        wake.RECIPIENTS.write_text(json.dumps({"claude:claude:self": [{"checkout": str(other), "role": "reviewer"}]}))
+        wake.RECIPIENTS.write_text(json.dumps({json.dumps(["claude", "claude", "self"]): [{"checkout": str(other), "role": "reviewer"}]}))
         wake.RECIPIENTS.chmod(0o600)
         self.assertEqual("NOT BOUND", self.signal_wake()["status"])
         self.assertEqual([], self.inbox.lines)
@@ -1970,9 +1971,9 @@ class SignalWakeTests(ClaudeTests):
             core_cli.main(["--repo", str(other), "--home", str(self.other_home), "unbind", "reviewer",
                            "--agent", "claude", "--session", "someone-else"])
         for name, index, mode in (
-                ("not bound there", {"claude:claude:self": [{"checkout": str(other), "role": "reviewer"}]}, 0o600),
+                ("not bound there", {json.dumps(["claude", "claude", "self"]): [{"checkout": str(other), "role": "reviewer"}]}, 0o600),
                 ("readable by others", None, 0o644),
-                ("malformed", {"claude:claude:self": [{"checkout": "relative", "role": "reviewer"}]}, 0o600)):
+                ("malformed", {json.dumps(["claude", "claude", "self"]): [{"checkout": "relative", "role": "reviewer"}]}, 0o600)):
             with self.subTest(index=name):
                 if index is None:
                     out = io.StringIO()
@@ -1985,6 +1986,45 @@ class SignalWakeTests(ClaudeTests):
                 result = self.signal_wake()
                 self.assertEqual("NOT BOUND", result["status"], result)
                 self.assertEqual([], self.inbox.lines)
+
+    def test_a_wake_names_the_primary_checkout_that_outlives_a_linked_worktree(self):
+        # A task worktree is removed after merge; the ledger it shares, and every pointer into it, must not be.
+        other = self.other_checkout()
+        with redirect_stdout(io.StringIO()):
+            wake.bind_main(["reviewer", "--repo", str(other), "--claude-socket", str(self.inbox_path),
+                            "--agent", "claude", "--session", "self", "--json"], ledger=self.ledger)
+        linked = self.base / "task-worktree"
+        subprocess.run(["git", "-C", str(self.repo), "worktree", "add", "-q", "--detach", str(linked)],
+                       check=True, capture_output=True)
+        out = io.StringIO()
+        with redirect_stdout(out):
+            code = wake.signal_wake_main(["work.handoff", "--wake", "--repo", str(linked), "--agent", "codex",
+                                          "--session", "sol", "--target", "claude", "--target-session", "self",
+                                          "--summary", "from a worktree", "--artifact", self.ARTIFACT,
+                                          "--codex", str(self.codex), "--json"], ledger=self.ledger)
+        result = json.loads(out.getvalue())
+        self.assertEqual("DELIVERED TO INBOX", result["status"], result)
+        seq = result["signal"]["seq"]
+        self.assertIn(f"ledger sequence {seq} in {self.repo.resolve()}", b"".join(self.inbox.lines).decode())
+        self.assertNotIn(str(linked), b"".join(self.inbox.lines).decode())
+
+    def test_the_index_keeps_recent_recipients_and_sets_an_unusable_file_aside(self):
+        with mock.patch.object(wake, "_RECIPIENTS_KEPT", 3):
+            for number in range(5):
+                self.assertTrue(wake._remember(wake._recipient("claude", "claude", f"s{number}", None),
+                                               str(self.repo), "reviewer"))
+        kept = json.loads(wake.RECIPIENTS.read_text())
+        self.assertEqual([json.dumps(["claude", "claude", f"s{number}"]) for number in (2, 3, 4)], list(kept))
+        # A colon inside an identifier no longer folds two recipients into one key.
+        self.assertNotEqual(wake._recipient("claude", "a:b", "c", None), wake._recipient("claude", "a", "b:c", None))
+        wake.RECIPIENTS.chmod(0o644)
+        self.assertTrue(wake._remember(wake._recipient("claude", "claude", "new", None), str(self.repo), "reviewer"))
+        aside = sorted(self.base.glob("recipients.json.unusable-*"))
+        self.assertEqual(1, len(aside), "the unusable index is kept for inspection, not overwritten")
+        self.assertEqual(kept, json.loads(aside[0].read_text()))
+        with mock.patch.object(wake, "RECIPIENTS", None), \
+                mock.patch.dict(os.environ, {"RELAY_HOME": str(self.base / "relay-home")}):
+            self.assertEqual(self.base / "relay-home" / "wake-recipients.json", wake._recipients_path())
 
     def test_a_paused_binding_is_recorded_but_not_woken(self):
         self.bind_inbox()

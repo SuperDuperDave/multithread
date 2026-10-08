@@ -31,6 +31,7 @@ from .protocol import (
     WAKE_PROVIDERS,
     WAKE_REQUESTS,
     WAKE_TRANSPORTS,
+    wake_ref_sequence,
 )
 from .store import (
     BRIEF_DEFAULT_LIMIT,
@@ -668,7 +669,7 @@ def _dispatch_wake(store: RelayStore, args: argparse.Namespace) -> Any:
         return store.wake_history(args.role, limit=args.limit, before=args.before, ref=args.ref)
     if action == "observed":
         return {
-            "ledger": str(store.paths.repo_root),
+            "ledger": str(store.ledger_home),
             "client": args.client,
             "session": args.session,
             "observed": bool(store.observed_sessions(args.client, [args.session])),
@@ -1187,11 +1188,11 @@ def _render_brief(result: Mapping[str, Any]) -> str:
          [_brief_event_line(event) for event in result["pending_signals"]]),
         ("ratchet_items", "Actionable ratchet items:", ratchet),
     ]
-    elsewhere = [
-        f"- seq={wake['seq']} ref={_quoted(wake['ref'], 200)} role={_quoted(wake['role'], 64)} "
-        f"from={_quoted(wake['sender'], 96)}"
-        for wake in result.get("wakes_elsewhere") or []
-    ]
+    elsewhere = []
+    for wake in result.get("wakes_elsewhere") or []:
+        checkout, number = wake_ref_sequence(wake["ref"])  # the sequence survives a long path's truncation
+        elsewhere.append(f"- seq={wake['seq']} at={_quoted(checkout, 160)} ref_seq={number} "
+                         f"role={_quoted(wake['role'], 64)} from={_quoted(wake['sender'], 96)}")
     if elsewhere:  # shown only when present, so an ordinary brief stays as it was
         sections.append(("wakes_elsewhere", "Wakes pointing at another checkout's ledger (last 24 h; read and "
                          "acknowledge each there with multithread --repo <that checkout>):", elsewhere))

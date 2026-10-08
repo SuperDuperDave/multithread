@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import json
+import os
 import re
 import unicodedata
 import uuid
@@ -521,8 +522,11 @@ def canonical_wake_ref(value: Any) -> str:
     ledger:/checkout#N, a sequence in that checkout's ledger."""
 
     ref = _one_line("ref", value, 400)
+    ledger = _WAKE_LEDGER_REF_RE.fullmatch(ref)
+    if ledger and (os.path.normpath(ledger.group(1)) != ledger.group(1) or ledger.group(1).startswith("//")):
+        raise ValidationError("ledger:/checkout#N needs the checkout's normalized absolute path")
     if ref != value or not (
-        _WAKE_SEQUENCE_REF_RE.fullmatch(ref) or _WAKE_LEDGER_REF_RE.fullmatch(ref) or ref.startswith("/")
+        _WAKE_SEQUENCE_REF_RE.fullmatch(ref) or ledger or ref.startswith("/")
     ):
         raise ValidationError(
             "ref must be an absolute task-file path, a ledger sequence number or ledger:/checkout#N"

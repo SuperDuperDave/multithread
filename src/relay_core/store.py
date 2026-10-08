@@ -1302,6 +1302,13 @@ class RelayStore:
     # transport runs and concluded once afterwards, so a send whose outcome was
     # never recorded stays visible and is never repeated under the same id.
 
+    @property
+    def ledger_home(self) -> Path:
+        """The checkout that names this ledger: the primary checkout its linked worktrees share, which outlives
+        any one of them, or the worktree itself when no .git directory owns the ledger."""
+        common = self.paths.git_common_dir
+        return common.parent if common.name == ".git" else self.paths.repo_root
+
     def wake_bindings(self, role: str | None = None) -> dict[str, Any]:
         """The current binding of one role, or of every role bound here."""
 
@@ -1315,14 +1322,12 @@ class RelayStore:
                     "WHERE kind = 'wake.bound' ORDER BY target"
                 ).fetchall()
             ]
-        common = self.paths.git_common_dir
-        common_owner = common.parent if common.name == ".git" else self.paths.repo_root
         try:
-            project = canonical_wake_project(common_owner.name)
+            project = canonical_wake_project(self.ledger_home.name)
         except ValidationError:
             project = None
         return {
-            "ledger": str(self.paths.repo_root),
+            "ledger": str(self.ledger_home),
             "project": project,
             "bindings": [self._wake_state(item) for item in roles],
         }
@@ -1705,7 +1710,7 @@ class RelayStore:
                 "wake recipient binding changed; inspect the current role binding before sending"
             )
         decision: dict[str, Any] = {
-            "ledger": str(self.paths.repo_root),
+            "ledger": str(self.ledger_home),
             "role": role,
             "ref": ref,
             "requested": requested,
@@ -1818,7 +1823,7 @@ class RelayStore:
         rows = self._execute(f"SELECT * FROM events WHERE {where} ORDER BY seq DESC LIMIT ?",
                              (*params, limit + 1)).fetchall()
         attempts = [self._wake_attempt(row) for row in rows[:limit]]
-        return {"ledger": str(self.paths.repo_root), "binding": self._wake_state(role),
+        return {"ledger": str(self.ledger_home), "binding": self._wake_state(role),
                 "attempts": attempts, "has_more": len(rows) > limit,
                 "next_before": attempts[-1]["seq"] if attempts else None}
 
