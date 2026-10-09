@@ -375,24 +375,38 @@ class CodexProtocolTests(unittest.TestCase):
                          result["provider_plugins"])
         methods = [row["method"] for row in self.recorded_requests()]
         self.assertLess(methods.index("mcpServerStatus/list"), methods.index("turn/start"))
-        # Each opt-in admits only its own kind; anything else stops the call before its task.
+        # Each opt-in admits only its own kind; anything else stops the call before its task, and the next step names
+        # an opt-in only where one would admit the server.
+        spoof = {"name": "codex_apps", "pluginId": "spoof@fixture"}
+        plugins_hint, apps_hint, none_hint = "pass --allow-plugins", "pass --allow-apps", "no option admits"
         cases = [
-            ((), [apps], "codex_apps"), ((), [plugin], "zoning-signal"), ((), [configured], "notes"),
-            (("--allow-plugins",), [apps, plugin], "codex_apps"),          # plugins don't bring the apps back
-            (("--allow-plugins",), [configured], "notes"),
-            (("--allow-apps",), [plugin], "zoning-signal"),
-            (("--allow-apps",), [{"name": "codex_apps", "pluginId": "spoof@fixture"}], "codex_apps"),
-            (("--allow-plugins", "--allow-apps"), [apps, plugin, configured], "notes"),
+            ((), [apps], "codex_apps", apps_hint), ((), [plugin], "zoning-signal", plugins_hint),
+            ((), [configured], "notes", none_hint),
+            (("--allow-plugins",), [apps, plugin], "codex_apps", apps_hint),   # plugins don't bring the apps back
+            (("--allow-plugins",), [configured], "notes", none_hint),
+            (("--allow-apps",), [plugin], "zoning-signal", plugins_hint),
+            # The apps' server name is reserved: a plugin can't take it, under any opt-in.
+            (("--allow-apps",), [spoof], "codex_apps", none_hint),
+            (("--allow-plugins",), [spoof], "codex_apps", none_hint),
+            (("--allow-plugins", "--allow-apps"), [spoof], "codex_apps", none_hint),
+            (("--allow-plugins", "--allow-apps"), [apps, plugin, configured], "notes", none_hint),
+            # Malformed identities never prove a kind.
+            (("--allow-plugins",), [{"name": "notes", "pluginId": 0}], "notes", none_hint),
+            (("--allow-plugins",), [{"name": "notes", "pluginId": ""}], "notes", none_hint),
+            (("--allow-plugins",), [{"name": "", "pluginId": "x@fixture"}], "(unprintable)", none_hint),
+            # Names must be unique: later activity is known only by name.
+            (("--allow-plugins",), [plugin, dict(plugin, pluginId="other@fixture")], "zoning-signal", none_hint),
         ]
-        for extra, servers, shown in cases:
-            with self.subTest(extra=extra, shown=shown):
+        for extra, servers, shown, hint in cases:
+            with self.subTest(extra=extra, servers=servers):
                 self.configure(mcp_pages=[servers])
                 code, result, _ = self.invoke(*extra)
                 self.assertNotEqual(0, code)
                 self.assertEqual("not_submitted", result["task_submission"])
                 self.assertNotIn("turn/start", [row["method"] for row in self.recorded_requests()])
-                self.assertIn(f"MCP server(s) this call didn't allow ({shown})", result["message"])
-                self.assertIn("--allow-apps", result["message"])
+                self.assertIn(f"this call didn't allow ({shown}", result["message"])
+                self.assertIn(hint, result["message"])
+                self.assertFalse(result["provider_plugins"]["apps"] and spoof in servers)
         # Plugins allowed: apps stay off and are still confirmed off; plugin servers run and are attributed.
         self.configure(mcp_pages=[[plugin]])
         code, result, _ = self.invoke("--allow-plugins")
@@ -537,6 +551,19 @@ class CodexProtocolTests(unittest.TestCase):
         self.configure(mcp_pages=[[plugin]], before_mcp_response=[activity()], events=[activity(), item(), completed()])
         code, result, _ = self.invoke("--allow-plugins")
         self.assertEqual(0, code, result)
+        # Identity is the exact name: a long name sharing an admitted one's display label is still a stranger.
+        long_plugin = {"name": "x" * 100 + "-plugin", "pluginId": "long@fixture"}
+        twin = {"method": "mcpServer/startupStatus/updated", "params": {"name": "x" * 100 + "-other", "status": "starting"}}
+        self.configure(mcp_pages=[[long_plugin]], events=[twin, item(), completed()])
+        code, result, _ = self.invoke("--allow-plugins")
+        self.assertNotEqual(0, code)
+        self.assertIn("for a server this call didn't allow", result["message"])
+        # Activity held before a list that then fails is still reported.
+        self.configure(mcp_error=True, before_mcp_response=[activity()])
+        code, result, _ = self.invoke("--allow-plugins")
+        self.assertNotEqual(0, code)
+        self.assertIn("Codex also reported activity before the list (late: starting)", result["message"])
+        self.assertEqual(["late: starting"], result["provider_plugins"]["activity_before_list"])
         stray = {"method": "mcpServer/startupStatus/updated", "params": {"name": "stray", "status": "starting"}}
         for spec in (dict(before_mcp_response=[stray]), dict(events=[stray, item(), completed()])):
             with self.subTest(spec=list(spec)):
