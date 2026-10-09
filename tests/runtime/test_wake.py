@@ -131,7 +131,7 @@ class FakeDaemon:
         self.threads = {}  # id -> {"cwd", "status", "turns"}
         self.steer = "accept"  # a key of STEER_REPLIES, or hang | close
         self.read_mode = "accept"  # metadata only: hang | close | traffic | trickle
-        self.traffic_ends = []  # per traffic/trickle read: True when the client left while traffic still flowed
+        self.traffic_ends = []  # per traffic/trickle read: seconds until the client left, or None if it outstayed it
         self.requests = []
         self.connections = 0
         self.server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -186,6 +186,7 @@ class FakeDaemon:
                     reply = self.answer(message)
                     if reply in ("traffic", "trickle"):
                         # Far longer than any readiness deadline: a client that honours its deadline leaves first.
+                        began = time.monotonic()
                         try:
                             if reply == "traffic":
                                 deadline = time.monotonic() + 5
@@ -201,9 +202,9 @@ class FakeDaemon:
                                     connection.sendall(bytes([byte]))
                                     time.sleep(0.01)
                         except OSError:
-                            self.traffic_ends.append(True)
+                            self.traffic_ends.append(time.monotonic() - began)
                             return
-                        self.traffic_ends.append(False)
+                        self.traffic_ends.append(None)
                         return
                     if reply == "close":
                         return
@@ -1189,12 +1190,16 @@ class QueuedReadinessTests(WakeCase):
                 before = len(self.daemon.methods())
                 with mock.patch.object(wake, "_READINESS_TIMEOUT", 0.08):
                     result = self.wake("--id", "stream-" + str(index))
-                # Ordering, not wall time: the read ends while the fixture still supplies traffic.
+                # Timed by the fixture from the read request to the client leaving, so the queue call after the
+                # read (slow under load) is not counted: traffic must not carry the 0.08 s deadline anywhere near
+                # the fixture's 5 s of traffic.
                 waited = time.monotonic() + 10
                 while len(self.daemon.traffic_ends) <= index and time.monotonic() < waited:
                     time.sleep(0.01)
-                self.assertEqual([True], self.daemon.traffic_ends[index:],
-                                 "The read must end while the fixture still supplies traffic")
+                left = self.daemon.traffic_ends[index:]
+                self.assertEqual(1, len(left), "The read must end while the fixture still supplies traffic")
+                self.assertIsNotNone(left[0], "The read must end while the fixture still supplies traffic")
+                self.assertLess(left[0], 0.5, "Traffic must not extend the readiness deadline")
                 self.assertEqual("QUEUED", result["status"])
                 self.assertEqual("unknown", result["recipient_runtime"]["status"])
                 self.assertEqual(index + 1, len(self.codex_calls()))
