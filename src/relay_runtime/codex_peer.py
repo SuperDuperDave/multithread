@@ -32,6 +32,7 @@ _MAX_LISTING = 1024 * 1024
 _MODEL_LIST_PAGES = 32
 _MODEL_LIST_SECONDS = 10
 _MCP_STATUS_PAGES = 5  # bounded: what runs is listed before the task, not browsed
+_FEATURE_PAGES = 5  # Codex 0.161 lists its 160 features in one page
 # Child threads are always off for a peer; plugins and apps unless the call allows them. Codex's own per-thread
 # feature list must confirm each before the task goes out.
 _ALWAYS_OFF = ("multi_agent", "multi_agent_v2")
@@ -464,16 +465,22 @@ class _Driver:
         unconfirmed stops the call with no task submitted."""
         page = result.get("data") if isinstance(result, dict) else None
         cursor = result.get("nextCursor") if isinstance(result, dict) else None
-        if (isinstance(page, list) and all(isinstance(feature, dict) for feature in page)
-                and (cursor is None or isinstance(cursor, str) and bool(cursor))):
-            self.features.update((feature.get("name"), feature.get("enabled")) for feature in page
-                                 if isinstance(feature.get("name"), str))
-            if cursor is not None and self.feature_pages < _MCP_STATUS_PAGES:
+        readable = (isinstance(page, list) and all(isinstance(feature, dict) for feature in page)
+                    and (cursor is None or isinstance(cursor, str) and bool(cursor)))
+        if readable:
+            for feature in page:
+                name, enabled = feature.get("name"), feature.get("enabled")
+                if isinstance(name, str):
+                    # A name listed twice with different values confirms nothing.
+                    self.features[name] = enabled if self.features.get(name, enabled) == enabled else None
+            if cursor is not None and self.feature_pages < _FEATURE_PAGES:
                 return self.list_features(cursor)
         off = _ALWAYS_OFF + (_PLUGINS_OFF if self.envelope["provider_plugins"].get("mode") == "off" else ())
         state = {name: self.features.get(name) for name in off}
         self.envelope["provider_features"] = state
-        unconfirmed = [name for name, enabled in state.items() if enabled is not False]
+        # Only a list read to its end confirms anything: a later page could still turn a feature on.
+        complete = readable and cursor is None
+        unconfirmed = [name for name, enabled in state.items() if enabled is not False or not complete]
         if unconfirmed:
             raise _ProtocolError(
                 f"Codex didn't confirm that {', '.join(unconfirmed)} {'is' if len(unconfirmed) == 1 else 'are'} off for "

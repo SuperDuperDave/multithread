@@ -168,14 +168,20 @@ while True:
         send_result(message, {})
     elif method == 'experimentalFeature/list':
         # A feature is off when this server's own argv turned it off, unless the fixture ignores that flag.
-        if spec.get('features_error'):
+        cursor = message['params'].get('cursor')
+        if spec.get('features_error') or (cursor and spec.get('features_later') == 'error'):
             emit({'id': message['id'], 'error': {'code': -32601, 'message': 'fixture: no such method'}})
+        elif cursor and spec.get('features_later') == 'malformed':
+            emit({'id': message['id'], 'result': {'data': 'not a list'}})
         else:
             names = ('multi_agent', 'multi_agent_v2', 'plugins', 'apps', 'fixture_other')
             emit({'id': message['id'], 'result': {'data': [
                 {'name': name, 'stage': 'stable', 'defaultEnabled': True,
                  'enabled': f'features.{name}=false' not in sys.argv or name in spec.get('features_ignored', [])}
-                for name in names if name not in spec.get('features_absent', [])], 'nextCursor': None}})
+                for name in names if name not in spec.get('features_absent', [])]
+                + [{'name': name, 'stage': 'stable', 'defaultEnabled': True, 'enabled': value}
+                   for name, value in spec.get('features_extra', [])],
+                'nextCursor': str(int(cursor or 0) + 1) if spec.get('features_later') else None}})
     elif method == 'mcpServerStatus/list':
         for event in spec.get('before_mcp_response', []):
             emit(event)
@@ -392,6 +398,12 @@ class CodexProtocolTests(unittest.TestCase):
             "apps is": (dict(features_ignored=["apps"]), ()),
             "multi_agent_v2 is": (dict(features_absent=["multi_agent_v2"]), ()),
             "multi_agent, multi_agent_v2, plugins, apps are": (dict(features_error=True), ()),
+            # Listed twice, once on: the later "off" doesn't erase it.
+            "multi_agent is  ": (dict(features_extra=[("multi_agent", True), ("multi_agent", False)]), ()),
+            # Every feature reads off on page 1, but the list isn't read to its end.
+            "multi_agent, multi_agent_v2, plugins, apps are ": (dict(features_later="error"), ()),
+            "multi_agent, multi_agent_v2, plugins, apps are  ": (dict(features_later="malformed"), ()),
+            "multi_agent, multi_agent_v2, plugins, apps are   ": (dict(features_later="endless"), ()),
             # Allowing plugins never allows child threads.
             "multi_agent is ": (dict(features_ignored=["multi_agent"]), ("--allow-plugins",)),
         }
