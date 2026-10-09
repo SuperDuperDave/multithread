@@ -155,12 +155,27 @@ while True:
                 response = receive()
                 if response.get('id') != event['id']:
                     raise SystemExit('response routed to wrong server request')
+        if spec.get('later_events'):
+            # Sent after the turn, in a separate read, while the server stays up.
+            time.sleep(0.5)
+            for event in spec['later_events']:
+                emit(event)
         if spec.get('sleep'):
             time.sleep(20)
         if spec.get('exit_after_events', True):
             raise SystemExit(spec.get('exit', 0))
     elif method == 'turn/interrupt':
         send_result(message, {})
+    elif method == 'experimentalFeature/list':
+        # A feature is off when this server's own argv turned it off, unless the fixture ignores that flag.
+        if spec.get('features_error'):
+            emit({'id': message['id'], 'error': {'code': -32601, 'message': 'fixture: no such method'}})
+        else:
+            names = ('multi_agent', 'multi_agent_v2', 'plugins', 'apps', 'fixture_other')
+            emit({'id': message['id'], 'result': {'data': [
+                {'name': name, 'stage': 'stable', 'defaultEnabled': True,
+                 'enabled': f'features.{name}=false' not in sys.argv or name in spec.get('features_ignored', [])}
+                for name in names if name not in spec.get('features_absent', [])], 'nextCursor': None}})
     elif method == 'mcpServerStatus/list':
         for event in spec.get('before_mcp_response', []):
             emit(event)
@@ -336,8 +351,11 @@ class CodexProtocolTests(unittest.TestCase):
         code, result, _ = self.invoke()
         self.assertEqual(0, code, result)
         argv = self.calls_argv(result)
-        self.assertEqual(["-c", "features.plugins=false", "-c", "features.apps=false"],
-                         argv[argv.index("app-server") - 4:argv.index("app-server")])
+        self.assertEqual(["-c", "features.multi_agent=false", "-c", "features.multi_agent_v2=false",
+                          "-c", "features.plugins=false", "-c", "features.apps=false"],
+                         argv[argv.index("app-server") - 8:argv.index("app-server")])
+        self.assertEqual({"multi_agent": False, "multi_agent_v2": False, "plugins": False, "apps": False},
+                         result["provider_features"])
         self.assertEqual({"mode": "off", "mcp_servers": [], "server_count": 0, "plugin_servers": [], "apps": False,
                           "source": "codex_mcp_server_status", "complete": True}, result["provider_plugins"])
         methods = [row["method"] for row in self.recorded_requests()]
@@ -359,11 +377,36 @@ class CodexProtocolTests(unittest.TestCase):
         self.assertEqual(0, code, result)
         self.assertNotIn("features.plugins=false", self.calls_argv(result))
         self.assertNotIn("features.apps=false", self.calls_argv(result))
+        # Child threads stay off even then; only they are confirmed.
+        self.assertIn("features.multi_agent=false", self.calls_argv(result))
+        self.assertEqual({"multi_agent": False, "multi_agent_v2": False}, result["provider_features"])
         self.assertEqual({"mode": "allowed", "mcp_servers": ["codex_apps", "zoning-signal"], "server_count": 2,
                           "plugin_servers": [{"name": "zoning-signal", "plugin": "zoning-signal@fixture"}],
                           "apps": True, "source": "codex_mcp_server_status", "complete": True},
                          result["provider_plugins"])
         self.assertIn("--allow-plugins", result["follow_up_preparation"]["argv_prefix"])
+
+    def test_codex_must_confirm_each_feature_is_off_for_the_thread_before_the_task(self):
+        cases = {
+            "multi_agent is": (dict(features_ignored=["multi_agent"]), ()),
+            "apps is": (dict(features_ignored=["apps"]), ()),
+            "multi_agent_v2 is": (dict(features_absent=["multi_agent_v2"]), ()),
+            "multi_agent, multi_agent_v2, plugins, apps are": (dict(features_error=True), ()),
+            # Allowing plugins never allows child threads.
+            "multi_agent is ": (dict(features_ignored=["multi_agent"]), ("--allow-plugins",)),
+        }
+        for unconfirmed, (spec, extra) in cases.items():
+            with self.subTest(unconfirmed):
+                self.configure(**spec)
+                code, result, _ = self.invoke(*extra)
+                self.assertNotEqual(0, code)
+                self.assertEqual("not_submitted", result["task_submission"])
+                self.assertNotIn("turn/start", [row["method"] for row in self.recorded_requests()])
+                self.assertIn(f"didn't confirm that {unconfirmed.strip()} off for this thread", result["message"])
+        # Allowed, plugins and apps aren't required to be off.
+        self.configure(features_ignored=["plugins", "apps"])
+        code, result, _ = self.invoke("--allow-plugins")
+        self.assertEqual(0, code, result)
 
     def test_with_plugins_off_a_list_that_cannot_be_read_to_its_end_stops_the_call(self):
         plugin = {"name": "zoning-signal", "pluginId": "zoning-signal@fixture"}
@@ -418,6 +461,9 @@ class CodexProtocolTests(unittest.TestCase):
             # After the answer and completion: the answer is withdrawn, not kept.
             "after completion": (dict(events=[item(), completed(), activity(THREAD)]), "late: starting",
                                  "Codex had already accepted its task"),
+            # Read while the server shuts down after the turn: still stopped at once, and the answer withdrawn.
+            "during shutdown": (dict(later_events=[activity()], exit_after_events=False, sleep=True),
+                                "late: starting", "Codex had already accepted its task"),
             # A provider that keeps working is stopped at once, not after a shutdown grace.
             "while the turn keeps running": (dict(events=[activity()], exit_after_events=False, sleep=True),
                                              "late: starting", "Codex had already accepted its task"),
@@ -455,6 +501,7 @@ class CodexProtocolTests(unittest.TestCase):
         self.assertEqual(0, code, dry)
         self.assertIn("features.plugins=false", dry["argv"])
         self.assertIn("features.apps=false", dry["argv"])
+        self.assertIn("features.multi_agent=false", dry["argv"])
         self.assertEqual(("off", "not_observed"), (dry["provider_plugins"]["mode"], dry["provider_plugins"]["source"]))
         with redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit):
             peer.peer_main(["claude", "--repo", str(self.repo), "--task-file", str(self.task), "--allow-plugins"])
@@ -479,15 +526,15 @@ class CodexProtocolTests(unittest.TestCase):
         self.assertEqual("not_checked", result["relay_acknowledgement"])
         self.assertEqual("not_checked", result["workflow_completion"])
         receipt = json.loads(self.receipt.read_text())
-        self.assertEqual([str(self.provider), *self.native_arguments, *self.confinement(result), "-c", "features.plugins=false", "-c", "features.apps=false", "app-server", "--listen", "stdio://"], receipt["argv"])
+        self.assertEqual([str(self.provider), *self.native_arguments, *self.confinement(result), "-c", "features.multi_agent=false", "-c", "features.multi_agent_v2=false", "-c", "features.plugins=false", "-c", "features.apps=false", "app-server", "--listen", "stdio://"], receipt["argv"])
         self.assertEqual(self.environment, receipt["env"])
         self.assertEqual(str(self.repo), receipt["cwd"])
         requests = self.recorded_requests()
-        self.assertEqual(["initialize", "initialized", "hooks/list", "thread/start", "mcpServerStatus/list", "turn/start"],
+        self.assertEqual(["initialize", "initialized", "hooks/list", "thread/start", "experimentalFeature/list", "mcpServerStatus/list", "turn/start"],
                          [request["method"] for request in requests])
         self.assertEqual(str(self.repo), requests[3]["params"]["cwd"])
         self.assertEqual(THREAD, requests[5]["params"]["threadId"])
-        self.assertEqual(self.task.read_text(), requests[5]["params"]["input"][0]["text"])
+        self.assertEqual(self.task.read_text(), requests[6]["params"]["input"][0]["text"])
         self.assertEqual('ready', result['hook_readiness']['state'])
         for request in requests:
             self.assertFalse({"sandbox", "sandboxPolicy", "approvalPolicy", "approvalsReviewer", "model",
@@ -568,7 +615,7 @@ class CodexProtocolTests(unittest.TestCase):
                 requests = self.recorded_requests()
                 # The listed model advertises the effort, checked before any thread opens.
                 self.assertEqual(["initialize", "initialized", "hooks/list", "model/list",
-                                  "thread/resume" if resume else "thread/start", "mcpServerStatus/list", "turn/start"],
+                                  "thread/resume" if resume else "thread/start", "experimentalFeature/list", "mcpServerStatus/list", "turn/start"],
                                  [row["method"] for row in requests])
                 self.assertEqual({"includeHidden": True}, requests[3]["params"])
                 self.assertEqual(checked("verified", MODEL, "requested", EFFORT, "requested",
@@ -816,7 +863,7 @@ class CodexProtocolTests(unittest.TestCase):
         self.assertEqual((MODEL, EFFORT, "unknown"),
                          (dry["requested_model"], dry["requested_effort"], dry["effective_effort"]))
         # Both settings travel in the turn request, never as native arguments.
-        self.assertEqual([str(self.provider), *self.native_arguments, *self.confinement(dry), "-c", "features.plugins=false", "-c", "features.apps=false", "app-server", "--listen", "stdio://"],
+        self.assertEqual([str(self.provider), *self.native_arguments, *self.confinement(dry), "-c", "features.multi_agent=false", "-c", "features.multi_agent_v2=false", "-c", "features.plugins=false", "-c", "features.apps=false", "app-server", "--listen", "stdio://"],
                          dry["argv"])
         self.assertFalse(self.calls.exists())
         # Claude keeps its own list; neither provider takes an option-like or spaced name.
@@ -967,7 +1014,7 @@ class CodexProtocolTests(unittest.TestCase):
             self.assertEqual("ready", result["hook_readiness"]["state"])
             receipt = json.loads(self.receipt.read_text())
             # No invocation copy beside the user hooks: each event runs once.
-            self.assertEqual([str(self.provider), *self.confinement(result), "-c", "features.plugins=false", "-c", "features.apps=false", "app-server", "--listen", "stdio://"], receipt["argv"])
+            self.assertEqual([str(self.provider), *self.confinement(result), "-c", "features.multi_agent=false", "-c", "features.multi_agent_v2=false", "-c", "features.plugins=false", "-c", "features.apps=false", "app-server", "--listen", "stdio://"], receipt["argv"])
             self.configure(hook_updates={**user, "trustStatus": "untrusted"})
             code, result, _ = self.invoke()
             self.assertNotEqual(0, code)
@@ -1678,8 +1725,8 @@ class CodexProtocolTests(unittest.TestCase):
         self.assertEqual(0, code, result)
         self.assertEqual("hidden", result["read_scope"]["project_instructions"])
         argv = json.loads(self.receipt.read_text())["argv"]
-        self.assertEqual(["-c", "project_doc_max_bytes=0", "-c", "features.plugins=false", "-c", "features.apps=false", "app-server"],
-                         argv[argv.index("app-server") - 6:][:7])
+        self.assertEqual(["-c", "project_doc_max_bytes=0", "-c", "features.multi_agent=false", "-c", "features.multi_agent_v2=false", "-c", "features.plugins=false", "-c", "features.apps=false", "app-server"],
+                         argv[argv.index("app-server") - 10:][:11])
         (self.repo / "AGENTS.md").unlink()
         (self.repo / "AGENTS.md").write_text("public guidance\n")
         code, result, _ = self.invoke()

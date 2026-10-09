@@ -133,6 +133,8 @@ else:
             hook('SessionStart')
             result = {'thread':{'id':session, 'cwd':os.getcwd(), 'turns':[]}, 'cwd':os.getcwd()}
         elif method == 'mcpServerStatus/list': result = {'data':[], 'nextCursor':None}
+        elif method == 'experimentalFeature/list':
+            result = {'data':[{'name':n, 'enabled':False} for n in ('multi_agent', 'multi_agent_v2', 'plugins', 'apps')], 'nextCursor':None}
         elif method == 'turn/start':
             hook('UserPromptSubmit')
             emit({'id':message['id'], 'result':{'turn':{'id':turn, 'status':'inProgress', 'items':[]}}})

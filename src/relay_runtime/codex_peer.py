@@ -32,6 +32,10 @@ _MAX_LISTING = 1024 * 1024
 _MODEL_LIST_PAGES = 32
 _MODEL_LIST_SECONDS = 10
 _MCP_STATUS_PAGES = 5  # bounded: what runs is listed before the task, not browsed
+# Child threads are always off for a peer; plugins and apps unless the call allows them. Codex's own per-thread
+# feature list must confirm each before the task goes out.
+_ALWAYS_OFF = ("multi_agent", "multi_agent_v2")
+_PLUGINS_OFF = ("plugins", "apps")
 _APPS_SERVER = "codex_apps"  # Codex's one server for the account's ChatGPT apps (connectors); it has no pluginId
 # Where a setting the call does not request comes from: Codex keeps a thread's settings.
 _KEPT = {"new_thread": "the new thread's configured", "resumed_thread": "this thread's current"}
@@ -368,7 +372,8 @@ class _Driver:
         self.waiting_turn = None
         self.mcp_pages = 0
         self.mcp_read = 0
-        self.breached = False
+        self.feature_pages = 0
+        self.features = {}
         self.mcp_servers = []
         self.envelope.update(state="uncertain", requested_session_id=resume,
                              needs_attention=True, task_submission="not_submitted")
@@ -449,6 +454,33 @@ class _Driver:
         if status == "refused":
             raise _ProtocolError(_settings_refusal(model, model_source, effort, effort_source, efforts))
 
+    def list_features(self, cursor):
+        self.feature_pages += 1
+        self.request("experimentalFeature/list", {"threadId": self.session, "limit": 200,
+                                                  **({"cursor": cursor} if cursor is not None else {})})
+
+    def features_listed(self, result):
+        """Confirm, from Codex's own view of this thread, that the features this call turns off are off; anything
+        unconfirmed stops the call with no task submitted."""
+        page = result.get("data") if isinstance(result, dict) else None
+        cursor = result.get("nextCursor") if isinstance(result, dict) else None
+        if (isinstance(page, list) and all(isinstance(feature, dict) for feature in page)
+                and (cursor is None or isinstance(cursor, str) and bool(cursor))):
+            self.features.update((feature.get("name"), feature.get("enabled")) for feature in page
+                                 if isinstance(feature.get("name"), str))
+            if cursor is not None and self.feature_pages < _MCP_STATUS_PAGES:
+                return self.list_features(cursor)
+        off = _ALWAYS_OFF + (_PLUGINS_OFF if self.envelope["provider_plugins"].get("mode") == "off" else ())
+        state = {name: self.features.get(name) for name in off}
+        self.envelope["provider_features"] = state
+        unconfirmed = [name for name, enabled in state.items() if enabled is not False]
+        if unconfirmed:
+            raise _ProtocolError(
+                f"Codex didn't confirm that {', '.join(unconfirmed)} {'is' if len(unconfirmed) == 1 else 'are'} off for "
+                "this thread, which this call requires; no task was submitted. Next: check the Codex version and "
+                "configuration, or inspect retained output.")
+        self.list_mcp(None)
+
     def list_mcp(self, cursor):
         self.mcp_pages += 1
         self.request("mcpServerStatus/list", {"threadId": self.session, "detail": "toolsAndAuthOnly", "limit": 100,
@@ -505,8 +537,14 @@ class _Driver:
         submitted = {"requested": "its task may already have been sent",
                      "accepted": "Codex had already accepted its task"}.get(self.envelope.get("task_submission"),
                                                                             "no task was submitted")
-        self.breached = True
         self.envelope.update(state="uncertain", result=None)
+        # A boundary the call set was crossed: no grace for work still running in the call's own process group,
+        # wherever this is read, during the turn or while its server shuts down. A reaped leader is left to cleanup.
+        if self.process.returncode is None:
+            try:
+                os.killpg(self.process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
         raise _ProtocolError(
             f"Codex reported MCP server activity ({_label(params.get('name'))}: {_label(params.get('status'))}) "
             f"although this call turned plugins and apps off; the call was ended and {submitted}. Next: pass "
@@ -621,6 +659,10 @@ class _Driver:
             self.pending.pop(identifier)
             self.listed(None if "error" in message else message.get("result"))
             return
+        if method == "experimentalFeature/list":
+            self.pending.pop(identifier)
+            self.features_listed(None if "error" in message else message.get("result"))
+            return
         if method == "mcpServerStatus/list":
             # A Codex without this listing leaves what runs unobserved (not "none"); with plugins off that refuses.
             self.pending.pop(identifier)
@@ -704,7 +746,7 @@ class _Driver:
             turn = {"threadId": self.session, "input": [{"type": "text", "text": self.task}]}
             turn.update((key, value) for key, value in requested.items() if value is not None)
             self.waiting_turn = turn
-            self.list_mcp(None)  # what runs is observed before any task goes out
+            self.list_features(None)  # what the thread may do is confirmed before any task goes out
         elif method == "turn/start":
             turn = self.validate_turn(result.get("turn"))
             self.turn = turn["id"]
@@ -1021,12 +1063,6 @@ def run(process, task: bytes, repo: str, resume: str | None, directory: Path,
             driver.close_stdin()
             driver.finish()
     except _ProtocolError as exc:
-        if driver.breached:
-            # A boundary the call set was crossed: no grace for the turn still running in the owned group.
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
         observation.fault(str(exc))
     except (subprocess.TimeoutExpired, OSError, KeyboardInterrupt):
         driver.problem("Native observation was interrupted or unavailable; preserve partial work and inspect evidence before retrying.")

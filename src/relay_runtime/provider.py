@@ -1483,7 +1483,8 @@ def peer_main(argv=None, *, report_entry=None):
     parser.add_argument("--allow-plugins", action="store_true",
                         help="Codex only: let the account's Codex plugins, ChatGPT apps (connectors) and MCP servers run "
                              "in this call. By default plugins and apps are off, the thread's MCP servers are listed before "
-                             "its task is sent, and any server, or a list that can't be read to its end, stops the call")
+                             "its task is sent, and any server, or a list that can't be read to its end, stops the call. Child threads "
+                             "stay off either way")
     parser.add_argument("--attach", action="append", default=[], metavar="IMAGE",
                         help="Claude only: attach a PNG, JPEG, GIF or WebP file to the task as an image; repeatable "
                              f"(at most {_MAX_ATTACHMENTS}, {_MAX_ATTACHMENT // (1024 * 1024)} MiB each, {_MAX_ATTACHMENTS_TOTAL // (1024 * 1024)} MiB in total)")
@@ -1656,9 +1657,10 @@ def _run_peer(args, interruption):
                                       "ignored_links": scope["linked"],
                                       "project_instructions": scope["project_instructions"],
                                       "verified": "not_checked"}
-            # Plugins and apps stay off unless asked for: what a peer can call is what this call names. The thread's
-            # MCP servers are listed before its task goes out, and with them off it must run none.
-            plugins = [] if args.allow_plugins else ["-c", "features.plugins=false", "-c", "features.apps=false"]
+            # A peer starts no child threads, and plugins and apps stay off unless asked for: what a peer can call is
+            # what this call names. Codex confirms each for the thread, and lists its MCP servers, before the task.
+            plugins = ["-c", "features.multi_agent=false", "-c", "features.multi_agent_v2=false",
+                       *([] if args.allow_plugins else ["-c", "features.plugins=false", "-c", "features.apps=false"])]
             envelope["provider_plugins"] = {"mode": "allowed" if args.allow_plugins else "off",
                                             "mcp_servers": None, "plugin_servers": None, "source": "not_observed"}
             native = [*plan["argv"], *confinement, *plugins, "app-server", "--listen", "stdio://"]
