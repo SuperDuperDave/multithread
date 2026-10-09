@@ -1458,20 +1458,22 @@ class RelayStore:
         if approval_ref is None or not approval_ref.startswith("receipt:"):
             return None
         target = approval_ref.removeprefix("receipt:")
-        if not target.isascii() or not target.isdigit():
+        response = ("Nothing was recorded. Name the decision response itself, the decision.responded event that "
+                    "multithread decision respond recorded, as receipt:<its seq>")
+        if not target.isascii() or not target.isdigit() or target != str(int(target)):
             raise ValidationError(
-                f"--approval-ref {approval_ref} can't be resolved: a receipt approval names the ledger sequence of a "
-                "decision response here, as receipt:<seq>"
+                f"--approval-ref {approval_ref} isn't receipt:<ledger seq> written plainly (no sign or leading "
+                f"zero). {response}"
             )
         row = self._execute("SELECT * FROM events WHERE seq = ?", (int(target),)).fetchone()
         if row is None:
-            raise ValidationError(f"--approval-ref {approval_ref} names no event in this ledger")
+            raise ValidationError(f"--approval-ref {approval_ref} names no event in this ledger. {response}")
         meta = json.loads(row["meta_json"])
         if row["kind"] != "decision.responded" or meta.get("resolution") not in ("choice", "directive"):
             found = row["kind"] + (f" ({meta.get('resolution')})" if row["kind"] == "decision.responded" else "")
             raise ValidationError(
                 f"--approval-ref {approval_ref} is a {found}, not an answered decision: a receipt approval must be a "
-                "decision.responded whose resolution is choice or directive"
+                f"decision.responded whose resolution is choice or directive. {response}"
             )
         return {"ref": approval_ref, "kind": row["kind"], "source": f"{row['agent']}:{row['session']}",
                 "at": row["recorded_at"], "decision_id": meta["decision_id"], "resolution": meta["resolution"],
@@ -1822,7 +1824,7 @@ class RelayStore:
             "ORDER BY seq DESC LIMIT 1",
             (role,),
         ).fetchone()
-        last = latest
+        last = latest if binding is not None else None  # an unbound role's wakes belong to no current binding
         if binding is not None and latest is not None and \
                 json.loads(latest["meta_json"])["generation"] != binding["generation"]:
             # A binding's last wake is its own: one sent to a replaced binding went to someone else.

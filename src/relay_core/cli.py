@@ -722,6 +722,10 @@ def _wake_sender(args: argparse.Namespace) -> dict[str, Any] | None:
 
 def describe_approval(approval: Mapping[str, Any]) -> str:
     """What an approval reference rests on, for a reader to judge: integrity and kind were checked, not who."""
+    return _approval_basis(approval) + " (checked: it exists and is this kind; not who approved)"
+
+
+def _approval_basis(approval: Mapping[str, Any]) -> str:
     kind = approval["kind"]
     if kind == "decision.responded":
         answer = approval["resolution"] + (f" {approval['choice']}" if approval.get("choice") else "")

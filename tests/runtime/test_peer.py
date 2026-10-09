@@ -1270,6 +1270,7 @@ class PeerTests(unittest.TestCase):
             self.assertNotEqual(0, code)
             self.assertEqual(("unavailable", False), (result["state"], result["provider_started"]))
             self.assertIn("Managed Claude settings were found (/etc/claude-code)", result["message"])
+            self.assertIn("Call without --tools for an unrestricted peer", result["message"], "a next step")
             code, _, _ = self.invoke("--dry-run")
             self.assertEqual(0, code, "an unrestricted call is unaffected")
             self.assertEqual(1, found.call_count)

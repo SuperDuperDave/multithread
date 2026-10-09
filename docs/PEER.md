@@ -484,8 +484,9 @@ sender role. If several roles match, `--sender-role reviewer` selects one and
 requires that exact source binding before recording or sending.
 
 Automatic lookup keeps the plain header when the sender is unbound, ambiguous
-or unavailable. JSON distinguishes those states through `sender_state`; an
-unavailable source is never reported as an empty ledger. A safe project label
+or unavailable, or when a dry run was given no identity. JSON distinguishes
+those states through `sender_state` (`not_given` for the last); an unavailable
+source is never reported as an empty ledger. A safe project label
 comes from the shared checkout's directory name, so linked worktrees use the
 same label. Other directory names produce role-only context. The original
 attempt retains the source ledger, role, generation and nullable project under

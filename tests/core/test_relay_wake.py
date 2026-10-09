@@ -309,6 +309,15 @@ class WakeSenderLedgerTests(WakeLedgerCase):
         shown["sender"]["project"] = "changed-query"
         self.assertEqual(original, self.store.wake_history("operator")["attempts"][0]["sender"])
 
+    def test_an_unbound_roles_last_wake_is_earlier_not_its_own(self):
+        self.bind()
+        begun = self.send(None)
+        self.store.wake_control("unbind", "operator", agent="claude", session="binder")
+        shown = self.store.wake_bindings("operator")["bindings"][0]
+        self.assertEqual("unbound", shown["state"])
+        self.assertIsNone(shown["last_attempt"], "no current binding owns a wake")
+        self.assertEqual(begun["attempt_seq"], shown["earlier_attempt"]["seq"])
+
     def test_sender_omission_keeps_legacy_attempt_and_decision_shapes(self):
         self.bind()
         begun = self.send()
@@ -677,7 +686,7 @@ class WakeBindingTests(WakeLedgerCase):
         first = self.bind()["binding"]
         before = self.store.events()
         for ref, said in ((f"receipt:{first['generation']}", "is a wake.bound, not an answered decision"),
-                          ("receipt:binding:1", "names the ledger sequence of a decision response")):
+                          ("receipt:binding:1", "isn't receipt:<ledger seq> written plainly")):
             with self.assertRaisesRegex(ValidationError, said):
                 self.store.wake_control("pause", "operator", agent="codex", session="someone-else",
                                         expected_generation=first["generation"], reason="r", approval_ref=ref)

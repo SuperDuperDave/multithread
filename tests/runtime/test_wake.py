@@ -675,7 +675,9 @@ class SenderContextTests(WakeCase):
         self.source_reply = None
         source_reads = [call for call in self.ledger_calls if Path(call[0]).is_relative_to(self.source)]
         missing = self.sender_wake("--dry-run", session=None)
-        self.assertEqual(("DRY RUN", "unavailable"), (missing["status"], missing["sender_state"]))
+        self.assertEqual(("DRY RUN", "not_given"), (missing["status"], missing["sender_state"]))
+        self.assertIn("without --dry-run and with --agent and --session", missing["next"],
+                      "the next step must not lead straight to a refusal")
         self.assertNotIn("sender", missing)
         self.assertEqual(f"Multithread wake from claude: {self.task}{SENT}", missing["text"])
         explicit = self.sender_wake("--dry-run", "--sender-role", "engineer", session=None)
@@ -2826,6 +2828,12 @@ class BindTests(WakeCase):
         self.assertEqual(0, code, out)
         self.assertIn(f"Approval: git commit {ref[4:16]} in {elsewhere}: \"Approve the operator handover\" (", out)
         self.assertEqual(ref, self.events("wake.bound")[-1]["meta"]["approval_ref"])
+        (self.base / "not-a-repo").mkdir()
+        for nowhere in (self.base / "no-such-repo", self.base / "not-a-repo"):
+            code, out = self.approve(ref, "--approval-repo", str(nowhere))
+            self.assertEqual(4, code, out)
+            self.assertIn(f"{nowhere} isn't a readable git repository", out, "not a missing object")
+            self.assertIn("Pass --approval-repo with the repository that holds the approval", out)
         code, out = self.approve("git:--output=x" + "0" * 26)
         self.assertEqual(4, code, "never an option to git")
         self.assertIn("isn't git:<full object id>, sha256:<digest> or receipt:<ledger seq>", out)
@@ -2851,14 +2859,42 @@ class BindTests(WakeCase):
                          "an audit can find the file without a protocol change")
         self.assertEqual(4, self.approve(digest, "--approval-repo", str(self.repo))[0], "repo is for git: only")
 
+    def test_an_approval_file_that_cannot_be_read_is_refused_not_crashed_or_waited_on(self):
+        self.bound()
+        approval = self.base / "approval.md"
+        approval.write_text("Approved\n")
+        digest = "sha256:" + hashlib.sha256(approval.read_bytes()).hexdigest()
+        pipe = self.base / "approval.fifo"
+        os.mkfifo(pipe)
+        with mock.patch.object(wake, "_EPHEMERAL_ROOTS", ()):
+            approval.chmod(0)
+            try:
+                code, out = self.approve(digest, "--approval-file", str(approval))
+            finally:
+                approval.chmod(0o600)
+            self.assertEqual(4, code, out)
+            self.assertIn(f"--approval-file {approval} can't be read", out)
+            self.assertIn("Make it readable by this user", out)
+            code, out = self.approve(digest, "--approval-file", str(pipe))  # opening a pipe must not wait for a writer
+            self.assertEqual(4, code, out)
+            self.assertIn("isn't a regular file", out)
+
+    def test_approval_flags_are_checked_even_when_nothing_would_change(self):
+        self.bound()
+        code, out = self.bind("--approval-repo", str(self.repo))
+        self.assertEqual(4, code, out)
+        self.assertIn("--approval-repo and --approval-file qualify an --approval-ref", out)
+
     def test_a_receipt_approval_must_be_an_answered_decision_here(self):
         first = self.bound()
-        for ref, said in ((f"receipt:binding:{first}", "names the ledger sequence of a decision response"),
+        for ref, said in ((f"receipt:binding:{first}", "isn't receipt:<ledger seq> written plainly"),
+                          (f"receipt:0{first}", "isn't receipt:<ledger seq> written plainly"),  # one spelling each
                           (f"receipt:{first}", "is a wake.bound, not an answered decision"),
                           ("receipt:999999", "names no event in this ledger")):
             code, out = self.approve(ref)
             self.assertEqual(4, code, out)
             self.assertIn(said, out)
+            self.assertIn("Nothing was recorded. Name the decision response itself", out)
         with self.store() as store:
             ref = approved_receipt(store)
         code, out = self.approve(ref)
@@ -2882,7 +2918,8 @@ class BindTests(WakeCase):
             "approval": {"ref": "git:" + "a" * 40, "kind": "commit", "repo": "/srv/approvals",
                          "subject": "Approve", "date": "2026-10-08T00:00:00+00:00"}})
         self.assertEqual(["PAUSED: Wakes to operator are paused (binding 7); nothing is sent until they are resumed.",
-                          "Approval: git commit aaaaaaaaaaaa in /srv/approvals: \"Approve\" (2026-10-08T00:00:00+00:00)",
+                          "Approval: git commit aaaaaaaaaaaa in /srv/approvals: \"Approve\" (2026-10-08T00:00:00+00:00) "
+                          "(checked: it exists and is this kind; not who approved)",
                           "Next: Resume with: multithread resume operator"], rendered.splitlines())
 
     def test_bind_refuses_a_recipient_move_until_authorized_handover(self):

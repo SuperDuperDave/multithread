@@ -801,7 +801,8 @@ def _managed_refusal(managed):
     unchecked = [source for source in managed if isinstance(source, _Unchecked)]
     if present:
         text = ("Managed Claude settings were found (" + ", ".join(present) + "); they stay in force under "
-                "--restricted, hooks included, so a --tools call cannot establish its registry.")
+                "--restricted, hooks included, so a --tools call cannot establish its registry. Call without --tools "
+                "for an unrestricted peer, or ask whoever manages this machine's Claude settings about these.")
         if unchecked:
             text += " These could not be checked either: " + ", ".join(unchecked) + "."
     else:

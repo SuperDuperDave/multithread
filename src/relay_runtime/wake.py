@@ -779,10 +779,18 @@ def message_text(agent, ref, ledger, sender=None):
     return f"Multithread wake from {agent}{context}: {where} (sent {_sent_label()})"
 
 
+def _send_next(base):
+    """After a dry run: sending also needs the identity a dry run may leave out."""
+    if base.get("sender_state") == "not_given":
+        return ("To send it, run again without --dry-run and with --agent and --session "
+                "(or RELAY_AGENT and RELAY_SESSION).")
+    return "Run again without --dry-run to send."
+
+
 def _sender_context(source, agent, session, role, ledger):
     """Observe one source ledger; a display label never grants coordination authority."""
-    if not session:
-        return "unavailable", None
+    if not agent or not session:
+        return "not_given", None  # only a dry run may leave identity out
     code, reply, problem = ledger(source, "wake-ledger", "show", *([role] if role else []))
     if code != 0:
         return "unavailable", None
@@ -1030,7 +1038,7 @@ def wake(args, ledger=launcher_ledger):
             seen = (f"latest turn {turn_id} is {latest.get('status')}" if latest
                     else "the conversation has no turns yet")
             return _outcome("DRY RUN", f"Would {plan} for {role} (conversation {binding['thread']}; {seen}). "
-                            "Nothing was sent.", "Run again without --dry-run to send.", **base)
+                            "Nothing was sent.", _send_next(base), **base)
         if args.steer and live:
             try:
                 receipt = daemon.call("turn/steer", {
@@ -1169,7 +1177,7 @@ def _wake_inbox(args, role, binding, text, message_id, base, conclude):
         return conclude(_outcome("NOT SENT", gone + " Nothing was sent.", resend, **base), "not_sent", reason)
     if args.dry_run:
         return _outcome("DRY RUN", f"Would deliver to the Claude Code inbox at {path} for {role}. Nothing was "
-                        "sent." + unsteered, "Run again without --dry-run to send.", **base)
+                        "sent." + unsteered, _send_next(base), **base)
     try:
         deliver(path, text, owner=(entry["pid"], entry["boot_id"], entry["start"]),
                 still=lambda: live_inbox(session) == entry)
@@ -1852,11 +1860,17 @@ def resolve_approval(ref, checkout, approval_repo=None, approval_file=None):
             return subprocess.run(["git", "-C", str(repo), *arguments], env=hooks._GIT_ENV, stdin=subprocess.DEVNULL,
                                   capture_output=True, text=True, timeout=10)
         try:
-            kind = git("cat-file", "-t", oid)
+            where = git("rev-parse", "--git-dir")
+            kind = git("cat-file", "-t", oid) if where.returncode == 0 else None
         except (OSError, subprocess.SubprocessError) as exc:
             raise ApprovalUnresolved(f"--approval-ref {ref} couldn't be checked in {repo} ({_detail(exc)})",
                                      "Check that git runs and the repository is readable, then run this again.") \
                 from None
+        if kind is None:
+            why = _printable(where.stderr.strip().splitlines()[0] if where.stderr.strip() else "no git directory")
+            raise ApprovalUnresolved(f"{repo} isn't a readable git repository ({why[:160]}), so --approval-ref "
+                                     f"{ref} couldn't be checked", "Pass --approval-repo with the repository that "
+                                     "holds the approval.")
         if kind.returncode != 0:
             raise ApprovalUnresolved(f"--approval-ref {ref} isn't an object in {repo}",
                                      "Fetch it there, or pass --approval-repo for the repository that holds it.")
@@ -1873,7 +1887,6 @@ def resolve_approval(ref, checkout, approval_repo=None, approval_file=None):
                                  "Pass --approval-file with the path of the durable file it hashes.")
     try:
         real = path.resolve(strict=True)
-        info = os.stat(real)
     except OSError as exc:
         raise ApprovalUnresolved(f"--approval-file {path} can't be read ({_detail(exc)})",
                                  "Pass the path of the file the digest names.") from None
@@ -1883,15 +1896,21 @@ def resolve_approval(ref, checkout, approval_repo=None, approval_file=None):
         raise ApprovalUnresolved(f"--approval-file {real} is under {ephemeral}, which doesn't survive a restart",
                                  "Keep the approval in a durable place, such as the project's records, and pass "
                                  "that path.")
-    if not stat.S_ISREG(info.st_mode) or info.st_size > _APPROVAL_FILE_MAX:
-        raise ApprovalUnresolved(f"--approval-file {real} isn't a regular file of at most 64 MiB",
-                                 "Pass the approval file itself.")
     digest = hashlib.sha256()
-    with open(real, "rb") as stream:
-        head = stream.read(1 << 16)
-        digest.update(head)
-        for chunk in iter(lambda: stream.read(1 << 20), b""):
-            digest.update(chunk)
+    try:
+        # Opened once without blocking and checked through the open file, so a pipe or a swap can't hang or fool it.
+        with os.fdopen(os.open(real, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC), "rb") as stream:
+            info = os.fstat(stream.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_size > _APPROVAL_FILE_MAX:
+                raise ApprovalUnresolved(f"--approval-file {real} isn't a regular file of at most 64 MiB",
+                                         "Pass the approval file itself.")
+            head = stream.read(1 << 16)
+            digest.update(head)
+            for chunk in iter(lambda: stream.read(1 << 20), b""):
+                digest.update(chunk)
+    except OSError as exc:
+        raise ApprovalUnresolved(f"--approval-file {real} can't be read ({_detail(exc)})",
+                                 "Make it readable by this user, or pass the file the digest names.") from None
     if "sha256:" + digest.hexdigest() != ref:
         raise ApprovalUnresolved(f"--approval-file {real} has sha256:{digest.hexdigest()}, not {ref}",
                                  "Pass the file the approval names, or the digest of this file.")
@@ -1954,10 +1973,10 @@ def _describe(binding):
     if last:
         lines.append(f"  last wake: {last['message_id']} {last['outcome']} at {last['at']} "
                      f"(ledger seq {last['seq']})")
-    elif earlier and binding["state"] != "unbound":
-        lines.append(f"  last wake: none under binding {binding['generation']}; the last was "
-                     f"{earlier['message_id']} {earlier['outcome']} at {earlier['at']} under binding "
-                     f"{earlier['generation']} (ledger seq {earlier['seq']})")
+    elif earlier:
+        now = "none while unbound" if binding["state"] == "unbound" else f"none under binding {binding['generation']}"
+        lines.append(f"  last wake: {now}; the last was {earlier['message_id']} {earlier['outcome']} at "
+                     f"{earlier['at']} under binding {earlier['generation']} (ledger seq {earlier['seq']})")
     return lines
 
 
@@ -2018,6 +2037,12 @@ def bind(args, ledger=launcher_ledger):
     wanted = {"provider": provider, "thread": thread, "endpoint": endpoint}
     target = _target(wanted)
     base = {"role": role, **wanted, "ledger": shown["ledger"]}
+    # Approval flags are checked before anything else decides, so a stray or broken one is never silently ignored.
+    try:
+        approval = resolve_approval(args.approval_ref, repo, args.approval_repo, args.approval_file)
+        reason = _with_approval_file(args.reason, approval)
+    except ApprovalUnresolved as exc:
+        return _outcome("NOT BOUND", f"{exc}. Nothing was recorded.", exc.next_step, **base)
     if current["state"] != "unbound":
         same_holder = (current.get("bound_agent"), current.get("bound_session")) == (agent, session) or (
             current["provider"] == "codex" and agent == "codex" and session == current["thread"])
@@ -2065,11 +2090,6 @@ def bind(args, ledger=launcher_ledger):
         coverage = _coverage(ledger, thread, cwd)
         record = ["--thread", thread, "--cwd", cwd]
         extra = {"warning": coverage["message"]} if "message" in coverage else {}
-    try:
-        approval = resolve_approval(args.approval_ref, repo, args.approval_repo, args.approval_file)
-        reason = _with_approval_file(args.reason, approval)
-    except ApprovalUnresolved as exc:
-        return _outcome("NOT BOUND", f"{exc}. Nothing was recorded.", exc.next_step, **base)
     options = ["--replace"] if args.replace else []
     for flag, value in (("--scope", args.scope), ("--charter", args.charter), ("--reason", reason),
                         ("--expected-generation", args.expected_generation), ("--approval-ref", args.approval_ref)):
@@ -2083,7 +2103,7 @@ def bind(args, ledger=launcher_ledger):
     binding = recorded["binding"]
     base.update(generation=binding["generation"], binding_state=binding["state"], coverage=coverage)
     approval = recorded.get("approval") or approval  # a receipt: is resolved by the ledger itself
-    if approval is not None:
+    if approval is not None and not recorded["duplicate"]:
         base["approval"] = approval
     # Re-running bind records an older binding here too, so the index fills without a migration.
     base["index_recorded"] = _remember(_recipient(provider, agent, session, thread), shown["ledger"], role)
