@@ -166,6 +166,14 @@ while True:
             time.sleep(0.5)
             for event in spec['later_events']:
                 emit(event)
+        if 'post_completion_raw_hex' in spec:
+            time.sleep(spec.get('post_completion_delay', 0.5))
+            sys.stdout.buffer.write(bytes.fromhex(spec['post_completion_raw_hex']))
+            sys.stdout.buffer.flush()
+        if 'post_completion_oversized' in spec:
+            time.sleep(spec.get('post_completion_delay', 0.5))
+            sys.stdout.buffer.write(b'{' + b'x' * spec['post_completion_oversized'] + b'\n')
+            sys.stdout.buffer.flush()
         if spec.get('sleep'):
             time.sleep(20)
         if spec.get('exit_after_events', True):
@@ -572,6 +580,70 @@ class CodexProtocolTests(unittest.TestCase):
                 self.assertNotEqual(0, code)
                 self.assertIn("MCP server activity (stray: starting) for a server this call didn't allow",
                               result["message"])
+
+    def test_early_mcp_activity_overflow_refuses_before_task(self):
+        def activity(name):
+            return {"method": "mcpServer/startupStatus/updated", "params": {"name": name, "status": "starting"}}
+        plugin = {"name": "fixture-plugin", "pluginId": "fixture@plugin"}
+        apps = {"name": "codex_apps", "pluginId": None}
+        cases = [(('--allow-plugins',), plugin, 'codex_apps'),
+                 (('--allow-apps',), apps, 'fixture-plugin'),
+                 (('--allow-plugins', '--allow-apps'), plugin, 'configured-stray')]
+        for flags, server, hidden in cases:
+            with self.subTest(flags=flags):
+                self.configure(mcp_pages=[[server]], before_mcp_response=
+                               [activity(server['name'])] * codex_peer._MAX_PENDING + [activity(hidden)],
+                               sleep=True, exit_after_events=False)
+                started = time.monotonic()
+                code, result, directory = self.invoke(*flags)
+                self.assertNotEqual(0, code, result)
+                self.assertEqual(('uncertain', None), (result['state'], result['result']))
+                self.assertEqual('not_submitted', result['task_submission'])
+                self.assertNotIn('turn/start', [row['method'] for row in self.recorded_requests()])
+                self.assertIn('activity', result['message'])
+                self.assertLess(time.monotonic() - started, 4)
+                self.assertEqual(result, json.loads((directory / 'result.json').read_text()))
+
+    def test_unhashable_mcp_names_refuse_and_leave_terminal_receipt(self):
+        for name in ([], {}):
+            with self.subTest(name=name):
+                self.configure(mcp_pages=[[{'name': name, 'pluginId': 'fixture@plugin'}]])
+                code, result, directory = self.invoke('--allow-plugins')
+                self.assertNotEqual(0, code)
+                self.assertEqual(('uncertain', None), (result['state'], result['result']))
+                self.assertEqual('not_submitted', result['task_submission'])
+                self.assertIn('malformed', result['message'])
+                self.assertNotIn('turn/start', [row['method'] for row in self.recorded_requests()])
+                self.assertEqual(result, json.loads((directory / 'result.json').read_text()))
+
+    def test_unknown_activity_remedy_never_broadens_permissions(self):
+        stray = {'method': 'mcpServer/startupStatus/updated', 'params': {'name': 'stray', 'status': 'starting'}}
+        for flags in ((), ('--allow-plugins',), ('--allow-apps',), ('--allow-plugins', '--allow-apps')):
+            with self.subTest(flags=flags):
+                self.configure(mcp_pages=[[]], events=[stray, item(), completed()])
+                code, result, _ = self.invoke(*flags)
+                self.assertNotEqual(0, code)
+                self.assertNotIn('pass --allow-', result['message'])
+                self.assertIn('inspect retained output', result['message'])
+
+    def test_observation_fault_after_completion_withdraws_answer(self):
+        stray = {'method': 'mcpServer/startupStatus/updated', 'params': {'name': 'stray', 'status': 'starting'}}
+        raw = b'{malformed}\n' + json.dumps(stray).encode() + b'\n'
+        for spec in ({'post_completion_raw_hex': raw.hex()},
+                     {'post_completion_raw_hex': raw.hex(), 'post_completion_delay': 0},
+                     {'post_completion_oversized': 17 * 1024 * 1024}):
+            with self.subTest(spec=list(spec)):
+                self.configure(**spec, sleep=True, exit_after_events=False)
+                started = time.monotonic()
+                code, result, directory = self.invoke('--timeout', '15')
+                self.assertNotEqual(0, code, result)
+                self.assertEqual(('uncertain', None), (result['state'], result['result']))
+                self.assertTrue(result['needs_attention'])
+                self.assertLess(time.monotonic() - started, 4)
+                self.assertEqual(result, json.loads((directory / 'result.json').read_text()))
+                receipt = json.loads(self.receipt.read_text())
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(receipt['pid'], 0)
 
     def test_the_server_list_is_bounded_and_says_how_many_ran(self):
         servers = [{"name": f"s{i:02}" + "x" * 120, "pluginId": None} for i in range(60)]
@@ -2038,10 +2110,16 @@ class CodexProtocolTests(unittest.TestCase):
         with mock.patch.object(native_io, "MAX_RECORD", 1024 * 1024):
             result = self.assert_attention(self.invoke("--timeout", "15"))
         self.assertIn("A native record exceeded its bound", result["message"])
-        # Interpretation stops; the whole record is still retained raw, under the output bound.
+        # Faults stop the owned group at once; retain exactly the prefix already observed, not bytes
+        # the provider would have written had it been allowed to keep running.
         raw = (self.base / f"evidence-{self.count}" / "stdout.json").read_bytes()
         self.assertFalse(result["stdout_observation"]["truncated"])
-        self.assertTrue(raw.endswith(b"\n{" + b"x" * (2 * 1024 * 1024)))
+        prefix, suffix = raw.rsplit(b"\n{", 1)
+        self.assertGreater(len(suffix), 1024 * 1024)
+        self.assertLessEqual(len(suffix), 2 * 1024 * 1024)
+        self.assertEqual(b"x" * len(suffix), suffix)
+        self.assertEqual(len(raw), result["stdout_observation"]["bytes"])
+        self.assertEqual(hashlib.sha256(raw).hexdigest(), result["stdout_observation"]["sha256"])
 
 if __name__ == "__main__":
     unittest.main()

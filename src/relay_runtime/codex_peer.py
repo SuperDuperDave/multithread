@@ -38,7 +38,6 @@ _FEATURE_PAGES = 5  # Codex 0.161 lists its 160 features in one page
 # feature list must confirm each before the task goes out.
 _ALWAYS_OFF = ("multi_agent", "multi_agent_v2")
 _APPS_SERVER = "codex_apps"  # Codex's one server for the account's ChatGPT apps (connectors); it has no pluginId
-_OPT_INS = "pass --allow-plugins to admit the account's plugin servers, or --allow-apps its ChatGPT apps (connectors)"
 _APPROVAL_POLICIES = ("untrusted", "on-failure", "on-request", "never")
 # A peer never escalates: asked for in every request that can carry it, and confirmed in Codex's response.
 _NO_ESCALATION = {"approvalPolicy": "never", "approvalsReviewer": "user"}
@@ -545,14 +544,21 @@ class _Driver:
                             if kind == "plugin"][:50] if observed else None,
             apps=any(kind == "apps" for _, _, kind in kinds) if observed else None)
         if self.early_activity:
-            plugins["activity_before_list"] = [f"{name}: {status}" for name, status in self.early_activity][:20]
+            plugins["activity_before_list"] = [f"{_label(name)}: {status}" for name, status in self.early_activity][:20]
         held = (f" Codex also reported activity before the list ({', '.join(plugins['activity_before_list'][:5])})."
                 if self.early_activity else "")
         # Only an explicit opt-in admits a server: --allow-plugins one a plugin provides, --allow-apps the apps' one
         # server. Names must be unique, since later activity is known only by name.
         seen = collections.Counter(name for name, _, kind in kinds if kind != "malformed")
-        refused = [(name, kind if seen[name] < 2 else "duplicate") for name, plugin, kind in kinds
-                   if seen.get(name, 0) > 1 or not self.admits(kind)]
+        refused = []
+        for name, _, kind in kinds:
+            # Malformed names may be arrays or objects; never hash them, even to refuse them.
+            if kind == "malformed":
+                refused.append((name, kind))
+            elif seen[name] > 1:
+                refused.append((name, "duplicate"))
+            elif not self.admits(kind):
+                refused.append((name, kind))
         if refused:
             shown = sorted({_label(name) for name, _ in refused})
             raise _ProtocolError(
@@ -586,14 +592,14 @@ class _Driver:
         modes = self.envelope.get("provider_plugins") or {}
         if self.admitted is None and "allowed" in (modes.get("mode"), modes.get("apps_mode")):
             # An allowed server may start before the list says which it is; judge it once the list is read.
-            if len(self.early_activity) < _MAX_PENDING:
-                self.early_activity.append((name, status))
+            if len(self.early_activity) >= _MAX_PENDING:
+                self.end_call("Codex's MCP activity before its server list exceeded the observation bound")
+            self.early_activity.append((name, status))
             return
         if self.admitted is not None and isinstance(name, str) and name in self.admitted:
             return
         name = _label(name)
-        self.end_call(f"Codex reported MCP server activity ({name}: {status}) for a server this call didn't allow",
-                      f"{_OPT_INS} if it should run")
+        self.end_call(f"Codex reported MCP server activity ({name}: {status}) for a server this call didn't allow")
 
     def end_call(self, what, remedy=None):
         """A boundary the call set was crossed: withdraw any recorded answer and stop the call's own process group at
@@ -1093,9 +1099,15 @@ class _Driver:
                 self.control.resolve(identifier, "uncertain", "Native steering acknowledgement was not observed; do not resend automatically.")
 
     def problem(self, message):
+        # A Codex peer enforces its boundary throughout shutdown, too. Once interpretation is lost,
+        # a previously completed turn no longer proves that boundary held for the whole call.
         self.had_problem = True
-        if not self.outcome_recorded:
-            self.envelope.update(state="uncertain", result=None)
+        self.envelope.update(state="uncertain", result=None)
+        if self.process.returncode is None:
+            try:
+                os.killpg(self.process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
         self.envelope.update(needs_attention=True, message=message)
 
     def finish(self, require_answer=True):

@@ -63,7 +63,12 @@ does not substitute for the separate `task_delivery` observation.
 For Codex and for Claude `--live-input`, `--stream-progress`, `--tools` or `--attach`, retained capture is
 limited to 16 MiB, plus one byte to detect overflow; a single unfinished record is limited to 64 MiB. Exceeding that bound sets `truncated`, stops interpretation,
 closes native input and leads to owned-process cleanup. Only the captured prefix
-is retained; a previously observed answer survives with `needs_attention`.
+is retained. A Codex protocol-observation fault or capture overflow withdraws any
+previously completed answer (`state: uncertain`, `result: null`) and stops the
+owned process group immediately: the call can no longer monitor its boundary.
+An unrestricted Claude call can preserve a previously observed answer with
+`needs_attention`; a restricted Claude call withholds it unless the entire
+stream was verified to its normal end.
 Claude calls without either streaming option capture raw stdout directly. Their
 `stdout_observation.scope` is `bounded_read`: the byte count and digest describe
 the read prefix, with the same 16 MiB plus one byte limit. Their raw file can
@@ -94,8 +99,9 @@ the provider still runs. Inspect native output and durable work before follow-up
 A streaming result can precede native process exit. Claude receives the remaining
 call time for its background work; Codex's owned server gets a short shutdown
 allowance after its terminal turn. Cleanup is limited to the process group this
-call created. A valid answer survives incomplete stdout observation, marked with
-`needs_attention`. Neither a terminal result nor termination proves that every
+call created. Ordinary shutdown cleanup may preserve a valid answer with
+`needs_attention`; loss of Codex protocol interpretation withdraws its answer.
+Neither a terminal result nor termination proves that every
 background operation completed.
 
 ## Usage measurements
