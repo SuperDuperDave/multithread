@@ -1,5 +1,7 @@
 """Reviewing an exact Claude Code binary for restricted calls, and calls admitting only reviewed binaries."""
 
+from contextlib import redirect_stdout
+import io
 import json
 import os
 from pathlib import Path
@@ -125,6 +127,13 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(("pass", ["cc-plugin-sec-default", "cc-plugin-telemetry"]),
                          (report["verdict"], report["plugins"]), "the report lists what it observed")
         self.assertIn("no hand review covered", " ".join(self.review()["reasons"]), "unseated, nothing covers it")
+        # Seated by this machine's file but not reported, the file did not do what it is admitted for.
+        self.spec({})
+        report = claude_review.review(str(self.binary), self.out, "fixture-model", seated)
+        self.assertEqual("needs_review", report["verdict"])
+        self.assertIn("did not report the guard", " ".join(report["reasons"]))
+        self.spec({"plugins": ["cc-plugin-sec-default", "cc-plugin-telemetry"]})
+        report = claude_review.review(str(self.binary), self.out, "fixture-model", seated)
         # A review made with the guard seated admits calls only while it still is, and so does the baseline.
         digest, launcher = "a" * 64, self.base / "multithread"
         meta = {"binary_sha256": digest, "version": "9.9.9", "surface_sha256": report["surface_sha256"],
@@ -136,6 +145,12 @@ class ReviewTests(unittest.TestCase):
                          claude_review.reviewed(digest, launcher, self.base, seated)["plugins"])
         with self.assertRaisesRegex(claude_review.ReviewError, "no longer in place"):
             claude_review.reviewed(digest, launcher, self.base)
+        # The latest review decides: an older one made without the guard does not stand in for it.
+        older = {**meta, "plugins": "cc-plugin-telemetry"}
+        launcher.write_text("#!/bin/sh\necho '" + json.dumps({"reviews": [{"seq": 6, "meta": older},
+                                                                        {"seq": 7, "meta": meta}]}) + "'\n")
+        with self.assertRaisesRegex(claude_review.ReviewError, r"ledger:7.*no longer in place"):
+            claude_review.reviewed(digest, launcher, self.base)
         # A review made without it admits it once it is seated.
         meta["plugins"] = "cc-plugin-telemetry"
         launcher.write_text("#!/bin/sh\necho '" + json.dumps({"reviews": [{"seq": 8, "meta": meta}]}) + "'\n")
@@ -145,6 +160,15 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(["cc-plugin-sec-default", "cc-plugin-telemetry"],
                          claude_review.reviewed("0" * 64, launcher, self.base, seated)["plugins"])
         self.assertEqual(["cc-plugin-telemetry"], claude_review.reviewed("0" * 64, launcher, self.base)["plugins"])
+
+    def test_review_claude_reviews_with_what_this_machine_seats_now(self):
+        from relay_runtime import provider
+        with (mock.patch.object(provider, "_seated_plugins", return_value=("cc-plugin-sec-default",)),
+              mock.patch.object(claude_review, "review", side_effect=claude_review.ReviewError("stop here.")) as review,
+              redirect_stdout(io.StringIO())):
+            self.assertEqual(1, claude_review.review_main(["--provider", str(self.binary), "--agent", "a",
+                                                           "--session", "s"], self.base / "multithread"))
+        self.assertEqual(("cc-plugin-sec-default",), review.call_args.args[3])
 
     def test_the_surface_is_the_present_strings_and_our_flags_whole_help(self):
         _, value = claude_review.surface(str(self.binary))
@@ -164,7 +188,7 @@ class ReviewTests(unittest.TestCase):
             launcher.chmod(0o755)
         answer()
         self.assertEqual({"version": "9.9.9", "surface_sha256": surface, "plugins": [], "agents": ["claude"],
-                          "source": "ledger:7"}, claude_review.reviewed(digest, launcher, self.base))
+                          "seated": [], "source": "ledger:7"}, claude_review.reviewed(digest, launcher, self.base))
         # A record admits nothing a hand review did not cover, however it was written.
         for changes, why in (({"surface_sha256": "c" * 64}, "no hand review covered"),
                              ({"agents": "claude,mailer"}, "no hand review covered"),

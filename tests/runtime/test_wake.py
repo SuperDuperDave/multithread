@@ -131,6 +131,7 @@ class FakeDaemon:
         self.threads = {}  # id -> {"cwd", "status", "turns"}
         self.steer = "accept"  # a key of STEER_REPLIES, or hang | close
         self.read_mode = "accept"  # metadata only: hang | close | traffic | trickle
+        self.traffic_ends = []  # per traffic/trickle read: True when the client left while traffic still flowed
         self.requests = []
         self.connections = 0
         self.server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -184,18 +185,25 @@ class FakeDaemon:
                         continue
                     reply = self.answer(message)
                     if reply in ("traffic", "trickle"):
-                        if reply == "traffic":
-                            deadline = time.monotonic() + 0.8
-                            while time.monotonic() < deadline and not self.stopped.is_set():
-                                self.send(connection, {"method": "fixture/notification", "params": {}})
-                                connection.sendall(bytes([0x89, 4]) + b"ping")
-                                time.sleep(0.01)
-                        else:
-                            body = json.dumps({"method": "fixture/notification", "params": {"text": "x" * 450}}).encode()
-                            frame = bytes([0x81, 126]) + struct.pack(">H", len(body)) + body
-                            for byte in frame:
-                                connection.sendall(bytes([byte]))
-                                time.sleep(0.002)
+                        # Far longer than any readiness deadline: a client that honours its deadline leaves first.
+                        try:
+                            if reply == "traffic":
+                                deadline = time.monotonic() + 5
+                                while time.monotonic() < deadline and not self.stopped.is_set():
+                                    self.send(connection, {"method": "fixture/notification", "params": {}})
+                                    connection.sendall(bytes([0x89, 4]) + b"ping")
+                                    time.sleep(0.01)
+                            else:
+                                body = json.dumps({"method": "fixture/notification",
+                                                   "params": {"text": "x" * 450}}).encode()
+                                frame = bytes([0x81, 126]) + struct.pack(">H", len(body)) + body
+                                for byte in frame:
+                                    connection.sendall(bytes([byte]))
+                                    time.sleep(0.01)
+                        except OSError:
+                            self.traffic_ends.append(True)
+                            return
+                        self.traffic_ends.append(False)
                         return
                     if reply == "close":
                         return
@@ -1179,11 +1187,14 @@ class QueuedReadinessTests(WakeCase):
             with self.subTest(mode=mode):
                 self.daemon.read_mode = mode
                 before = len(self.daemon.methods())
-                started = time.monotonic()
                 with mock.patch.object(wake, "_READINESS_TIMEOUT", 0.08):
                     result = self.wake("--id", "stream-" + str(index))
-                self.assertLess(time.monotonic() - started, 0.65,
-                                "Total read must finish while the fixture still supplies traffic")
+                # Ordering, not wall time: the read ends while the fixture still supplies traffic.
+                waited = time.monotonic() + 10
+                while len(self.daemon.traffic_ends) <= index and time.monotonic() < waited:
+                    time.sleep(0.01)
+                self.assertEqual([True], self.daemon.traffic_ends[index:],
+                                 "The read must end while the fixture still supplies traffic")
                 self.assertEqual("QUEUED", result["status"])
                 self.assertEqual("unknown", result["recipient_runtime"]["status"])
                 self.assertEqual(index + 1, len(self.codex_calls()))

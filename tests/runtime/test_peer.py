@@ -1334,6 +1334,14 @@ class PeerTests(unittest.TestCase):
               mock.patch.object(peer, "_MANAGED_OWNER", os.getuid())):
             self.assertFalse(peer._inert_managed_settings(machine))
         (machine / "managed-settings.json").unlink()
+        # Nor is a file with another name elsewhere (a hard link): the directory alone decides what it holds.
+        call(inert)
+        elsewhere = self.base / "hard-linked.json"
+        os.link(machine / "managed-settings.json", elsewhere)
+        with (mock.patch.object(peer, "_MANAGED_CLAUDE_SETTINGS", {peer.platform.system(): machine}),
+              mock.patch.object(peer, "_MANAGED_OWNER", os.getuid())):
+            self.assertFalse(peer._inert_managed_settings(machine))
+        elsewhere.unlink()
         # A link is followed by Claude, not by this check: it refuses rather than vouch for what it points at.
         elsewhere = self.base / "elsewhere.json"
         elsewhere.write_text(json.dumps(inert))

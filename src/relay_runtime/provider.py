@@ -701,11 +701,15 @@ def _policy_listings():
         os.close(lock)
 
 
-# The one managed setting a restricted call admits. It seats the built-in guard cc-plugin-sec-default ahead of every
-# other plugin; as read from Claude Code 2.1.295's bundle, with no user mods that guard refuses user-level mods, turns
-# an error in the hook chain into a denial, and leaves the tool list and tool decisions as they were. Anything else
-# stays a managed source and refuses a restricted call. A call admits the seated guard only while this file is
-# exactly so, and a review made with it seated admits calls only while it still is.
+# The one managed setting a restricted call admits. It seats Claude Code's built-in guard cc-plugin-sec-default ahead
+# of every other plugin. Inferred from Claude Code 2.1.295's bundle (2.1.293's guard is the same): with no user mods
+# the guard refuses user-level plugin registration, denies when its hook chain cannot be checked, and leaves the tool
+# list and tool decisions as they were. Anything else stays a managed source and refuses a restricted call. The file
+# is checked before launch, and a call made then requires the guard at initialization; a change by root between this
+# check and Claude Code's own read is outside what it can see. A review made with the guard seated admits calls only
+# while it is seated, so widening this allowlist must also invalidate those reviews. Accepted residual: while this
+# file is present, a guard seated by something else (a Windows policy added within the policy-read cache, or an
+# organization's remote settings not yet cached) looks the same at initialization and is admitted.
 _INERT_MANAGED_SETTINGS = {"pluginConfigs": {"cc-plugin-sec-default@builtin": {"options": {"allowManagedModsOnly": True}}}}
 _SEATED_BY_INERT_SETTINGS = ("cc-plugin-sec-default",)
 _MANAGED_OWNER = 0  # root; tests stand in their own user
@@ -737,7 +741,7 @@ def _inert_managed_settings(directory):
         fd = os.open(Path(directory) / "managed-settings.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
         try:
             info = os.fstat(fd)
-            if not stat.S_ISREG(info.st_mode) or not _root_only(info) or info.st_size > 4096:
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or not _root_only(info) or info.st_size > 4096:
                 return False
             body = os.read(fd, 4097)
         finally:

@@ -249,7 +249,7 @@ class RestrictedCallTests(ClaudeIntegrationTests):
         steps = [{'read': 1}, {'emit': protocol.ClaudeProtocolTests.restricted(
                      plugins=[guard, {'name': 'cc-plugin-telemetry', 'path': 'builtin',
                                       'source': 'cc-plugin-telemetry@builtin'}])}, {'emit': protocol.result()}]
-        def call():
+        def call(steps=steps):
             shutil.rmtree(self.base / 'stream-evidence', ignore_errors=True)
             with mock.patch.dict(claude_review.BUILT_IN, {digest: {k: v for k, v in protocol.REVIEWED.items()
                                                                    if k != 'source'}}), \
@@ -259,6 +259,10 @@ class RestrictedCallTests(ClaudeIntegrationTests):
         code, value, _ = call()
         self.assertEqual((0, 'returned'), (code, value['state']), value)
         self.assertEqual(['cc-plugin-sec-default', 'cc-plugin-telemetry'], value['provider_tools']['plugins'])
+        # With the file exactly so, a session that does not report the guard did not apply it as admitted.
+        code, value, _ = call([steps[0], {'emit': protocol.ClaudeProtocolTests.restricted()}, steps[2]])
+        self.assertNotEqual(0, code)
+        self.assertIn('registry differs from the requested one', value['message'])
         # Seated by anything else (a Team plan, say) the guard is not admitted, and the call fails closed.
         (machine / 'managed-settings.json').unlink()
         machine.rmdir()

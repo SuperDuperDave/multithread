@@ -370,6 +370,7 @@ class _Driver:
             for item in plugins)
         if (surfaces["reported"] != self.tools or surfaces["mcp_servers"] or surfaces["slash_commands"]
                 or surfaces["skills"] or not builtin or not set(surfaces["plugins"]) <= set(reviewed["plugins"])
+                or not set(reviewed.get("seated", ())) <= set(surfaces["plugins"])
                 or not set(surfaces["agents"]) <= set(reviewed["agents"])):
             raise self.fault("The native tool registry differs from the requested one; this call fails closed. "
                                 "Inspect retained output.")
@@ -780,10 +781,11 @@ def _option_blocks(help_text):
 def reviewed(digest, launcher, repo, seated=()):
     """The review that admits this exact binary to restricted calls, or None. Unreadable reviews raise.
 
-    `seated` names the built-in plugins the inert machine setting seats now: a call admits them, and a review that
+    `seated` names the built-in plugins the inert machine setting seats now: a call requires them, and a review that
     saw them seated admits calls only while they still are."""
     if digest in BUILT_IN:
-        return {**BUILT_IN[digest], "plugins": sorted({*BUILT_IN[digest]["plugins"], *seated}), "source": "built_in"}
+        return {**BUILT_IN[digest], "plugins": sorted({*BUILT_IN[digest]["plugins"], *seated}), "seated": sorted(seated),
+                "source": "built_in"}
     command = [str(launcher), "--repo", str(repo), "--json", "provider-review", "show", "--binary-sha256", digest]
     try:
         answer = subprocess.run(command, cwd=repo, stdin=subprocess.DEVNULL, capture_output=True, text=True,
@@ -809,7 +811,7 @@ def reviewed(digest, launcher, repo, seated=()):
                                    and set(record["agents"]) <= {g for a in anchors for g in a["agents"]}):
                 raise ReviewError(f"The recorded review ({record['source']}) claims a restricted surface or built-ins no "
                                   "hand review covered, or was made under a managed setting no longer in place.")
-            return {**record, "plugins": sorted({*record["plugins"], *seated})}
+            return {**record, "plugins": sorted({*record["plugins"], *seated}), "seated": sorted(seated)}
     return None
 
 
@@ -904,6 +906,8 @@ def review(provider, out, model=DEFAULT_MODEL, seated=()):
         reasons.append("the restricted call read a file outside its working directory")
     if not version or restricted.get("version") != version:
         reasons.append("the session's reported version differs from the binary's")
+    if not set(seated) <= set(report["plugins"]):
+        reasons.append("the restricted call did not report the guard this machine's managed setting seats")
     if anchors and not (set(report["plugins"]) - set(seated) <= {p for a in anchors for p in a["plugins"]}
                         and set(report["agents"]) <= {g for a in anchors for g in a["agents"]}):
         reasons.append("the session reports built-in plugins or agents no hand review covered")
