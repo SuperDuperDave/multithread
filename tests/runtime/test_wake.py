@@ -35,7 +35,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
 from relay_core import cli as core_cli
 from relay_core.store import RelayStore
-from relay_core.protocol import DECISION_ROLLOUT_FENCE, session_target
+from relay_core.protocol import DECISION_ROLLOUT_FENCE, ValidationError, session_target
 from relay_runtime import cli as runtime_cli, hooks, wake
 
 SENT = " (sent 2026-10-08 12:00Z)"
@@ -682,6 +682,14 @@ class SenderContextTests(WakeCase):
         self.assertEqual(f"Multithread wake from claude: {self.task}{SENT}", missing["text"])
         explicit = self.sender_wake("--dry-run", "--sender-role", "engineer", session=None)
         self.assertEqual("NOT SENT", explicit["status"])
+        with mock.patch.object(wake.os, "getcwd", return_value=str(self.source)), \
+             mock.patch.dict(os.environ, {"RELAY_SESSION": "", "RELAY_AGENT": ""}):
+            code, out = self.run_helper(wake.wake_main, "operator", "--ref", str(self.task), "--session", "sender",
+                                        "--codex", str(self.codex), "--json", "--dry-run", "--sender-role", "engineer")
+        partial = json.loads(out)
+        self.assertEqual(("NOT SENT", "not_given"), (partial["status"], partial["sender_state"]))
+        self.assertIn("looked up by the sender's identity, and none was given", partial["happened"],
+                      "no ledger was asked, so none is said to have refused")
         self.assertEqual(source_reads, [call for call in self.ledger_calls
                                        if Path(call[0]).is_relative_to(self.source)])
         self.assertEqual(before, self.events())
@@ -2848,13 +2856,16 @@ class BindTests(WakeCase):
         self.assertIn("Pass --approval-file with the path of the durable file it hashes", out)
         code, out = self.approve(digest, "--approval-file", str(approval))
         self.assertEqual(4, code, "the fixture lives in a temporary directory")
-        self.assertIn("which doesn't survive a restart", out)
-        with mock.patch.object(wake, "_EPHEMERAL_ROOTS", ()):
-            self.assertIn(f"has {digest}, not sha256:{'b' * 64}",
-                          self.approve("sha256:" + "b" * 64, "--approval-file", str(approval))[1])
+        self.assertIn("which isn't a durable place", out)
+        with mock.patch.object(core_cli, "_NOT_DURABLE", ()):
+            wrong = self.approve("sha256:" + "b" * 64, "--approval-file", str(approval))[1]
             code, out = self.approve(digest, "--approval-file", str(approval))
+        # A file's digest or contents never reach the output: naming a file mustn't disclose it (Daybreak Blue).
+        self.assertIn(f"doesn't have digest sha256:{'b' * 64}", wrong)
+        self.assertNotIn(digest.removeprefix("sha256:"), wrong)
         self.assertEqual(0, code, out)
-        self.assertIn(f"Approval: {approval}, whose sha256 matches {digest}: \"Approved: move operator", out)
+        self.assertIn(f"Approval: {approval}, whose sha256 matches {digest} (checked:", out)
+        self.assertNotIn("Approved: move operator", out)
         self.assertEqual(f"approved move; approval file {approval}", self.events("wake.bound")[-1]["meta"]["reason"],
                          "an audit can find the file without a protocol change")
         self.assertEqual(4, self.approve(digest, "--approval-repo", str(self.repo))[0], "repo is for git: only")
@@ -2866,7 +2877,7 @@ class BindTests(WakeCase):
         digest = "sha256:" + hashlib.sha256(approval.read_bytes()).hexdigest()
         pipe = self.base / "approval.fifo"
         os.mkfifo(pipe)
-        with mock.patch.object(wake, "_EPHEMERAL_ROOTS", ()):
+        with mock.patch.object(core_cli, "_NOT_DURABLE", ()):
             approval.chmod(0)
             try:
                 code, out = self.approve(digest, "--approval-file", str(approval))
@@ -2879,6 +2890,76 @@ class BindTests(WakeCase):
             self.assertEqual(4, code, out)
             self.assertIn("isn't a regular file", out)
 
+    def test_a_named_repository_runs_none_of_its_own_programs(self):
+        # Git reads the repository the caller names; its config must not run anything (Opus: gpg.program ran for a
+        # signed commit, and a partial clone's lazy fetch ran core.sshCommand).
+        self.bound()
+        marker = self.base / "RAN"
+        program = self.base / "program.sh"
+        program.write_text(f"#!/bin/sh\ntouch '{marker}'\nexit 1\n")
+        program.chmod(0o700)
+        hostile = self.base / "hostile"
+        hostile.mkdir()
+        git = lambda *a, **k: subprocess.run(["git", "-C", str(hostile), *a], check=True, capture_output=True,
+                                             text=True, **k)
+        git("init", "-q")
+        for key, value in (("gpg.program", str(program)), ("log.showSignature", "true"),
+                           ("core.sshCommand", str(program)), ("core.fsmonitor", str(program)),
+                           ("core.hooksPath", str(self.base)), ("remote.origin.url", "ssh://fixture.invalid/x"),
+                           ("remote.origin.promisor", "true"), ("extensions.partialClone", "origin")):
+            git("config", key, value)
+        tree = git("hash-object", "-t", "tree", "-w", "--stdin", input="").stdout.strip()
+        signed = (f"tree {tree}\nauthor A <a@invalid> 1700000000 +0000\ncommitter A <a@invalid> 1700000000 +0000\n"
+                  "gpgsig -----BEGIN PGP SIGNATURE-----\n \n -----END PGP SIGNATURE-----\n\nApprove\n")
+        commit = git("hash-object", "-t", "commit", "-w", "--stdin", "--literally", input=signed).stdout.strip()
+        code, out = self.approve("git:" + commit, "--approval-repo", str(hostile))
+        self.assertEqual(0, code, out)
+        code, out = self.approve("git:" + "1" * 40, "--approval-repo", str(hostile))
+        self.assertEqual(4, code, out)
+        self.assertIn("isn't an object in", out, "a missing object is not fetched")
+        self.assertFalse(marker.exists(), "nothing the repository names may run")
+
+    def test_places_that_arent_files_and_oversized_receipts_are_refused_cleanly(self):
+        self.bound()
+        code, out = self.approve("sha256:" + "0" * 64, "--approval-file", "/proc/self/status")
+        self.assertEqual(4, code, out)
+        self.assertIn("is under /proc, which isn't a durable place", out)
+        code, out = self.approve("receipt:" + "9" * 30)
+        self.assertEqual(4, code, out)
+        self.assertIn("isn't git:<full object id>, sha256:<digest> or receipt:<ledger seq>", out)
+        with self.store() as store, self.assertRaisesRegex(ValidationError, "written plainly"):
+            store._approval_receipt("receipt:" + "9" * 30)  # the ledger's own check holds without the front door
+
+    def test_a_control_that_changes_nothing_shows_no_approval(self):
+        self.bound()
+        ref = "git:" + self.git_head(self.repo)
+        outputs = []
+        for _ in range(2):
+            out = io.StringIO()
+            with redirect_stdout(out):
+                code = core_cli.main(["--repo", str(self.repo), "--home", str(self.home), "pause", "operator",
+                                      "--agent", "claude", "--session", "binder", "--reason", "approved pause",
+                                      "--approval-ref", ref])
+            self.assertEqual(0, code, out.getvalue())
+            outputs.append(out.getvalue())
+        self.assertIn("Approval: git commit", outputs[0])
+        self.assertNotIn("Approval:", outputs[1], "a duplicate records nothing, so it rests on nothing")
+
+    def test_an_approval_file_that_grows_while_read_is_refused(self):
+        self.bound()
+        approval = self.base / "growing.md"
+        approval.write_bytes(b"x" * 64)
+        real_fstat = core_cli.os.fstat
+
+        def small(fd):  # what fstat saw before the file grew
+            info = real_fstat(fd)
+            return os.stat_result((info.st_mode, *info[1:6], 1, *info[7:]))
+        with mock.patch.object(core_cli, "_NOT_DURABLE", ()), mock.patch.object(core_cli, "_APPROVAL_FILE_MAX", 16), \
+                mock.patch.object(core_cli.os, "fstat", small):
+            code, out = self.approve("sha256:" + "0" * 64, "--approval-file", str(approval))
+        self.assertEqual(4, code, out)
+        self.assertIn("grew past 64 MiB while it was read", out)
+
     def test_approval_flags_are_checked_even_when_nothing_would_change(self):
         self.bound()
         code, out = self.bind("--approval-repo", str(self.repo))
@@ -2887,14 +2968,15 @@ class BindTests(WakeCase):
 
     def test_a_receipt_approval_must_be_an_answered_decision_here(self):
         first = self.bound()
-        for ref, said in ((f"receipt:binding:{first}", "isn't receipt:<ledger seq> written plainly"),
+        for ref, said in ((f"receipt:binding:{first}", "isn't git:<full object id>, sha256:<digest> or receipt:"),
                           (f"receipt:0{first}", "isn't receipt:<ledger seq> written plainly"),  # one spelling each
                           (f"receipt:{first}", "is a wake.bound, not an answered decision"),
                           ("receipt:999999", "names no event in this ledger")):
             code, out = self.approve(ref)
             self.assertEqual(4, code, out)
             self.assertIn(said, out)
-            self.assertIn("Nothing was recorded. Name the decision response itself", out)
+            if ref.removeprefix("receipt:").isdigit():  # the ledger's own check, past the form
+                self.assertIn("Nothing was recorded. Name the decision response itself", out)
         with self.store() as store:
             ref = approved_receipt(store)
         code, out = self.approve(ref)
@@ -2903,16 +2985,38 @@ class BindTests(WakeCase):
         self.assertIn(f"({ref}): \"", out)
         self.assertEqual(ref, self.events("wake.bound")[-1]["meta"]["approval_ref"])
 
-    def test_pause_by_another_holder_checks_its_approval_before_admission(self):
-        self.bound()
-        err = io.StringIO()
-        with redirect_stderr(err), redirect_stdout(io.StringIO()):
-            code = runtime_cli.main(["--repo", str(self.repo), "pause", "operator", "--agent", "codex", "--session",
-                                     "someone", "--expected-generation", "1", "--reason", "x",
-                                     "--approval-ref", "git:" + "0" * 40])
-        self.assertNotEqual(0, code)
-        self.assertIn("isn't an object in", err.getvalue())
-        self.assertIn("nothing was recorded", err.getvalue())
+    def test_every_entry_resolves_its_approval_where_it_is_admitted(self):
+        # The control commands and the installed wake-ledger bind all run through core main, which resolves the
+        # approval before the ledger opens: none records a reference that doesn't resolve (in 0.4.33's first draft
+        # wake-ledger bind did; Sol, Daybreak Blue and Opus each found it).
+        first = self.bound()
+
+        def core(*argv):
+            out, err = io.StringIO(), io.StringIO()
+            with redirect_stdout(out), redirect_stderr(err):
+                code = core_cli.main(["--repo", str(self.repo), "--home", str(self.home), *argv])
+            return code, out.getvalue() + err.getvalue()
+        holder = ["--agent", "codex", "--session", "someone"]
+        handover = ["--expected-generation", str(first), "--reason", "x"]
+        before = len(self.events())
+        for argv in (["pause", "operator", *holder, *handover],
+                     ["wake-ledger", "bind", "operator", *holder, "--endpoint", "unix:///srv/fixture.sock",
+                      "--thread", OTHER, "--cwd", str(self.repo), "--replace", *handover]):
+            with self.subTest(command=argv[0]):
+                code, said = core(*argv, "--approval-ref", "git:" + "0" * 40)
+                self.assertNotEqual(0, code, said)
+                self.assertIn("isn't an object in", said)
+                self.assertIn("nothing was recorded", said)
+        approval = self.base / "approval.md"
+        approval.write_text("Approved\n")
+        digest = "sha256:" + hashlib.sha256(approval.read_bytes()).hexdigest()
+        with mock.patch.object(core_cli, "_NOT_DURABLE", ()):
+            code, said = core("pause", "operator", *holder, "--expected-generation", str(first),
+                              "--approval-ref", digest, "--approval-file", str(approval))
+        self.assertNotEqual(0, code, said)
+        self.assertIn("its path is kept in --reason; nothing was recorded. Next: Pass --reason.", said,
+                      "an approval's place never stands in for a missing reason")
+        self.assertEqual(before, len(self.events()))
         rendered = core_cli._render_wake_control("pause", {
             "duplicate": False, "binding": {"role": "operator", "generation": 7},
             "approval": {"ref": "git:" + "a" * 40, "kind": "commit", "repo": "/srv/approvals",

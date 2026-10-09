@@ -798,18 +798,25 @@ recipient needs the holder's release, or actual user authorization for the
 handover. For that authorized replacement, add `--replace
 --expected-generation N --reason 'why this handover is authorized'
 --approval-ref <reference>` to the new `bind` command, preserving the approved
-scope and charter. The reference must resolve, or nothing is recorded:
+scope and charter. The reference must resolve, or nothing is recorded, on
+every command that takes it, `wake-ledger bind` included:
 
 - `git:<full object id>` is an object in the bound checkout, or in the
-  repository `--approval-repo <path>` names. Nothing is fetched.
-- `sha256:<digest>` is the digest of the durable file `--approval-file <path>`
-  names, outside `/tmp`, `/var/tmp`, `/dev/shm` and `/run`. Its path is added to
-  the recorded reason so an audit can find it.
+  repository `--approval-repo <path>` names; that repository's path is added to
+  the recorded reason. Nothing is fetched, and nothing the repository's
+  configuration names (hooks, a signature program, a transport) is run.
+- `sha256:<digest>` is the digest of the durable regular file
+  `--approval-file <path>` names, at most 64 MiB and outside `/tmp`,
+  `/var/tmp`, `/dev`, `/run`, `/proc` and `/sys`. Its path is added to the
+  recorded reason so an audit can find it. Nothing from the file is shown,
+  not even its digest when it doesn't match.
 - `receipt:<seq>` is an answered decision in this ledger: a
   `decision.responded` whose resolution is `choice` or `directive`.
 
-The result shows what the reference rests on: a commit's repository, subject
-and date; the file's path and first line; or the decision's answer and who gave
+An approval that names a repository or a file needs `--reason`, which carries
+its path. A command that changes nothing records nothing and shows no
+approval. The result shows what the reference rests on: a commit's repository,
+subject and date; the file's path; or the decision's answer and who gave
 it. This checks the reference's integrity and kind, not who approved: the
 approval repository and file are the caller's choice, and a decision response
 is an agent's answer, not a person's signature. These flags audit authority

@@ -8,6 +8,8 @@ import io
 import json
 import os
 from pathlib import Path
+import re
+import stat
 import subprocess
 import sys
 from typing import Any, Callable, Mapping, Sequence
@@ -347,6 +349,8 @@ def build_parser() -> argparse.ArgumentParser:
     bind.add_argument("--expected-generation", type=int)
     bind.add_argument("--reason")
     bind.add_argument("--approval-ref")
+    bind.add_argument("--approval-repo", help="repository holding a git: approval; default this checkout")
+    bind.add_argument("--approval-file", help="durable file whose digest a sha256: approval names")
     history = wake_actions.add_parser("history", help="read original-binding attempts and observed ACKs")
     history.add_argument("role")
     history.add_argument("--limit", type=int, default=30)
@@ -393,20 +397,25 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: Sequence[str] | None = None, *, carried: Mapping[str, Any] | None = None) -> int:
-    """carried: values the installed front door settled before admission, such as a resolved approval."""
+def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     raw_argv = list(argv if argv is not None else sys.argv[1:])
     if "--json" in raw_argv:
         raw_argv = [item for item in raw_argv if item != "--json"]
         raw_argv.insert(0, "--json")
     args = parse(parser, raw_argv)
-    for key, value in (carried or {}).items():
-        setattr(args, key, value)
     if args.command == "hook":
         return _run_hook(args)
 
     try:
+        args.approval_resolved = None
+        if args.command in {"unbind", "pause", "resume"} or (args.command == "wake-ledger"
+                                                              and args.wake_action == "bind"):
+            # Resolved here, where every entry point is admitted, before the ledger is opened; receipt: is the
+            # ledger's to check.
+            args.approval_resolved = resolve_approval(args.approval_ref, args.repo or os.getcwd(),
+                                                      args.approval_repo, args.approval_file)
+            args.reason = with_approval_place(args.reason, args.approval_resolved, args.approval_repo is not None)
         if args.command == "wake-ledger" and args.wake_action in ("plan", "begin"):
             _wake_expectation(args)
             if args.wake_action == "begin":
@@ -584,8 +593,9 @@ def _dispatch(store: RelayStore, args: argparse.Namespace) -> Any:
         result = store.wake_control(args.command, args.role, agent=agent, session=session,
                                     expected_generation=args.expected_generation,
                                     reason=args.reason, approval_ref=args.approval_ref)
-        resolved = getattr(args, "approval_resolved", None)  # git: and sha256: refs, checked before admission
-        return {**result, "approval": resolved} if resolved is not None else result
+        approval = result.get("approval") or args.approval_resolved
+        return {**result, "approval": approval} if approval is not None and not result.get("duplicate") else {
+            key: value for key, value in result.items() if key != "approval"}
     if args.command == "wake-ledger":
         return _dispatch_wake(store, args)
     if args.command == "events":
@@ -689,12 +699,15 @@ def _dispatch_wake(store: RelayStore, args: argparse.Namespace) -> Any:
         )
     agent, session = _actor(args)
     if action == "bind":
-        return store.wake_bind(
+        result = store.wake_bind(
             args.role, provider=args.provider, thread=args.thread, endpoint=args.endpoint,
             cwd=args.cwd, replace=args.replace, agent=agent, session=session,
             charter=args.charter, role_scope=args.role_scope,
             expected_generation=args.expected_generation, reason=args.reason, approval_ref=args.approval_ref,
         )
+        approval = result.get("approval") or args.approval_resolved  # receipt: comes back from the ledger
+        return {**result, "approval": approval} if approval is not None and not result.get("duplicate") else {
+            key: value for key, value in result.items() if key != "approval"}
     if action == "begin":
         return store.wake_begin(
             args.role, ref=args.ref, requested=args.requested,
@@ -720,21 +733,169 @@ def _wake_sender(args: argparse.Namespace) -> dict[str, Any] | None:
     return canonical_wake_sender(_read_json_object(io.BytesIO(data)))
 
 
+# --- Approval references -------------------------------------------------------
+# One resolver, where every entry point is admitted: an --approval-ref that doesn't resolve isn't recorded.
+
+_NOT_DURABLE = ("/tmp", "/var/tmp", "/dev", "/run", "/proc", "/sys")  # gone at a restart, or not a file at all
+_APPROVAL_FILE_MAX = 64 * 1024 * 1024
+# Git runs on a repository the caller names, so nothing in that repository's config may run a program: no hooks,
+# fsmonitor, signature program or transport (which a partial clone's lazy fetch would start).
+_APPROVAL_GIT = ("git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "protocol.allow=never",
+                 "-c", "log.showSignature=false", "-c", "gpg.program=false", "-c", "core.sshCommand=false")
+_APPROVAL_GIT_ENV = {"PATH": "/usr/bin:/bin", "HOME": "/nonexistent", "LC_ALL": "C", "GIT_CONFIG_GLOBAL": "/dev/null",
+                     "GIT_CONFIG_SYSTEM": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1", "GIT_TERMINAL_PROMPT": "0",
+                     "GIT_OPTIONAL_LOCKS": "0", "GIT_NO_LAZY_FETCH": "1", "GIT_NO_REPLACE_OBJECTS": "1"}
+
+
+class ApprovalUnresolved(ValidationError):
+    """An --approval-ref that doesn't resolve isn't an approval; the message ends with what would."""
+
+    def __init__(self, message: str, next_step: str):
+        super().__init__(f"{message}; nothing was recorded. Next: {next_step[:1].upper()}{next_step[1:]}")
+
+
+def _shown(text: Any, limit: int = 160) -> str:
+    """Caller-chosen text (a path, a reference) as one bounded line, control characters escaped."""
+    line = "".join(character if character.isprintable() else json.dumps(character)[1:-1] for character in str(text))
+    return line if len(line) <= limit else line[:limit - 1] + "…"
+
+
+def resolve_approval(ref: str | None, checkout: str | Path, approval_repo: str | None = None,
+                     approval_file: str | None = None) -> dict[str, Any] | None:
+    """What a git: or sha256: approval rests on; None for none, or for a receipt:, which the ledger resolves.
+
+    It checks that the reference exists and is what it says. It can't show who approved, and the repository and
+    file are the caller's choice. Nothing from the file reaches the output but its path: a digest the caller didn't
+    already know is never shown."""
+    if ref is None:
+        if approval_repo is not None or approval_file is not None:
+            raise ApprovalUnresolved("--approval-repo and --approval-file qualify an --approval-ref, and none was "
+                                     "given", "pass the --approval-ref they belong to, or drop them.")
+        return None
+    if approval_repo is not None and not ref.startswith("git:"):
+        raise ApprovalUnresolved(f"--approval-repo names where a git: approval is, but {_shown(ref)} isn't one",
+                                 "drop --approval-repo.")
+    if approval_file is not None and not ref.startswith("sha256:"):
+        raise ApprovalUnresolved(f"--approval-file holds a sha256: approval's file, but {_shown(ref)} isn't one",
+                                 "drop --approval-file.")
+    if not re.fullmatch(r"git:(?:[0-9a-f]{40}|[0-9a-f]{64})|sha256:[0-9a-f]{64}|receipt:[0-9]{1,18}", ref):
+        raise ApprovalUnresolved(f"--approval-ref {_shown(ref, 90)} isn't git:<full object id>, sha256:<digest> or "
+                                 "receipt:<ledger seq>", "pass one of those forms.")
+    if ref.startswith("receipt:"):
+        return None
+    if ref.startswith("git:"):
+        return _git_approval(ref, Path(approval_repo or checkout).absolute())
+    return _file_approval(ref, approval_file)
+
+
+def _git_approval(ref: str, repo: Path) -> dict[str, Any]:
+    oid = ref.removeprefix("git:")
+
+    def git(*arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run([*_APPROVAL_GIT, "-C", str(repo), *arguments], env=_APPROVAL_GIT_ENV,
+                              stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=10)
+    try:
+        where = git("rev-parse", "--absolute-git-dir")
+        if where.returncode != 0:
+            why = where.stderr.strip().splitlines()[0] if where.stderr.strip() else "no git directory"
+            raise ApprovalUnresolved(f"{_shown(repo)} isn't a readable git repository ({_shown(why)}), so "
+                                     f"--approval-ref {ref} couldn't be checked",
+                                     "pass --approval-repo with the repository that holds the approval.")
+        top = git("rev-parse", "--show-toplevel")  # a bare repository has no working tree: name its directory
+        holder = top.stdout.strip() if top.returncode == 0 and top.stdout.strip() else where.stdout.strip()
+        kind = git("cat-file", "-t", oid)
+        if kind.returncode != 0:
+            raise ApprovalUnresolved(f"--approval-ref {ref} isn't an object in {_shown(holder)}",
+                                     "fetch it there, or pass --approval-repo for the repository that holds it.")
+        approval = {"ref": ref, "kind": kind.stdout.strip(), "repo": holder, "subject": None, "date": None}
+        if approval["kind"] == "commit":
+            shown = git("log", "-1", "--no-show-signature", "--format=%s%x00%aI", oid)
+            if shown.returncode == 0 and "\0" in shown.stdout:
+                subject, date = shown.stdout.rstrip("\n").split("\0", 1)
+                approval.update(subject=_shown(subject, 120), date=_shown(date, 40))
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ApprovalUnresolved(f"--approval-ref {ref} couldn't be checked in {_shown(repo)} "
+                                 f"({_shown(exc.__class__.__name__)})",
+                                 "check that git runs and the repository is readable, then run this again.") from None
+    return approval
+
+
+def _file_approval(ref: str, approval_file: str | None) -> dict[str, Any]:
+    if approval_file is None:
+        raise ApprovalUnresolved(f"--approval-ref {ref} names a digest, and nothing says which file it is",
+                                 "pass --approval-file with the path of the durable file it hashes.")
+    try:
+        real = Path(approval_file).resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise ApprovalUnresolved(f"--approval-file {_shown(approval_file)} can't be read "
+                                 f"({_shown(getattr(exc, 'strerror', None) or exc.__class__.__name__)})",
+                                 "pass the path of the file the digest names.") from None
+    root = next((root for root in _NOT_DURABLE if str(real) == root or str(real).startswith(root + "/")), None)
+    if root is not None:
+        raise ApprovalUnresolved(f"--approval-file {_shown(real)} is under {root}, which isn't a durable place",
+                                 "keep the approval in a durable place, such as the project's records, and pass "
+                                 "that path.")
+    digest, size = hashlib.sha256(), 0
+    try:
+        # One non-blocking open, checked through the open file: a pipe can't hang it and a swap can't fool it.
+        with os.fdopen(os.open(real, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC | os.O_NOCTTY), "rb") as stream:
+            info = os.fstat(stream.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_size > _APPROVAL_FILE_MAX:
+                raise ApprovalUnresolved(f"--approval-file {_shown(real)} isn't a regular file of at most 64 MiB",
+                                         "pass the approval file itself.")
+            for chunk in iter(lambda: stream.read(1 << 20), b""):
+                size += len(chunk)
+                if size > _APPROVAL_FILE_MAX:  # still growing while read
+                    raise ApprovalUnresolved(f"--approval-file {_shown(real)} grew past 64 MiB while it was read",
+                                             "pass a settled approval file.")
+                digest.update(chunk)
+    except OSError as exc:
+        raise ApprovalUnresolved(f"--approval-file {_shown(real)} can't be read "
+                                 f"({_shown(exc.strerror or exc.__class__.__name__)})",
+                                 "make it readable by this user, or pass the file the digest names.") from None
+    if "sha256:" + digest.hexdigest() != ref:
+        raise ApprovalUnresolved(f"--approval-file {_shown(real)} doesn't have digest {ref}",
+                                 "pass the file the approval names.")
+    return {"ref": ref, "kind": "file", "path": str(real)}
+
+
+def with_approval_place(reason: str | None, approval: Mapping[str, Any] | None, named_repo: bool) -> str | None:
+    """The record's reason, carrying where the approval is when the caller chose the place: a file, or a repository
+    named with --approval-repo. An approval that names a place needs a reason to carry it."""
+    if approval is None:
+        return reason
+    if approval["kind"] == "file":
+        place = f"approval file {approval['path']}"
+    elif named_repo:
+        place = f"approval repository {approval['repo']}"
+    else:
+        return reason
+    if not reason:
+        raise ApprovalUnresolved(f"--approval-ref {approval['ref']} rests on a place outside this ledger, and its "
+                                 "path is kept in --reason", "pass --reason.")
+    noted = f"{reason}; {place}"
+    if len(noted) > 300:
+        raise ApprovalUnresolved("--reason has no room left to record where the approval is (300 characters)",
+                                 "shorten --reason and run this again.")
+    return noted
+
+
 def describe_approval(approval: Mapping[str, Any]) -> str:
     """What an approval reference rests on, for a reader to judge: integrity and kind were checked, not who."""
     return _approval_basis(approval) + " (checked: it exists and is this kind; not who approved)"
 
 
 def _approval_basis(approval: Mapping[str, Any]) -> str:
+    quoted = lambda text: json.dumps(_shown(text, 120), ensure_ascii=False)  # noqa: E731 - quotes stay quoted
     kind = approval["kind"]
     if kind == "decision.responded":
-        answer = approval["resolution"] + (f" {approval['choice']}" if approval.get("choice") else "")
-        return (f"decision {approval['decision_id']} answered {answer} by {approval['source']} at {approval['at']} "
-                f"({approval['ref']}): \"{approval['summary']}\"")
+        answer = _shown(approval["resolution"] + (f" {approval['choice']}" if approval.get("choice") else ""), 80)
+        return (f"decision {_shown(approval['decision_id'], 80)} answered {answer} by {_shown(approval['source'], 80)} "
+                f"at {_shown(approval['at'], 40)} ({approval['ref']}): {quoted(approval['summary'])}")
     if kind == "file":
-        return f"{approval['path']}, whose sha256 matches {approval['ref']}: \"{approval['first_line']}\""
-    detail = f": \"{approval['subject']}\" ({approval['date']})" if approval.get("subject") is not None else ""
-    return f"git {kind} {approval['ref'].removeprefix('git:')[:12]} in {approval['repo']}{detail}"
+        return f"{_shown(approval['path'])}, whose sha256 matches {approval['ref']}"
+    detail = f": {quoted(approval['subject'])} ({_shown(approval['date'], 40)})" if approval.get("subject") else ""
+    return f"git {_shown(kind, 20)} {approval['ref'].removeprefix('git:')[:12]} in {_shown(approval['repo'])}{detail}"
 
 
 def _render_wake_control(command: str, result: Mapping[str, Any]) -> str:

@@ -1460,10 +1460,10 @@ class RelayStore:
         target = approval_ref.removeprefix("receipt:")
         response = ("Nothing was recorded. Name the decision response itself, the decision.responded event that "
                     "multithread decision respond recorded, as receipt:<its seq>")
-        if not target.isascii() or not target.isdigit() or target != str(int(target)):
+        if not target.isascii() or not target.isdigit() or len(target) > 18 or target != str(int(target)):
             raise ValidationError(
-                f"--approval-ref {approval_ref} isn't receipt:<ledger seq> written plainly (no sign or leading "
-                f"zero). {response}"
+                f"--approval-ref {approval_ref[:40]} isn't receipt:<ledger seq> written plainly (no sign or "
+                f"leading zero). {response}"
             )
         row = self._execute("SELECT * FROM events WHERE seq = ?", (int(target),)).fetchone()
         if row is None:
