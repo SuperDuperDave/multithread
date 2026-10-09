@@ -126,6 +126,22 @@ class CaptureFilesTests(unittest.TestCase):
         self.assert_incomplete(c.finish(0, clean=True))
         self.assertEqual([], list(target.iterdir()))
 
+    def test_replaced_named_file_cannot_seal_retained_old_descriptor(self):
+        c = self.capture()
+        self.complete(c)
+        directory = self.root / "transport"
+        (directory / "stdin.bin").rename(self.root / "moved-stdin.bin")
+        (directory / "stdin.bin").write_bytes(b"x" * len(b'{"id":1}\n'))
+        (directory / "stdin.bin").chmod(0o600)
+        self.assert_incomplete(c.finish(0, clean=True))
+
+    def test_replaced_capture_directory_cannot_redirect_inventory_path(self):
+        c = self.capture()
+        self.complete(c)
+        (self.root / "transport").rename(self.root / "moved-transport")
+        (self.root / "transport").mkdir(mode=0o700)
+        self.assert_incomplete(c.finish(0, clean=True))
+
     def test_each_initial_recording_operation_failure_refuses_without_throwing(self):
         for operation in ("open", "mkdir", "write", "fsync"):
             with self.subTest(operation=operation), tempfile.TemporaryDirectory() as folder:

@@ -478,6 +478,7 @@ class TransportCapture:
              "journal": "journal.jsonl", "context": "context.json"}
 
     def __init__(self, directory, context):
+        self.path = os.fspath(directory)
         self.directory_fd = None
         self.files = {}
         self.counts = {name: 0 for name in self.NAMES}
@@ -572,6 +573,10 @@ class TransportCapture:
                     or not self.counts["stdin"] or not self.counts["stdout"]):
                 raise ValueError("capture did not reach a clean whole end")
             self._event("leader_reaped", exit_code=exit_code)
+            retained = os.fstat(self.directory_fd)
+            visible = os.stat(os.path.join(self.path, "transport"), follow_symlinks=False)
+            if (retained.st_dev, retained.st_ino) != (visible.st_dev, visible.st_ino):
+                raise OSError("capture directory path changed")
             if set(os.listdir(self.directory_fd)) != set(self.NAMES.values()):
                 raise OSError("capture directory inventory changed")
             members = []
@@ -579,7 +584,9 @@ class TransportCapture:
                 fd = self.files[kind]
                 os.fsync(fd)
                 info = os.fstat(fd)
+                visible = os.stat(name, dir_fd=self.directory_fd, follow_symlinks=False)
                 if (info.st_uid != os.getuid() or info.st_nlink != 1
+                        or (info.st_dev, info.st_ino) != (visible.st_dev, visible.st_ino)
                         or info.st_mode & 0o777 != 0o600
                         or not stat.S_ISREG(info.st_mode) or info.st_size != self.counts[kind]):
                     raise OSError("capture file changed")
@@ -616,6 +623,9 @@ class TransportCapture:
                     dst_dir_fd=self.directory_fd, follow_symlinks=False)
             os.unlink("inventory.tmp", dir_fd=self.directory_fd)
             os.fsync(self.directory_fd)
+            visible = os.stat(os.path.join(self.path, "transport"), follow_symlinks=False)
+            if (retained.st_dev, retained.st_ino) != (visible.st_dev, visible.st_ino):
+                raise OSError("capture directory path changed during publication")
             self.report.update(status="complete", inventory_sha256=hashlib.sha256(inventory).hexdigest(),
                                path="transport/inventory.json", stdout_eof=True, events=self.sequence)
         except (OSError, ValueError, TypeError):
