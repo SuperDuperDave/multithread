@@ -33,11 +33,11 @@ _MODEL_LIST_PAGES = 32
 _MODEL_LIST_SECONDS = 10
 _MCP_STATUS_PAGES = 5  # bounded: what runs is listed before the task, not browsed
 _FEATURE_PAGES = 5  # Codex 0.161 lists its 160 features in one page
-# Child threads are always off for a peer; plugins and apps unless the call allows them. Codex's own per-thread
+# Child threads are always off for a peer; plugins and apps each unless the call allows them. Codex's own per-thread
 # feature list must confirm each before the task goes out.
 _ALWAYS_OFF = ("multi_agent", "multi_agent_v2")
-_PLUGINS_OFF = ("plugins", "apps")
 _APPS_SERVER = "codex_apps"  # Codex's one server for the account's ChatGPT apps (connectors); it has no pluginId
+_OPT_INS = "pass --allow-plugins to admit the account's plugin servers, or --allow-apps its ChatGPT apps (connectors)"
 _APPROVAL_POLICIES = ("untrusted", "on-failure", "on-request", "never")
 # A peer never escalates: asked for in every request that can carry it, and confirmed in Codex's response.
 _NO_ESCALATION = {"approvalPolicy": "never", "approvalsReviewer": "user"}
@@ -377,6 +377,8 @@ class _Driver:
         self.mcp_pages = 0
         self.mcp_read = 0
         self.feature_pages = 0
+        self.admitted = None  # the MCP servers this call allows, once the list is read
+        self.early_activity = []
         self.features = {}
         self.mcp_servers = []
         self.envelope.update(state="uncertain", requested_session_id=resume,
@@ -478,7 +480,9 @@ class _Driver:
                     self.features[name] = enabled if self.features.get(name, enabled) == enabled else None
             if cursor is not None and self.feature_pages < _FEATURE_PAGES:
                 return self.list_features(cursor)
-        off = _ALWAYS_OFF + (_PLUGINS_OFF if self.envelope["provider_plugins"].get("mode") == "off" else ())
+        modes = self.envelope.get("provider_plugins") or {}
+        off = _ALWAYS_OFF + tuple(name for name, key in (("plugins", "mode"), ("apps", "apps_mode"))
+                                  if modes.get(key) != "allowed")
         state = {name: self.features.get(name) for name in off}
         self.envelope["provider_features"] = state
         # Only a list read to its end confirms anything: a later page could still turn a feature on.
@@ -497,9 +501,9 @@ class _Driver:
                                               **({"cursor": cursor} if cursor is not None else {})})
 
     def mcp_listed(self, result):
-        """Record the MCP servers this thread runs, before its task goes out. With plugins off it should run none:
-        any server, or a listing that can't be read to its end, stops the call with no task submitted."""
-        plugins = self.envelope.setdefault("provider_plugins", {"mode": "allowed"})
+        """Record the MCP servers this thread runs, before its task goes out. A server the call didn't allow, or a
+        list that can't be read to its end, stops the call with no task submitted."""
+        plugins = self.envelope.setdefault("provider_plugins", {"mode": "off", "apps_mode": "off"})
         page = result.get("data") if isinstance(result, dict) else None
         cursor = result.get("nextCursor") if isinstance(result, dict) else None
         readable = (isinstance(page, list) and all(isinstance(server, dict) for server in page)
@@ -519,34 +523,45 @@ class _Driver:
             plugin_servers=[{"name": name, "plugin": plugin} for name, plugin in self.mcp_servers
                             if plugin is not None][:50] if observed else None,
             apps=_APPS_SERVER in names if observed else None)
-        if plugins.get("mode") == "off":
-            if names:
-                raise _ProtocolError(
-                    f"Codex runs {'' if complete else 'at least '}{len(names)} MCP server(s) ({', '.join(names[:5])}) "
-                    "although this call turned plugins "
-                    "and apps off; no task was submitted. Next: pass --allow-plugins to run with the account's "
-                    "plugins, apps and MCP servers, or inspect retained output.")
-            if not complete:
-                if readable:
-                    why = f"it has more than {_MCP_STATUS_PAGES} pages"
-                elif result is None and self.mcp_pages == 1:
-                    why = "it is unavailable"
-                else:
-                    why = f"page {self.mcp_pages} " + ("failed" if result is None else "is unreadable")
-                raise _ProtocolError(
-                    f"Codex's list of MCP servers couldn't be read to its end ({why}), so this call can't show none "
-                    "run; no task was submitted. Next: pass --allow-plugins to run without that check, or inspect "
-                    "retained output.")
+        # Only an explicit opt-in admits a server: --allow-plugins a plugin's, --allow-apps the apps' one server.
+        refused = sorted(name for name, plugin in self.mcp_servers if not self.admits(name, plugin))
+        if refused:
+            raise _ProtocolError(
+                f"Codex runs {'' if complete else 'at least '}{len(refused)} MCP server(s) this call didn't allow ({', '.join(refused[:5])}); no task "
+                f"was submitted. Next: {_OPT_INS}, or inspect retained output.")
+        if not complete:
+            if readable:
+                why = f"it has more than {_MCP_STATUS_PAGES} pages"
+            elif result is None and self.mcp_pages == 1:
+                why = "it is unavailable"
+            else:
+                why = f"page {self.mcp_pages} " + ("failed" if result is None else "is unreadable")
+            raise _ProtocolError(
+                f"Codex's list of MCP servers couldn't be read to its end ({why}), so this call can't show what runs; "
+                "no task was submitted. Next: inspect retained output.")
+        self.admitted = {name for name, _ in self.mcp_servers}
+        for name, status in self.early_activity:
+            self.mcp_started({"name": name, "status": status})
         self.submit_turn()
 
+    def admits(self, name, plugin):
+        modes = self.envelope.get("provider_plugins") or {}
+        return (plugin is not None and modes.get("mode") == "allowed"
+                or plugin is None and name == _APPS_SERVER and modes.get("apps_mode") == "allowed")
+
     def mcp_started(self, params):
-        """With plugins off, any MCP server activity ends the call at once, whatever thread it names: this app-server
-        is the call's own, so no other thread's servers run in it. An answer already recorded is withdrawn."""
-        if (self.envelope.get("provider_plugins") or {}).get("mode") != "off":
+        """MCP server activity is allowed only for a server this call admitted. Anything else ends the call at once,
+        whatever thread it names: this app-server is the call's own. An answer already recorded is withdrawn."""
+        name, status = _label(params.get("name")), _label(params.get("status"))
+        modes = self.envelope.get("provider_plugins") or {}
+        if self.admitted is None and "allowed" in (modes.get("mode"), modes.get("apps_mode")):
+            # An allowed server may start before the list says which it is; judge it once the list is read.
+            self.early_activity.append((name, status))
             return
-        self.end_call(f"Codex reported MCP server activity ({_label(params.get('name'))}: "
-                      f"{_label(params.get('status'))}) although this call turned plugins and apps off",
-                      "pass --allow-plugins to run with the account's plugins, apps and MCP servers")
+        if self.admitted is not None and name in self.admitted:
+            return
+        self.end_call(f"Codex reported MCP server activity ({name}: {status}) for a server this call didn't allow",
+                      _OPT_INS)
 
     def end_call(self, what, remedy=None):
         """A boundary the call set was crossed: withdraw any recorded answer and stop the call's own process group at

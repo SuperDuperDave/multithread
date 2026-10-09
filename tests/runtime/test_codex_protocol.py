@@ -357,10 +357,11 @@ class CodexProtocolTests(unittest.TestCase):
         self.assertEqual(value, json.loads((directory / "result.json").read_text()))
         return value
 
-    def test_plugins_and_apps_are_off_unless_asked_for_and_the_thread_must_run_no_mcp_server(self):
+    def test_plugins_and_apps_are_off_unless_asked_for_and_only_an_opt_in_admits_a_server(self):
         apps = {"name": "codex_apps", "pluginId": None}
         plugin = {"name": "zoning-signal", "pluginId": "zoning-signal@fixture"}
-        # Off by default: both flags are passed, and the thread's servers are listed (none) before its task.
+        configured = {"name": "notes", "pluginId": None}
+        # Off by default: the flags are passed, and the thread's servers are listed (none) before its task.
         code, result, _ = self.invoke()
         self.assertEqual(0, code, result)
         argv = self.calls_argv(result)
@@ -369,35 +370,61 @@ class CodexProtocolTests(unittest.TestCase):
                          argv[argv.index("app-server") - 8:argv.index("app-server")])
         self.assertEqual({"multi_agent": False, "multi_agent_v2": False, "plugins": False, "apps": False},
                          result["provider_features"])
-        self.assertEqual({"mode": "off", "mcp_servers": [], "server_count": 0, "plugin_servers": [], "apps": False,
-                          "source": "codex_mcp_server_status", "complete": True}, result["provider_plugins"])
+        self.assertEqual({"mode": "off", "apps_mode": "off", "mcp_servers": [], "server_count": 0,
+                          "plugin_servers": [], "apps": False, "source": "codex_mcp_server_status", "complete": True},
+                         result["provider_plugins"])
         methods = [row["method"] for row in self.recorded_requests()]
         self.assertLess(methods.index("mcpServerStatus/list"), methods.index("turn/start"))
-        # Any server running anyway stops the call before its task: the apps' server, a plugin's, or a configured one.
-        for servers, shown in (([apps], "codex_apps"), ([plugin], "zoning-signal"),
-                               ([{"name": "notes", "pluginId": None}], "notes")):
-            with self.subTest(shown):
+        # Each opt-in admits only its own kind; anything else stops the call before its task.
+        cases = [
+            ((), [apps], "codex_apps"), ((), [plugin], "zoning-signal"), ((), [configured], "notes"),
+            (("--allow-plugins",), [apps, plugin], "codex_apps"),          # plugins don't bring the apps back
+            (("--allow-plugins",), [configured], "notes"),
+            (("--allow-apps",), [plugin], "zoning-signal"),
+            (("--allow-apps",), [{"name": "codex_apps", "pluginId": "spoof@fixture"}], "codex_apps"),
+            (("--allow-plugins", "--allow-apps"), [apps, plugin, configured], "notes"),
+        ]
+        for extra, servers, shown in cases:
+            with self.subTest(extra=extra, shown=shown):
                 self.configure(mcp_pages=[servers])
-                code, result, _ = self.invoke()
+                code, result, _ = self.invoke(*extra)
                 self.assertNotEqual(0, code)
                 self.assertEqual("not_submitted", result["task_submission"])
                 self.assertNotIn("turn/start", [row["method"] for row in self.recorded_requests()])
-                self.assertIn(f"runs 1 MCP server(s) ({shown})", result["message"])
-                self.assertIn("--allow-plugins", result["message"])
-        # Asked for, they stay on and run, and the result says which servers came from where.
-        self.configure(mcp_pages=[[apps], [plugin]])
+                self.assertIn(f"MCP server(s) this call didn't allow ({shown})", result["message"])
+                self.assertIn("--allow-apps", result["message"])
+        # Plugins allowed: apps stay off and are still confirmed off; plugin servers run and are attributed.
+        self.configure(mcp_pages=[[plugin]])
         code, result, _ = self.invoke("--allow-plugins")
         self.assertEqual(0, code, result)
-        self.assertNotIn("features.plugins=false", self.calls_argv(result))
-        self.assertNotIn("features.apps=false", self.calls_argv(result))
-        # Child threads stay off even then; only they are confirmed.
-        self.assertIn("features.multi_agent=false", self.calls_argv(result))
-        self.assertEqual({"multi_agent": False, "multi_agent_v2": False}, result["provider_features"])
-        self.assertEqual({"mode": "allowed", "mcp_servers": ["codex_apps", "zoning-signal"], "server_count": 2,
+        argv = self.calls_argv(result)
+        self.assertNotIn("features.plugins=false", argv)
+        self.assertIn("features.apps=false", argv)
+        self.assertIn("features.multi_agent=false", argv)
+        self.assertEqual({"multi_agent": False, "multi_agent_v2": False, "apps": False}, result["provider_features"])
+        self.assertEqual({"mode": "allowed", "apps_mode": "off", "mcp_servers": ["zoning-signal"], "server_count": 1,
                           "plugin_servers": [{"name": "zoning-signal", "plugin": "zoning-signal@fixture"}],
-                          "apps": True, "source": "codex_mcp_server_status", "complete": True},
+                          "apps": False, "source": "codex_mcp_server_status", "complete": True},
                          result["provider_plugins"])
         self.assertIn("--allow-plugins", result["follow_up_preparation"]["argv_prefix"])
+        self.assertNotIn("--allow-apps", result["follow_up_preparation"]["argv_prefix"])
+        # Apps allowed: only the apps' server, and plugins still confirmed off.
+        self.configure(mcp_pages=[[apps]])
+        code, result, _ = self.invoke("--allow-apps")
+        self.assertEqual(0, code, result)
+        argv = self.calls_argv(result)
+        self.assertIn("features.plugins=false", argv)
+        self.assertNotIn("features.apps=false", argv)
+        self.assertEqual({"multi_agent": False, "multi_agent_v2": False, "plugins": False}, result["provider_features"])
+        self.assertEqual(("off", "allowed", True), (result["provider_plugins"]["mode"],
+                                                    result["provider_plugins"]["apps_mode"],
+                                                    result["provider_plugins"]["apps"]))
+        self.assertIn("--allow-apps", result["follow_up_preparation"]["argv_prefix"])
+        # Both: both kinds run.
+        self.configure(mcp_pages=[[apps, plugin]])
+        code, result, _ = self.invoke("--allow-plugins", "--allow-apps")
+        self.assertEqual(0, code, result)
+        self.assertEqual({"multi_agent": False, "multi_agent_v2": False}, result["provider_features"])
 
     def test_codex_must_confirm_each_feature_is_off_for_the_thread_before_the_task(self):
         cases = {
@@ -422,9 +449,15 @@ class CodexProtocolTests(unittest.TestCase):
                 self.assertEqual("not_submitted", result["task_submission"])
                 self.assertNotIn("turn/start", [row["method"] for row in self.recorded_requests()])
                 self.assertIn(f"didn't confirm that {unconfirmed.strip()} off for this thread", result["message"])
-        # Allowed, plugins and apps aren't required to be off.
-        self.configure(features_ignored=["plugins", "apps"])
+        # Allowing plugins still requires apps off, and the other way round; allowing both requires neither.
+        self.configure(features_ignored=["apps"])
         code, result, _ = self.invoke("--allow-plugins")
+        self.assertIn("didn't confirm that apps is off", result["message"])
+        self.configure(features_ignored=["plugins"])
+        code, result, _ = self.invoke("--allow-apps")
+        self.assertIn("didn't confirm that plugins is off", result["message"])
+        self.configure(features_ignored=["plugins", "apps"])
+        code, result, _ = self.invoke("--allow-plugins", "--allow-apps")
         self.assertEqual(0, code, result)
 
     def test_with_plugins_off_a_list_that_cannot_be_read_to_its_end_stops_the_call(self):
@@ -455,14 +488,14 @@ class CodexProtocolTests(unittest.TestCase):
         # A server seen before a later page fails is kept, and named in the refusal.
         self.configure(mcp_pages=[[plugin], "error"])
         _, result, _ = self.invoke()
-        self.assertIn("runs at least 1 MCP server(s) (zoning-signal)", result["message"])
+        self.assertIn("runs at least 1 MCP server(s) this call didn't allow (zoning-signal)", result["message"])
         self.assertEqual([{"name": "zoning-signal", "plugin": "zoning-signal@fixture"}],
                          result["provider_plugins"]["plugin_servers"])
-        # Asked for, an incomplete list is recorded as such and doesn't stop the call.
+        # An opt-in doesn't excuse an incomplete list: what runs must still be known.
         self.configure(mcp_pages=[[]] * 6)
-        code, result, _ = self.invoke("--allow-plugins")
-        self.assertEqual(0, code, result)
-        self.assertFalse(result["provider_plugins"]["complete"])
+        code, result, _ = self.invoke("--allow-plugins", "--allow-apps")
+        self.assertNotEqual(0, code)
+        self.assertIn("couldn't be read to its end (it has more than 5 pages)", result["message"])
 
     def test_with_plugins_off_mcp_activity_at_any_point_ends_the_call(self):
         def activity(thread=None, status="starting"):
@@ -499,10 +532,19 @@ class CodexProtocolTests(unittest.TestCase):
                 self.assertIn(f"the call was ended and {submitted}", result["message"])
                 if submitted == "no task was submitted":
                     self.assertNotIn("turn/start", [row["method"] for row in self.recorded_requests()])
-        # Asked for, servers may start.
-        self.configure(events=[activity(), item(), completed()])
+        # An admitted server may report activity, even before the list arrives; any other still ends the call.
+        plugin = {"name": "late", "pluginId": "late@fixture"}
+        self.configure(mcp_pages=[[plugin]], before_mcp_response=[activity()], events=[activity(), item(), completed()])
         code, result, _ = self.invoke("--allow-plugins")
         self.assertEqual(0, code, result)
+        stray = {"method": "mcpServer/startupStatus/updated", "params": {"name": "stray", "status": "starting"}}
+        for spec in (dict(before_mcp_response=[stray]), dict(events=[stray, item(), completed()])):
+            with self.subTest(spec=list(spec)):
+                self.configure(mcp_pages=[[plugin]], **spec)
+                code, result, _ = self.invoke("--allow-plugins")
+                self.assertNotEqual(0, code)
+                self.assertIn("MCP server activity (stray: starting) for a server this call didn't allow",
+                              result["message"])
 
     def test_the_server_list_is_bounded_and_says_how_many_ran(self):
         servers = [{"name": f"s{i:02}" + "x" * 120, "pluginId": None} for i in range(60)]
@@ -525,6 +567,9 @@ class CodexProtocolTests(unittest.TestCase):
         with redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit):
             peer.peer_main(["claude", "--repo", str(self.repo), "--task-file", str(self.task), "--allow-plugins"])
         self.assertIn("--allow-plugins is a Codex option", err.getvalue())
+        with redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit):
+            peer.peer_main(["claude", "--repo", str(self.repo), "--task-file", str(self.task), "--allow-apps"])
+        self.assertIn("--allow-apps is a Codex option", err.getvalue())
 
     def calls_argv(self, result):
         return json.loads(self.receipt.read_text())["argv"]

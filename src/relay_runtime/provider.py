@@ -1483,10 +1483,13 @@ def peer_main(argv=None, *, report_entry=None):
                              "otherwise reads only the checkout without what Git ignores there, its Git store and Codex's own release, "
                              "checked before launch")
     parser.add_argument("--allow-plugins", action="store_true",
-                        help="Codex only: let the account's Codex plugins, ChatGPT apps (connectors) and MCP servers run "
-                             "in this call. By default plugins and apps are off, the thread's MCP servers are listed before "
-                             "its task is sent, and any server, or a list that can't be read to its end, stops the call. Child threads "
-                             "stay off either way")
+                        help="Codex only: let the account's Codex plugins and their MCP servers run in this call. By "
+                             "default plugins and apps are off; the thread's MCP servers are listed before its task is "
+                             "sent, and a server the call didn't allow, or a list that can't be read to its end, stops "
+                             "the call. Child threads stay off either way")
+    parser.add_argument("--allow-apps", action="store_true",
+                        help="Codex only: let the account's ChatGPT apps (connectors such as mail, drive and databases) "
+                             "run in this call as Codex's one apps server. Independent of --allow-plugins")
     parser.add_argument("--attach", action="append", default=[], metavar="IMAGE",
                         help="Claude only: attach a PNG, JPEG, GIF or WebP file to the task as an image; repeatable "
                              f"(at most {_MAX_ATTACHMENTS}, {_MAX_ATTACHMENT // (1024 * 1024)} MiB each, {_MAX_ATTACHMENTS_TOTAL // (1024 * 1024)} MiB in total)")
@@ -1498,8 +1501,9 @@ def peer_main(argv=None, *, report_entry=None):
         parser.error("--max-turns is a Claude option; Codex returns one native turn with its normal tool loop")
     if args.client == "claude" and args.effort is not None and args.effort not in _CLAUDE_EFFORTS:
         parser.error("argument --effort: Claude accepts " + ", ".join(_CLAUDE_EFFORTS))
-    if args.client == "claude" and args.allow_plugins:
-        parser.error("--allow-plugins is a Codex option; a Claude --tools call admits only reviewed built-in plugins")
+    if args.client == "claude" and (args.allow_plugins or args.allow_apps):
+        parser.error(f"{'--allow-plugins' if args.allow_plugins else '--allow-apps'} is a Codex option; a Claude "
+                     "--tools call admits only reviewed built-in plugins")
     if args.client == "codex" and args.stream_progress:
         parser.error("Codex already uses native streaming; --stream-progress is a Claude option")
     if args.client == "codex" and (args.tools is not None or args.attach):
@@ -1557,6 +1561,8 @@ def _follow_up_preparation(args, plan, envelope):
         prefix.extend(["--tools", ",".join(tools) or "none"])
     if getattr(args, "allow_plugins", False):
         prefix.append("--allow-plugins")
+    if getattr(args, "allow_apps", False):
+        prefix.append("--allow-apps")
     if args.live_input:
         prefix.append("--live-input")
     if args.stream_progress:
@@ -1660,12 +1666,15 @@ def _run_peer(args, interruption):
                                       "project_instructions": scope["project_instructions"],
                                       "verified": "not_checked"}
             # A peer never escalates out of its sandbox (no approvals asked, none granted elsewhere), starts no child
-            # threads, and plugins and apps stay off unless asked for: what a peer can call is
-            # what this call names. Codex confirms each for the thread, and lists its MCP servers, before the task.
+            # threads, and plugins and apps each stay off unless asked for: what a peer can call is what this call
+            # names. Codex confirms each for the thread, and lists its MCP servers, before the task; only a server an
+            # opt-in admits may run.
             plugins = ["-c", 'approval_policy="never"', "-c", 'approvals_reviewer="user"',
                        "-c", "features.multi_agent=false", "-c", "features.multi_agent_v2=false",
-                       *([] if args.allow_plugins else ["-c", "features.plugins=false", "-c", "features.apps=false"])]
+                       *([] if args.allow_plugins else ["-c", "features.plugins=false"]),
+                       *([] if args.allow_apps else ["-c", "features.apps=false"])]
             envelope["provider_plugins"] = {"mode": "allowed" if args.allow_plugins else "off",
+                                            "apps_mode": "allowed" if args.allow_apps else "off",
                                             "mcp_servers": None, "plugin_servers": None, "source": "not_observed"}
             native = [*plan["argv"], *confinement, *plugins, "app-server", "--listen", "stdio://"]
         envelope["repo"] = plan["repo"]
