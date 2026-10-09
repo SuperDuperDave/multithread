@@ -30,6 +30,10 @@ class PeerTests(unittest.TestCase):
             isolated = mock.patch.object(peer, name, Path("/nonexistent") / name)
             isolated.start()
             self.addCleanup(isolated.stop)
+        # Nor this host's machine-wide managed settings (/etc/claude-code appeared on 2026-10-08).
+        machine = mock.patch.object(peer, "_MANAGED_CLAUDE_SETTINGS", {})
+        machine.start()
+        self.addCleanup(machine.stop)
         # Restricted calls admit only reviewed binaries; these fixtures stand in for the hand-reviewed one.
         from relay_runtime import claude_peer as claude_review
         reviewed = mock.patch.object(claude_review, "reviewed",

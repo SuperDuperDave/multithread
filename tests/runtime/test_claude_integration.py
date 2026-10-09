@@ -208,6 +208,10 @@ class RestrictedCallTests(ClaudeIntegrationTests):
             isolated = mock.patch.object(peer, name, Path("/nonexistent") / name)
             isolated.start()
             self.addCleanup(isolated.stop)
+        # Nor this host's machine-wide managed settings (/etc/claude-code appeared on 2026-10-08).
+        machine = mock.patch.object(peer, "_MANAGED_CLAUDE_SETTINGS", {})
+        machine.start()
+        self.addCleanup(machine.stop)
         self.review = mock.patch("relay_runtime.claude_peer.reviewed", return_value=protocol.REVIEWED)
         self.found = self.review.start()
         self.addCleanup(self.review.stop)
