@@ -701,6 +701,60 @@ def _policy_listings():
         os.close(lock)
 
 
+# The one managed setting a restricted call admits. It seats the built-in guard cc-plugin-sec-default ahead of every
+# other plugin; as read from Claude Code 2.1.295's bundle, with no user mods that guard refuses user-level mods, turns
+# an error in the hook chain into a denial, and leaves the tool list and tool decisions as they were. Anything else
+# stays a managed source and refuses a restricted call. A call admits the seated guard only while this file is
+# exactly so, and a review made with it seated admits calls only while it still is.
+_INERT_MANAGED_SETTINGS = {"pluginConfigs": {"cc-plugin-sec-default@builtin": {"options": {"allowManagedModsOnly": True}}}}
+_SEATED_BY_INERT_SETTINGS = ("cc-plugin-sec-default",)
+_MANAGED_OWNER = 0  # root; tests stand in their own user
+
+
+def _root_only(info):
+    return info.st_uid == _MANAGED_OWNER and not info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+
+
+def _inert_managed_settings(directory):
+    """Whether this machine settings directory holds nothing but the inert setting: root's alone, one regular file,
+    exactly that JSON with a real boolean and no repeated keys. Any doubt counts as a managed source."""
+    def unique(pairs):
+        keys = [key for key, _ in pairs]
+        if len(keys) != len(set(keys)):
+            raise ValueError("repeated key")
+        return dict(pairs)
+
+    def same(value, expected):
+        if isinstance(expected, dict):
+            return isinstance(value, dict) and value.keys() == expected.keys() and all(
+                same(value[key], expected[key]) for key in expected)
+        return value is expected
+
+    try:
+        held = os.lstat(directory)
+        if not stat.S_ISDIR(held.st_mode) or not _root_only(held) or os.listdir(directory) != ["managed-settings.json"]:
+            return False
+        fd = os.open(Path(directory) / "managed-settings.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or not _root_only(info) or info.st_size > 4096:
+                return False
+            body = os.read(fd, 4097)
+        finally:
+            os.close(fd)
+        if len(body) > 4096:
+            return False
+        return same(json.loads(body.decode("utf-8"), object_pairs_hook=unique), _INERT_MANAGED_SETTINGS)
+    except (OSError, ValueError, UnicodeError):
+        return False
+
+
+def _seated_plugins():
+    """The built-in plugins Claude Code seats for the inert machine setting: none unless it is exactly there."""
+    machine = _MANAGED_CLAUDE_SETTINGS.get(platform.system())
+    return _SEATED_BY_INERT_SETTINGS if machine is not None and _inert_managed_settings(machine) else ()
+
+
 def _managed_claude_sources(cwd, observed=None):
     """Managed Claude settings this machine would apply to a restricted call: a best-effort preflight.
 
@@ -710,7 +764,7 @@ def _managed_claude_sources(cwd, observed=None):
     """
     found = []
     machine = _MANAGED_CLAUDE_SETTINGS.get(platform.system())
-    if machine is not None and machine.exists():
+    if machine is not None and machine.exists() and not _inert_managed_settings(machine):
         found.append(str(machine))
     home = _claude_config_home(cwd)
     found.extend(str(home / name) for name in _SERVER_MANAGED_CLAUDE if (home / name).exists())
@@ -1532,7 +1586,8 @@ def _run_peer(args, interruption):
             stage = "provider_review"
             try:
                 identity = claude_peer.binary_identity(plan["argv"][0])
-                reviewed = claude_peer.reviewed(identity[1], args.relay or account_launcher(), plan["repo"])
+                seated = _seated_plugins()
+                reviewed = claude_peer.reviewed(identity[1], args.relay or account_launcher(), plan["repo"], seated)
             except claude_peer.ReviewError as exc:
                 raise LaunchError(f"{exc} No provider was started.") from None
             if reviewed is None:

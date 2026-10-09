@@ -118,6 +118,34 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual("needs_review", report["verdict"])
         self.assertIn("the restricted surface differs from every hand-reviewed one", report["reasons"])
 
+    def test_a_guard_the_inert_machine_setting_seats_is_covered_only_while_it_is_seated(self):
+        seated = ("cc-plugin-sec-default",)
+        self.spec({"plugins": ["cc-plugin-sec-default", "cc-plugin-telemetry"]})
+        report = claude_review.review(str(self.binary), self.out, "fixture-model", seated)
+        self.assertEqual(("pass", ["cc-plugin-sec-default", "cc-plugin-telemetry"]),
+                         (report["verdict"], report["plugins"]), "the report lists what it observed")
+        self.assertIn("no hand review covered", " ".join(self.review()["reasons"]), "unseated, nothing covers it")
+        # A review made with the guard seated admits calls only while it still is, and so does the baseline.
+        digest, launcher = "a" * 64, self.base / "multithread"
+        meta = {"binary_sha256": digest, "version": "9.9.9", "surface_sha256": report["surface_sha256"],
+                "plugins": "cc-plugin-sec-default,cc-plugin-telemetry", "agents": "claude",
+                "control_fired": "local-hook,mcp-server,project-hook,tool-hook"}
+        launcher.write_text("#!/bin/sh\necho '" + json.dumps({"reviews": [{"seq": 7, "meta": meta}]}) + "'\n")
+        launcher.chmod(0o755)
+        self.assertEqual(["cc-plugin-sec-default", "cc-plugin-telemetry"],
+                         claude_review.reviewed(digest, launcher, self.base, seated)["plugins"])
+        with self.assertRaisesRegex(claude_review.ReviewError, "no longer in place"):
+            claude_review.reviewed(digest, launcher, self.base)
+        # A review made without it admits it once it is seated.
+        meta["plugins"] = "cc-plugin-telemetry"
+        launcher.write_text("#!/bin/sh\necho '" + json.dumps({"reviews": [{"seq": 8, "meta": meta}]}) + "'\n")
+        self.assertEqual(["cc-plugin-sec-default", "cc-plugin-telemetry"],
+                         claude_review.reviewed(digest, launcher, self.base, seated)["plugins"])
+        self.assertEqual(["cc-plugin-telemetry"], claude_review.reviewed(digest, launcher, self.base)["plugins"])
+        self.assertEqual(["cc-plugin-sec-default", "cc-plugin-telemetry"],
+                         claude_review.reviewed("0" * 64, launcher, self.base, seated)["plugins"])
+        self.assertEqual(["cc-plugin-telemetry"], claude_review.reviewed("0" * 64, launcher, self.base)["plugins"])
+
     def test_the_surface_is_the_present_strings_and_our_flags_whole_help(self):
         _, value = claude_review.surface(str(self.binary))
         self.assertEqual(list(claude_review.SURFACE_TOKENS), value["tokens"])

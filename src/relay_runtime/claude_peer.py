@@ -777,10 +777,13 @@ def _option_blocks(help_text):
     return {name: " ".join(" ".join(lines).split()) for name, lines in sorted(blocks.items())}
 
 
-def reviewed(digest, launcher, repo):
-    """The review that admits this exact binary to restricted calls, or None. Unreadable reviews raise."""
+def reviewed(digest, launcher, repo, seated=()):
+    """The review that admits this exact binary to restricted calls, or None. Unreadable reviews raise.
+
+    `seated` names the built-in plugins the inert machine setting seats now: a call admits them, and a review that
+    saw them seated admits calls only while they still are."""
     if digest in BUILT_IN:
-        return {**BUILT_IN[digest], "source": "built_in"}
+        return {**BUILT_IN[digest], "plugins": sorted({*BUILT_IN[digest]["plugins"], *seated}), "source": "built_in"}
     command = [str(launcher), "--repo", str(repo), "--json", "provider-review", "show", "--binary-sha256", digest]
     try:
         answer = subprocess.run(command, cwd=repo, stdin=subprocess.DEVNULL, capture_output=True, text=True,
@@ -802,11 +805,11 @@ def reviewed(digest, launcher, repo):
                       "plugins": names("plugins"), "agents": names("agents"), "source": f"ledger:{event.get('seq')}"}
             # A record admits nothing a hand review did not cover: a known surface, no new built-ins.
             anchors = [entry for entry in BUILT_IN.values() if entry["surface_sha256"] == record["surface_sha256"]]
-            if not anchors or not (set(record["plugins"]) <= {p for a in anchors for p in a["plugins"]}
+            if not anchors or not (set(record["plugins"]) - set(seated) <= {p for a in anchors for p in a["plugins"]}
                                    and set(record["agents"]) <= {g for a in anchors for g in a["agents"]}):
                 raise ReviewError(f"The recorded review ({record['source']}) claims a restricted surface or built-ins no "
-                                  "hand review covered.")
-            return record
+                                  "hand review covered, or was made under a managed setting no longer in place.")
+            return {**record, "plugins": sorted({*record["plugins"], *seated})}
     return None
 
 
@@ -864,8 +867,9 @@ def _canary_call(binary, out, model, restricted):
             "answered": bool(result.get("result")) and not result.get("is_error") and len(inits) == len(results) == 1}
 
 
-def review(provider, out, model=DEFAULT_MODEL):
-    """Review one binary; returns the report. A pass is the only verdict that may be recorded."""
+def review(provider, out, model=DEFAULT_MODEL, seated=()):
+    """Review one binary; returns the report. A pass is the only verdict that may be recorded. `seated` names the
+    built-in plugins the inert machine setting seats now; the report lists them as observed."""
     path, digest = binary_identity(provider)
     surface_sha256, surface_value = surface(path)
     anchors = [entry for entry in BUILT_IN.values() if entry["surface_sha256"] == surface_sha256]
@@ -900,7 +904,7 @@ def review(provider, out, model=DEFAULT_MODEL):
         reasons.append("the restricted call read a file outside its working directory")
     if not version or restricted.get("version") != version:
         reasons.append("the session's reported version differs from the binary's")
-    if anchors and not (set(report["plugins"]) <= {p for a in anchors for p in a["plugins"]}
+    if anchors and not (set(report["plugins"]) - set(seated) <= {p for a in anchors for p in a["plugins"]}
                         and set(report["agents"]) <= {g for a in anchors for g in a["agents"]}):
         reasons.append("the session reports built-in plugins or agents no hand review covered")
     report["verdict"] = "needs_review" if reasons else "pass"
@@ -927,9 +931,10 @@ def review_main(argv, launcher):
     args = parser.parse_args(argv)
     if not args.agent or not args.session:
         parser.error("--agent and --session name the reviewer the record is attributed to")
+    from .provider import _seated_plugins
     out = Path(tempfile.mkdtemp(prefix="relay-claude-review-"))
     try:
-        report = review(args.provider, out, args.model)
+        report = review(args.provider, out, args.model, _seated_plugins())
     except ReviewError as exc:
         print(json.dumps({"verdict": "unavailable", "message": str(exc)}), file=sys.stdout)
         return 1

@@ -232,6 +232,40 @@ class RestrictedCallTests(ClaudeIntegrationTests):
         self.assertNotEqual(0, code)
         self.assertEqual(('uncertain', None, True), (value['state'], value['result'], value['provider_binary_changed']))
 
+    def test_the_guard_the_inert_machine_setting_seats_runs_only_while_that_file_is_exactly_there(self):
+        import shutil
+        from pathlib import Path
+        from relay_runtime import claude_peer as claude_review
+        machine = self.base / 'machine'
+        machine.mkdir(mode=0o755)
+        inert = {'pluginConfigs': {'cc-plugin-sec-default@builtin': {'options': {'allowManagedModsOnly': True}}}}
+        (machine / 'managed-settings.json').write_text(json.dumps(inert))
+        (machine / 'managed-settings.json').chmod(0o644)
+        # Admission runs for real, with this fixture binary standing in for the hand-reviewed one.
+        self.plan_claude()
+        digest = __import__('hashlib').sha256(self.provider.read_bytes()).hexdigest()
+        self.found.side_effect = self.review.temp_original
+        guard = {'name': 'cc-plugin-sec-default', 'path': 'builtin', 'source': 'cc-plugin-sec-default@builtin'}
+        steps = [{'read': 1}, {'emit': protocol.ClaudeProtocolTests.restricted(
+                     plugins=[guard, {'name': 'cc-plugin-telemetry', 'path': 'builtin',
+                                      'source': 'cc-plugin-telemetry@builtin'}])}, {'emit': protocol.result()}]
+        def call():
+            shutil.rmtree(self.base / 'stream-evidence', ignore_errors=True)
+            with mock.patch.dict(claude_review.BUILT_IN, {digest: {k: v for k, v in protocol.REVIEWED.items()
+                                                                   if k != 'source'}}), \
+                    mock.patch.object(peer, '_MANAGED_CLAUDE_SETTINGS', {peer.platform.system(): machine}), \
+                    mock.patch.object(peer, '_MANAGED_OWNER', os.getuid()):
+                return self.invoke(steps, restricted=True)
+        code, value, _ = call()
+        self.assertEqual((0, 'returned'), (code, value['state']), value)
+        self.assertEqual(['cc-plugin-sec-default', 'cc-plugin-telemetry'], value['provider_tools']['plugins'])
+        # Seated by anything else (a Team plan, say) the guard is not admitted, and the call fails closed.
+        (machine / 'managed-settings.json').unlink()
+        machine.rmdir()
+        code, value, _ = call()
+        self.assertNotEqual(0, code)
+        self.assertIn('registry differs from the requested one', value['message'])
+
     def test_an_unreviewed_or_unknowable_binary_starts_nothing(self):
         from relay_runtime import claude_peer as claude_review
         for name, effect, why in (

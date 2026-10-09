@@ -1274,6 +1274,86 @@ class PeerTests(unittest.TestCase):
             self.assertEqual(1, found.call_count)
         self.assertFalse(self.calls.exists())
 
+    def test_only_the_inert_machine_setting_lets_a_restricted_call_through(self):
+        # The one machine setting that seats Claude Code's built-in guard to load only managed mods acts on nothing
+        # during a call, so alone it does not refuse. Anything more, and any doubt about it, still refuses.
+        machine = self.base / "machine"
+        inert = {"pluginConfigs": {"cc-plugin-sec-default@builtin": {"options": {"allowManagedModsOnly": True}}}}
+        def call(body, *, owner=os.getuid(), mode=0o644, directory_mode=0o755, beside=None):
+            if machine.exists():
+                for entry in machine.iterdir():
+                    entry.unlink()
+                machine.rmdir()
+            machine.mkdir()
+            settings = machine / "managed-settings.json"
+            settings.write_bytes(body if isinstance(body, bytes) else (
+                body if isinstance(body, str) else json.dumps(body)).encode())
+            settings.chmod(mode)
+            if beside:
+                (machine / beside).write_text("{}")
+            machine.chmod(directory_mode)
+            with (mock.patch.object(peer, "_MANAGED_CLAUDE_SETTINGS", {peer.platform.system(): machine}),
+                  mock.patch.object(peer, "_MANAGED_OWNER", owner)):
+                return self.invoke("--tools", "none", "--dry-run")
+        for body in (inert, json.dumps(inert, indent=2) + "\n"):
+            code, result, _ = call(body)
+            self.assertEqual(0, code, result.get("message"))
+        def options(**changed):
+            return {"pluginConfigs": {"cc-plugin-sec-default@builtin": {"options": changed}}}
+        refused = {
+            "hooks": dict(inert, hooks={}), "permissions": dict(inert, permissions={"allow": []}),
+            "env": dict(inert, env={}), "another plugin": {"pluginConfigs": dict(inert["pluginConfigs"], other={})},
+            "another option": options(allowManagedModsOnly=True, more=True),
+            "another entry key": {"pluginConfigs": {"cc-plugin-sec-default@builtin": {
+                "options": {"allowManagedModsOnly": True}, "enabled": True}}},
+            "a number": options(allowManagedModsOnly=1), "false": options(allowManagedModsOnly=False),
+            "a string": options(allowManagedModsOnly="true"), "a list": [inert], "empty": {},
+            "a repeated key": '{"pluginConfigs": {}, ' + json.dumps(inert)[1:],
+            "a nested repeated key": json.dumps(inert).replace(
+                '{"allowManagedModsOnly"', '{"allowManagedModsOnly": false, "allowManagedModsOnly"'),
+            "a byte-order mark": "\ufeff" + json.dumps(inert),
+            "not JSON": "{", "not UTF-8": b"\xff", "oversized": json.dumps(inert) + " " * 4096,
+        }
+        for name, body in refused.items():
+            with self.subTest(content=name):
+                code, result, _ = call(body)
+                self.assertNotEqual(0, code)
+                self.assertIn(f"Managed Claude settings were found ({machine})", result["message"])
+        for name, arrangement in (("another owner", {"owner": os.getuid() + 1}), ("group-writable", {"mode": 0o664}),
+                                  ("a writable directory", {"directory_mode": 0o777}),
+                                  ("another file", {"beside": "managed-mcp.json"})):
+            with self.subTest(arrangement=name):
+                code, result, _ = call(inert, **arrangement)
+                self.assertNotEqual(0, code)
+                self.assertIn(f"Managed Claude settings were found ({machine})", result["message"])
+        # A pipe in its place is not waited on: it is not a regular file.
+        call(inert)
+        (machine / "managed-settings.json").unlink()
+        os.mkfifo(machine / "managed-settings.json", 0o644)
+        with (mock.patch.object(peer, "_MANAGED_CLAUDE_SETTINGS", {peer.platform.system(): machine}),
+              mock.patch.object(peer, "_MANAGED_OWNER", os.getuid())):
+            self.assertFalse(peer._inert_managed_settings(machine))
+        (machine / "managed-settings.json").unlink()
+        # A link is followed by Claude, not by this check: it refuses rather than vouch for what it points at.
+        elsewhere = self.base / "elsewhere.json"
+        elsewhere.write_text(json.dumps(inert))
+        code, _, _ = call(inert)
+        self.assertEqual(0, code)
+        (machine / "managed-settings.json").unlink()
+        (machine / "managed-settings.json").symlink_to(elsewhere)
+        with (mock.patch.object(peer, "_MANAGED_CLAUDE_SETTINGS", {peer.platform.system(): machine}),
+              mock.patch.object(peer, "_MANAGED_OWNER", os.getuid())):
+            code, _, _ = self.invoke("--tools", "none", "--dry-run")
+            self.assertNotEqual(0, code)
+            (machine / "managed-settings.json").unlink()
+            target = self.base / "machine-target"
+            machine.rename(target)
+            machine.symlink_to(target, target_is_directory=True)
+            (target / "managed-settings.json").write_text(json.dumps(inert))
+            code, _, _ = self.invoke("--tools", "none", "--dry-run")
+            self.assertNotEqual(0, code, "a linked directory refuses too")
+        self.assertFalse(self.calls.exists())
+
     def test_a_refusal_record_never_follows_a_directory_swapped_after_creation(self):
         other = self.base / "another-call"
         other.mkdir()
