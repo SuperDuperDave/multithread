@@ -741,6 +741,9 @@ _APPROVAL_FILE_MAX = 64 * 1024 * 1024
 # Git runs on a repository the caller names, so nothing in that repository's config may run a program: no hooks,
 # fsmonitor, signature program or transport (which a partial clone's lazy fetch would start).
 _APPROVAL_GIT = ("git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "protocol.allow=never",
+                 # A repository's own protocol.<name>.allow outranks protocol.allow, so each transport is closed too.
+                 *(item for name in ("ext", "file", "git", "ssh", "http", "https")
+                   for item in ("-c", f"protocol.{name}.allow=never")),
                  "-c", "log.showSignature=false", "-c", "gpg.program=false", "-c", "core.sshCommand=false")
 _APPROVAL_GIT_ENV = {"PATH": "/usr/bin:/bin", "HOME": "/nonexistent", "LC_ALL": "C", "GIT_CONFIG_GLOBAL": "/dev/null",
                      "GIT_CONFIG_SYSTEM": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1", "GIT_TERMINAL_PROMPT": "0",
@@ -801,8 +804,7 @@ def _git_approval(ref: str, repo: Path) -> dict[str, Any]:
             raise ApprovalUnresolved(f"{_shown(repo)} isn't a readable git repository ({_shown(why)}), so "
                                      f"--approval-ref {ref} couldn't be checked",
                                      "pass --approval-repo with the repository that holds the approval.")
-        top = git("rev-parse", "--show-toplevel")  # a bare repository has no working tree: name its directory
-        holder = top.stdout.strip() if top.returncode == 0 and top.stdout.strip() else where.stdout.strip()
+        holder = str(repo)  # the path the caller named: the repository's own config can't relocate the record
         kind = git("cat-file", "-t", oid)
         if kind.returncode != 0:
             raise ApprovalUnresolved(f"--approval-ref {ref} isn't an object in {_shown(holder)}",

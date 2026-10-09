@@ -2905,7 +2905,9 @@ class BindTests(WakeCase):
         git("init", "-q")
         for key, value in (("gpg.program", str(program)), ("log.showSignature", "true"),
                            ("core.sshCommand", str(program)), ("core.fsmonitor", str(program)),
-                           ("core.hooksPath", str(self.base)), ("remote.origin.url", "ssh://fixture.invalid/x"),
+                           ("core.hooksPath", str(self.base)), ("remote.origin.url", f"ext::{program}"),
+                           ("protocol.ext.allow", "always"),  # outranks a command-line protocol.allow (Opus)
+                           ("core.worktree", str(self.base / "looks-legit")),
                            ("remote.origin.promisor", "true"), ("extensions.partialClone", "origin")):
             git("config", key, value)
         tree = git("hash-object", "-t", "tree", "-w", "--stdin", input="").stdout.strip()
@@ -2914,6 +2916,8 @@ class BindTests(WakeCase):
         commit = git("hash-object", "-t", "commit", "-w", "--stdin", "--literally", input=signed).stdout.strip()
         code, out = self.approve("git:" + commit, "--approval-repo", str(hostile))
         self.assertEqual(0, code, out)
+        self.assertTrue(self.events("wake.bound")[-1]["meta"]["reason"].endswith(f"approval repository {hostile}"),
+                        "the record names the repository the caller passed, whatever its config says")
         code, out = self.approve("git:" + "1" * 40, "--approval-repo", str(hostile))
         self.assertEqual(4, code, out)
         self.assertIn("isn't an object in", out, "a missing object is not fetched")
@@ -2976,7 +2980,7 @@ class BindTests(WakeCase):
             self.assertEqual(4, code, out)
             self.assertIn(said, out)
             if ref.removeprefix("receipt:").isdigit():  # the ledger's own check, past the form
-                self.assertIn("Nothing was recorded. Name the decision response itself", out)
+                self.assertIn("Next: Name the decision response itself", out)
         with self.store() as store:
             ref = approved_receipt(store)
         code, out = self.approve(ref)

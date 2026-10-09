@@ -1458,22 +1458,22 @@ class RelayStore:
         if approval_ref is None or not approval_ref.startswith("receipt:"):
             return None
         target = approval_ref.removeprefix("receipt:")
-        response = ("Nothing was recorded. Name the decision response itself, the decision.responded event that "
-                    "multithread decision respond recorded, as receipt:<its seq>")
+        response = ("nothing was recorded. Next: Name the decision response itself, the decision.responded event "
+                    "that multithread decision respond recorded, as receipt:<its seq>.")
         if not target.isascii() or not target.isdigit() or len(target) > 18 or target != str(int(target)):
             raise ValidationError(
                 f"--approval-ref {approval_ref[:40]} isn't receipt:<ledger seq> written plainly (no sign or "
-                f"leading zero). {response}"
+                f"leading zero); {response}"
             )
         row = self._execute("SELECT * FROM events WHERE seq = ?", (int(target),)).fetchone()
         if row is None:
-            raise ValidationError(f"--approval-ref {approval_ref} names no event in this ledger. {response}")
+            raise ValidationError(f"--approval-ref {approval_ref} names no event in this ledger; {response}")
         meta = json.loads(row["meta_json"])
         if row["kind"] != "decision.responded" or meta.get("resolution") not in ("choice", "directive"):
             found = row["kind"] + (f" ({meta.get('resolution')})" if row["kind"] == "decision.responded" else "")
             raise ValidationError(
                 f"--approval-ref {approval_ref} is a {found}, not an answered decision: a receipt approval must be a "
-                f"decision.responded whose resolution is choice or directive. {response}"
+                f"decision.responded whose resolution is choice or directive; {response}"
             )
         return {"ref": approval_ref, "kind": row["kind"], "source": f"{row['agent']}:{row['session']}",
                 "at": row["recorded_at"], "decision_id": meta["decision_id"], "resolution": meta["resolution"],
