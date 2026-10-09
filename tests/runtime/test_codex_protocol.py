@@ -163,10 +163,15 @@ while True:
         if spec.get('mcp_error'):
             emit({'id': message['id'], 'error': {'code': -32601, 'message': 'fixture: no such method'}})
         else:
+            # A page is a list of servers, 'error', or {'raw': result} sent as is.
             pages = spec.get('mcp_pages', [[]])
             index = int(message['params'].get('cursor') or 0)
-            emit({'id': message['id'], 'result': {
-                'data': pages[index], 'nextCursor': str(index + 1) if index + 1 < len(pages) else None}})
+            page = pages[index]
+            if page == 'error':
+                emit({'id': message['id'], 'error': {'code': -32000, 'message': 'fixture: listing failed'}})
+            else:
+                emit({'id': message['id'], 'result': page['raw'] if isinstance(page, dict) else {
+                    'data': page, 'nextCursor': str(index + 1) if index + 1 < len(pages) else None}})
     elif method == 'model/list':
         params = message['params']
         if spec.get('defer_model_list'):
@@ -320,44 +325,112 @@ class CodexProtocolTests(unittest.TestCase):
         self.assertEqual(value, json.loads((directory / "result.json").read_text()))
         return value
 
-    def test_plugins_are_off_unless_asked_for_and_what_runs_is_listed_before_the_task(self):
-        config = {"name": "sentinel", "pluginId": None}
+    def test_plugins_and_apps_are_off_unless_asked_for_and_the_thread_must_run_no_mcp_server(self):
+        apps = {"name": "codex_apps", "pluginId": None}
         plugin = {"name": "zoning-signal", "pluginId": "zoning-signal@fixture"}
-        # Off by default: the flag is passed, and the thread's servers are listed before its task.
-        self.configure(mcp_pages=[[config], [{"name": "notes", "pluginId": None}]])
+        # Off by default: both flags are passed, and the thread's servers are listed (none) before its task.
         code, result, _ = self.invoke()
         self.assertEqual(0, code, result)
-        self.assertIn("features.plugins=false", self.calls_argv(result))
-        self.assertEqual({"mode": "off", "mcp_servers": ["notes", "sentinel"], "plugin_servers": [],
+        argv = self.calls_argv(result)
+        self.assertEqual(["-c", "features.plugins=false", "-c", "features.apps=false"],
+                         argv[argv.index("app-server") - 4:argv.index("app-server")])
+        self.assertEqual({"mode": "off", "mcp_servers": [], "server_count": 0, "plugin_servers": [], "apps": False,
                           "source": "codex_mcp_server_status", "complete": True}, result["provider_plugins"])
         methods = [row["method"] for row in self.recorded_requests()]
         self.assertLess(methods.index("mcpServerStatus/list"), methods.index("turn/start"))
-        # A plugin's server running anyway stops the call before its task.
-        self.configure(mcp_pages=[[config, plugin]])
-        code, result, _ = self.invoke()
-        self.assertNotEqual(0, code)
-        self.assertEqual("not_submitted", result["task_submission"])
-        self.assertNotIn("turn/start", [row["method"] for row in self.recorded_requests()])
-        self.assertIn("zoning-signal from zoning-signal@fixture", result["message"])
-        # Asked for, plugins stay on, and the result says which servers they brought.
+        # Any server running anyway stops the call before its task: the apps' server, a plugin's, or a configured one.
+        for servers, shown in (([apps], "codex_apps"), ([plugin], "zoning-signal"),
+                               ([{"name": "notes", "pluginId": None}], "notes")):
+            with self.subTest(shown):
+                self.configure(mcp_pages=[servers])
+                code, result, _ = self.invoke()
+                self.assertNotEqual(0, code)
+                self.assertEqual("not_submitted", result["task_submission"])
+                self.assertNotIn("turn/start", [row["method"] for row in self.recorded_requests()])
+                self.assertIn(f"runs 1 MCP server(s) ({shown})", result["message"])
+                self.assertIn("--allow-plugins", result["message"])
+        # Asked for, they stay on and run, and the result says which servers came from where.
+        self.configure(mcp_pages=[[apps], [plugin]])
         code, result, _ = self.invoke("--allow-plugins")
         self.assertEqual(0, code, result)
         self.assertNotIn("features.plugins=false", self.calls_argv(result))
-        self.assertEqual("allowed", result["provider_plugins"]["mode"])
+        self.assertNotIn("features.apps=false", self.calls_argv(result))
+        self.assertEqual({"mode": "allowed", "mcp_servers": ["codex_apps", "zoning-signal"], "server_count": 2,
+                          "plugin_servers": [{"name": "zoning-signal", "plugin": "zoning-signal@fixture"}],
+                          "apps": True, "source": "codex_mcp_server_status", "complete": True},
+                         result["provider_plugins"])
+        self.assertIn("--allow-plugins", result["follow_up_preparation"]["argv_prefix"])
+
+    def test_with_plugins_off_a_list_that_cannot_be_read_to_its_end_stops_the_call(self):
+        plugin = {"name": "zoning-signal", "pluginId": "zoning-signal@fixture"}
+        cases = {
+            "it is unavailable": dict(mcp_error=True),
+            "page 1 is unreadable": dict(mcp_pages=[{"raw": {"data": "not a list"}}]),
+            "page 1 is unreadable ": dict(mcp_pages=[{"raw": {"data": [], "nextCursor": 7}}]),
+            "page 2 failed": dict(mcp_pages=[[], "error"]),
+            "page 2 is unreadable": dict(mcp_pages=[[], {"raw": {"data": [None]}}]),
+            "it has more than 5 pages": dict(mcp_pages=[[]] * 6),
+        }
+        for why, spec in cases.items():
+            with self.subTest(why):
+                self.configure(**spec)
+                code, result, _ = self.invoke()
+                self.assertNotEqual(0, code)
+                self.assertEqual("not_submitted", result["task_submission"])
+                self.assertNotIn("turn/start", [row["method"] for row in self.recorded_requests()])
+                self.assertIn(f"couldn't be read to its end ({why.strip()})", result["message"])
+                self.assertFalse(result["provider_plugins"]["complete"])
+        # Unread is unobserved, not empty; a partly read list keeps what it saw.
+        self.configure(mcp_error=True)
+        _, result, _ = self.invoke()
+        self.assertEqual((None, None, "unavailable"), (result["provider_plugins"]["mcp_servers"],
+                                                       result["provider_plugins"]["server_count"],
+                                                       result["provider_plugins"]["source"]))
+        # A server seen before a later page fails is kept, and named in the refusal.
+        self.configure(mcp_pages=[[plugin], "error"])
+        _, result, _ = self.invoke()
+        self.assertIn("runs 1 MCP server(s) (zoning-signal)", result["message"])
         self.assertEqual([{"name": "zoning-signal", "plugin": "zoning-signal@fixture"}],
                          result["provider_plugins"]["plugin_servers"])
-        # A Codex that can't list them leaves what runs unobserved, not empty; the flag still holds.
-        self.configure(mcp_error=True)
+        # Asked for, an incomplete list is recorded as such and doesn't stop the call.
+        self.configure(mcp_pages=[[]] * 6)
+        code, result, _ = self.invoke("--allow-plugins")
+        self.assertEqual(0, code, result)
+        self.assertFalse(result["provider_plugins"]["complete"])
+
+    def test_with_plugins_off_a_server_starting_after_the_list_ends_the_call(self):
+        started = {"method": "mcpServer/startupStatus/updated",
+                   "params": {"name": "late", "status": "starting", "threadId": None}}
+        self.configure(events=[started, item(), completed()])
+        code, result, _ = self.invoke()
+        self.assertNotEqual(0, code)
+        self.assertIn("started the MCP server late", result["message"])
+        self.assertIn("after its task was sent", result["message"])
+        # Another thread's server is not this call's; asked for, servers may start.
+        elsewhere = dict(started, params=dict(started["params"], threadId="another-thread"))
+        self.configure(events=[elsewhere, item(), completed()])
         code, result, _ = self.invoke()
         self.assertEqual(0, code, result)
-        self.assertEqual(("off", None, "unavailable"), (result["provider_plugins"]["mode"],
-                                                         result["provider_plugins"]["mcp_servers"],
-                                                         result["provider_plugins"]["source"]))
+        self.configure(events=[started, item(), completed()])
+        code, result, _ = self.invoke("--allow-plugins")
+        self.assertEqual(0, code, result)
+
+    def test_the_server_list_is_bounded_and_says_how_many_ran(self):
+        servers = [{"name": f"s{i:02}" + "x" * 120, "pluginId": None} for i in range(60)]
+        servers.append({"name": "bad\nname", "pluginId": None})
+        self.configure(mcp_pages=[servers])
+        _, result, _ = self.invoke("--allow-plugins")
+        listed = result["provider_plugins"]
+        self.assertEqual(61, listed["server_count"])
+        self.assertEqual(50, len(listed["mcp_servers"]))
+        self.assertTrue(all(len(name) <= 100 for name in listed["mcp_servers"]))
+        self.assertIn("(unprintable)", listed["mcp_servers"])
 
     def test_a_dry_run_shows_plugins_off_and_claude_refuses_the_flag(self):
         code, dry, _ = self.invoke("--dry-run")
         self.assertEqual(0, code, dry)
         self.assertIn("features.plugins=false", dry["argv"])
+        self.assertIn("features.apps=false", dry["argv"])
         self.assertEqual(("off", "not_observed"), (dry["provider_plugins"]["mode"], dry["provider_plugins"]["source"]))
         with redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit):
             peer.peer_main(["claude", "--repo", str(self.repo), "--task-file", str(self.task), "--allow-plugins"])
@@ -382,7 +455,7 @@ class CodexProtocolTests(unittest.TestCase):
         self.assertEqual("not_checked", result["relay_acknowledgement"])
         self.assertEqual("not_checked", result["workflow_completion"])
         receipt = json.loads(self.receipt.read_text())
-        self.assertEqual([str(self.provider), *self.native_arguments, *self.confinement(result), "-c", "features.plugins=false", "app-server", "--listen", "stdio://"], receipt["argv"])
+        self.assertEqual([str(self.provider), *self.native_arguments, *self.confinement(result), "-c", "features.plugins=false", "-c", "features.apps=false", "app-server", "--listen", "stdio://"], receipt["argv"])
         self.assertEqual(self.environment, receipt["env"])
         self.assertEqual(str(self.repo), receipt["cwd"])
         requests = self.recorded_requests()
@@ -719,7 +792,7 @@ class CodexProtocolTests(unittest.TestCase):
         self.assertEqual((MODEL, EFFORT, "unknown"),
                          (dry["requested_model"], dry["requested_effort"], dry["effective_effort"]))
         # Both settings travel in the turn request, never as native arguments.
-        self.assertEqual([str(self.provider), *self.native_arguments, *self.confinement(dry), "-c", "features.plugins=false", "app-server", "--listen", "stdio://"],
+        self.assertEqual([str(self.provider), *self.native_arguments, *self.confinement(dry), "-c", "features.plugins=false", "-c", "features.apps=false", "app-server", "--listen", "stdio://"],
                          dry["argv"])
         self.assertFalse(self.calls.exists())
         # Claude keeps its own list; neither provider takes an option-like or spaced name.
@@ -870,7 +943,7 @@ class CodexProtocolTests(unittest.TestCase):
             self.assertEqual("ready", result["hook_readiness"]["state"])
             receipt = json.loads(self.receipt.read_text())
             # No invocation copy beside the user hooks: each event runs once.
-            self.assertEqual([str(self.provider), *self.confinement(result), "-c", "features.plugins=false", "app-server", "--listen", "stdio://"], receipt["argv"])
+            self.assertEqual([str(self.provider), *self.confinement(result), "-c", "features.plugins=false", "-c", "features.apps=false", "app-server", "--listen", "stdio://"], receipt["argv"])
             self.configure(hook_updates={**user, "trustStatus": "untrusted"})
             code, result, _ = self.invoke()
             self.assertNotEqual(0, code)
@@ -946,7 +1019,7 @@ class CodexProtocolTests(unittest.TestCase):
         while time.monotonic() < deadline:
             try:
                 state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
-            except FileNotFoundError:
+            except (FileNotFoundError, ProcessLookupError):  # it ended between listing and reading
                 break
             if state == "Z":
                 break
@@ -1581,8 +1654,8 @@ class CodexProtocolTests(unittest.TestCase):
         self.assertEqual(0, code, result)
         self.assertEqual("hidden", result["read_scope"]["project_instructions"])
         argv = json.loads(self.receipt.read_text())["argv"]
-        self.assertEqual(["-c", "project_doc_max_bytes=0", "-c", "features.plugins=false", "app-server"],
-                         argv[argv.index("app-server") - 4:][:5])
+        self.assertEqual(["-c", "project_doc_max_bytes=0", "-c", "features.plugins=false", "-c", "features.apps=false", "app-server"],
+                         argv[argv.index("app-server") - 6:][:7])
         (self.repo / "AGENTS.md").unlink()
         (self.repo / "AGENTS.md").write_text("public guidance\n")
         code, result, _ = self.invoke()

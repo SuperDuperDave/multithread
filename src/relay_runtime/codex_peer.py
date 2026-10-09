@@ -32,6 +32,7 @@ _MAX_LISTING = 1024 * 1024
 _MODEL_LIST_PAGES = 32
 _MODEL_LIST_SECONDS = 10
 _MCP_STATUS_PAGES = 5  # bounded: what runs is listed before the task, not browsed
+_APPS_SERVER = "codex_apps"  # Codex's one server for the account's ChatGPT apps (connectors); it has no pluginId
 # Where a setting the call does not request comes from: Codex keeps a thread's settings.
 _KEPT = {"new_thread": "the new thread's configured", "resumed_thread": "this thread's current"}
 _CLIENT_INFO = {"name": "multithread", "title": "Multithread", "version": "0.4.1"}
@@ -366,6 +367,7 @@ class _Driver:
         self.abandoned = set()
         self.waiting_turn = None
         self.mcp_pages = 0
+        self.mcp_read = 0
         self.mcp_servers = []
         self.envelope.update(state="uncertain", requested_session_id=resume,
                              needs_attention=True, task_submission="not_submitted")
@@ -452,27 +454,57 @@ class _Driver:
                                               **({"cursor": cursor} if cursor is not None else {})})
 
     def mcp_listed(self, result):
-        """Record the MCP servers this thread runs, and which a plugin provides; with plugins off, any plugin server
-        stops the call before its task."""
+        """Record the MCP servers this thread runs, before its task goes out. With plugins off it should run none:
+        any server, or a listing that can't be read to its end, stops the call with no task submitted."""
         plugins = self.envelope.setdefault("provider_plugins", {"mode": "allowed"})
         page = result.get("data") if isinstance(result, dict) else None
-        if not isinstance(page, list) or any(not isinstance(server, dict) for server in page):
-            plugins.update(mcp_servers=None, plugin_servers=None, source="unavailable")
-            return self.submit_turn()
-        for server in page:
-            self.mcp_servers.append((_label(server.get("name")), _label(server.get("pluginId"))
-                                     if server.get("pluginId") is not None else None))
-        cursor = result.get("nextCursor")
-        if isinstance(cursor, str) and cursor and self.mcp_pages < _MCP_STATUS_PAGES:
-            return self.list_mcp(cursor)
-        plugin_servers = [{"name": name, "plugin": plugin} for name, plugin in self.mcp_servers if plugin is not None]
-        plugins.update(mcp_servers=sorted(name for name, _ in self.mcp_servers)[:50], plugin_servers=plugin_servers[:50],
-                       source="codex_mcp_server_status", complete=not (isinstance(cursor, str) and cursor))
-        if plugins.get("mode") == "off" and plugin_servers:
-            raise _ProtocolError("Codex runs MCP servers from plugins (" + ", ".join(
-                f"{item['name']} from {item['plugin']}" for item in plugin_servers[:5]) + ") although this call turned "
-                "plugins off; no task was submitted. Inspect retained output.")
+        cursor = result.get("nextCursor") if isinstance(result, dict) else None
+        readable = (isinstance(page, list) and all(isinstance(server, dict) for server in page)
+                    and (cursor is None or isinstance(cursor, str) and bool(cursor)))
+        if readable:
+            self.mcp_read += 1
+            self.mcp_servers.extend((_label(server.get("name")), None if server.get("pluginId") is None
+                                     else _label(server.get("pluginId"))) for server in page)
+            if cursor is not None and self.mcp_pages < _MCP_STATUS_PAGES:
+                return self.list_mcp(cursor)
+        complete = readable and cursor is None
+        names = sorted(name for name, _ in self.mcp_servers)
+        observed = self.mcp_read > 0
+        plugins.update(
+            source="codex_mcp_server_status" if observed else "unavailable", complete=complete,
+            server_count=len(names) if observed else None, mcp_servers=names[:50] if observed else None,
+            plugin_servers=[{"name": name, "plugin": plugin} for name, plugin in self.mcp_servers
+                            if plugin is not None][:50] if observed else None,
+            apps=_APPS_SERVER in names if observed else None)
+        if plugins.get("mode") == "off":
+            if names:
+                raise _ProtocolError(
+                    f"Codex runs {len(names)} MCP server(s) ({', '.join(names[:5])}) although this call turned plugins "
+                    "and apps off; no task was submitted. Next: pass --allow-plugins to run with the account's "
+                    "plugins, apps and MCP servers, or inspect retained output.")
+            if not complete:
+                if readable:
+                    why = f"it has more than {_MCP_STATUS_PAGES} pages"
+                elif result is None and self.mcp_pages == 1:
+                    why = "it is unavailable"
+                else:
+                    why = f"page {self.mcp_pages} " + ("failed" if result is None else "is unreadable")
+                raise _ProtocolError(
+                    f"Codex's list of MCP servers couldn't be read to its end ({why}), so this call can't show none "
+                    "run; no task was submitted. Next: pass --allow-plugins to run without that check, or inspect "
+                    "retained output.")
         self.submit_turn()
+
+    def mcp_started(self, params):
+        """With plugins off, a server starting at any time, not only one listed before the task, ends the call."""
+        if (self.envelope.get("provider_plugins") or {}).get("mode") != "off" or params.get("threadId") not in (
+                None, self.session):
+            return
+        raise _ProtocolError(
+            f"Codex started the MCP server {_label(params.get('name'))} although this call turned plugins and apps off; "
+            + ("the call was ended after its task was sent" if self.turn_requested else "no task was submitted")
+            + ". Next: pass --allow-plugins to run with the account's plugins, apps and MCP servers, or inspect "
+            "retained output.")
 
     def submit_turn(self):
         turn, self.waiting_turn = self.waiting_turn, None
@@ -584,7 +616,7 @@ class _Driver:
             self.listed(None if "error" in message else message.get("result"))
             return
         if method == "mcpServerStatus/list":
-            # A Codex without this listing leaves what runs unobserved (not "none"); the plugins setting still holds.
+            # A Codex without this listing leaves what runs unobserved (not "none"); with plugins off that refuses.
             self.pending.pop(identifier)
             self.mcp_listed(None if "error" in message else message.get("result"))
             return
@@ -712,6 +744,8 @@ class _Driver:
         method, params = message["method"], message.get("params")
         if not isinstance(params, dict):
             raise _ProtocolError("Malformed native notification; inspect retained output.")
+        if method == "mcpServer/startupStatus/updated":
+            return self.mcp_started(params)
         relevant = ("turn/started", "turn/completed", "item/completed", "item/agentMessage/delta",
                     "thread/tokenUsage/updated", "error", "thread/settings/updated", "model/rerouted")
         if method not in relevant:

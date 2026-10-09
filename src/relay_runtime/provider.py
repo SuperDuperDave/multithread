@@ -1481,9 +1481,9 @@ def peer_main(argv=None, *, report_entry=None):
                              "otherwise reads only the checkout without what Git ignores there, its Git store and Codex's own release, "
                              "checked before launch")
     parser.add_argument("--allow-plugins", action="store_true",
-                        help="Codex only: keep the account's Codex plugins and their MCP servers for this call. By "
-                             "default they are off, and the MCP servers the thread runs are listed in the result before "
-                             "its task is sent")
+                        help="Codex only: let the account's Codex plugins, ChatGPT apps (connectors) and MCP servers run "
+                             "in this call. By default plugins and apps are off, the thread's MCP servers are listed before "
+                             "its task is sent, and any server, or a list that can't be read to its end, stops the call")
     parser.add_argument("--attach", action="append", default=[], metavar="IMAGE",
                         help="Claude only: attach a PNG, JPEG, GIF or WebP file to the task as an image; repeatable "
                              f"(at most {_MAX_ATTACHMENTS}, {_MAX_ATTACHMENT // (1024 * 1024)} MiB each, {_MAX_ATTACHMENTS_TOTAL // (1024 * 1024)} MiB in total)")
@@ -1552,6 +1552,8 @@ def _follow_up_preparation(args, plan, envelope):
     if tools is not None:
         # A resumed restricted session keeps its restriction; attachments belong to one task.
         prefix.extend(["--tools", ",".join(tools) or "none"])
+    if getattr(args, "allow_plugins", False):
+        prefix.append("--allow-plugins")
     if args.live_input:
         prefix.append("--live-input")
     if args.stream_progress:
@@ -1654,9 +1656,9 @@ def _run_peer(args, interruption):
                                       "ignored_links": scope["linked"],
                                       "project_instructions": scope["project_instructions"],
                                       "verified": "not_checked"}
-            # Plugins stay off unless asked for: what a peer can call is what this call names, and the thread's
-            # running MCP servers are listed before its task goes out.
-            plugins = [] if args.allow_plugins else ["-c", "features.plugins=false"]
+            # Plugins and apps stay off unless asked for: what a peer can call is what this call names. The thread's
+            # MCP servers are listed before its task goes out, and with them off it must run none.
+            plugins = [] if args.allow_plugins else ["-c", "features.plugins=false", "-c", "features.apps=false"]
             envelope["provider_plugins"] = {"mode": "allowed" if args.allow_plugins else "off",
                                             "mcp_servers": None, "plugin_servers": None, "source": "not_observed"}
             native = [*plan["argv"], *confinement, *plugins, "app-server", "--listen", "stdio://"]

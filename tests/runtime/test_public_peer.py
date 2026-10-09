@@ -132,6 +132,7 @@ else:
         elif method == 'thread/start':
             hook('SessionStart')
             result = {'thread':{'id':session, 'cwd':os.getcwd(), 'turns':[]}, 'cwd':os.getcwd()}
+        elif method == 'mcpServerStatus/list': result = {'data':[], 'nextCursor':None}
         elif method == 'turn/start':
             hook('UserPromptSubmit')
             emit({'id':message['id'], 'result':{'turn':{'id':turn, 'status':'inProgress', 'items':[]}}})
