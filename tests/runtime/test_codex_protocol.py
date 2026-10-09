@@ -556,7 +556,11 @@ class CodexProtocolTests(unittest.TestCase):
         self.assertEqual(self.task.read_text(), requests[6]["params"]["input"][0]["text"])
         self.assertEqual('ready', result['hook_readiness']['state'])
         for request in requests:
-            self.assertFalse({"sandbox", "sandboxPolicy", "model", "effort", "config"} & set(request.get("params", {})))
+            self.assertFalse({"sandbox", "sandboxPolicy", "model", "effort"} & set(request.get("params", {})))
+            # The only configuration a request carries is this call's own profile, on the thread it opens.
+            if "config" in request.get("params", {}):
+                self.assertEqual(("thread/start", {"default_permissions": result["read_scope"]["profile"]}),
+                                 (request["method"], request["params"]["config"]))
         # Escalation off travels in every request that can carry it.
         for index in (3, 6):
             self.assertEqual(("never", "user"), (requests[index]["params"]["approvalPolicy"],
@@ -644,6 +648,7 @@ class CodexProtocolTests(unittest.TestCase):
                                          [EFFORT, "fixture-other-effort"]), result["settings_check"])
                 opened = next(row for row in requests if row["method"] in ("thread/start", "thread/resume"))
                 self.assertEqual({"cwd": str(self.repo), "approvalPolicy": "never", "approvalsReviewer": "user",
+                                  "config": {"default_permissions": result["read_scope"]["profile"]},
                                   **({"threadId": resume} if resume else {})}, opened["params"])
                 turn = next(row for row in requests if row["method"] == "turn/start")
                 self.assertEqual({"threadId": THREAD, "model": MODEL, "effort": EFFORT,
@@ -1686,7 +1691,14 @@ class CodexProtocolTests(unittest.TestCase):
         for update, shown in ((settings_notification(policy="on-request"), "approvalPolicy on-request"),
                               (settings_notification(reviewer="auto_review", thread=OTHER_THREAD),
                                "approvalsReviewer auto_review"),
-                              (settings_notification(policy={"granular": {}}), "approvalPolicy (structured)")):
+                              (settings_notification(policy={"granular": {}}), "approvalPolicy (structured)"),
+                              (dict(settings_notification(), params=dict(settings_notification()["params"],
+                               threadSettings=dict(settings_notification()["params"]["threadSettings"],
+                                                   sandboxPolicy={"type": "workspaceWrite"}))), "sandboxPolicy (structured)"),
+                              (dict(settings_notification(), params=dict(settings_notification()["params"],
+                               threadSettings=dict(settings_notification()["params"]["threadSettings"],
+                                                   activePermissionProfile={"id": ":workspace", "extends": None}))),
+                               "activePermissionProfile (structured)")):
             with self.subTest(update=shown):
                 self.configure(events=[item(), completed(), update], exit_after_events=False, sleep=True)
                 code, result, _ = self.invoke()

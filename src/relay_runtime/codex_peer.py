@@ -572,6 +572,10 @@ class _Driver:
 
     def start_thread(self):
         params = {"cwd": self.repo, **_NO_ESCALATION}
+        # A resumed thread keeps its saved permission profile unless the request names this call's own.
+        profile = (self.envelope.get("read_scope") or {}).get("profile")
+        if profile:
+            params["config"] = {"default_permissions": profile}
         if self.resume:
             params["threadId"] = self.resume
         self.request("thread/resume" if self.resume else "thread/start", params)
@@ -832,6 +836,13 @@ class _Driver:
             settings = params["threadSettings"]
             drifted = {key: settings[key] for key, safe in (("approvalPolicy", "never"), ("approvalsReviewer", "user"))
                        if key in settings and settings[key] != safe}
+            profile = (self.envelope.get("read_scope") or {}).get("profile")
+            if profile and "activePermissionProfile" in settings and settings["activePermissionProfile"] != {
+                    "id": profile, "extends": None}:
+                drifted["activePermissionProfile"] = settings["activePermissionProfile"]
+            sandbox = settings.get("sandboxPolicy")
+            if profile and isinstance(sandbox, dict) and (sandbox.get("type") != "readOnly" or sandbox.get("networkAccess")):
+                drifted["sandboxPolicy"] = sandbox
             if drifted:
                 self.envelope.update(native_approval_policy=settings.get("approvalPolicy")
                                      if settings.get("approvalPolicy") in _APPROVAL_POLICIES else None,
