@@ -368,6 +368,7 @@ class _Driver:
         self.waiting_turn = None
         self.mcp_pages = 0
         self.mcp_read = 0
+        self.breached = False
         self.mcp_servers = []
         self.envelope.update(state="uncertain", requested_session_id=resume,
                              needs_attention=True, task_submission="not_submitted")
@@ -479,7 +480,8 @@ class _Driver:
         if plugins.get("mode") == "off":
             if names:
                 raise _ProtocolError(
-                    f"Codex runs {len(names)} MCP server(s) ({', '.join(names[:5])}) although this call turned plugins "
+                    f"Codex runs {'' if complete else 'at least '}{len(names)} MCP server(s) ({', '.join(names[:5])}) "
+                    "although this call turned plugins "
                     "and apps off; no task was submitted. Next: pass --allow-plugins to run with the account's "
                     "plugins, apps and MCP servers, or inspect retained output.")
             if not complete:
@@ -496,15 +498,19 @@ class _Driver:
         self.submit_turn()
 
     def mcp_started(self, params):
-        """With plugins off, a server starting at any time, not only one listed before the task, ends the call."""
-        if (self.envelope.get("provider_plugins") or {}).get("mode") != "off" or params.get("threadId") not in (
-                None, self.session):
+        """With plugins off, any MCP server activity ends the call at once, whatever thread it names: this app-server
+        is the call's own, so no other thread's servers run in it. An answer already recorded is withdrawn."""
+        if (self.envelope.get("provider_plugins") or {}).get("mode") != "off":
             return
+        submitted = {"requested": "its task may already have been sent",
+                     "accepted": "Codex had already accepted its task"}.get(self.envelope.get("task_submission"),
+                                                                            "no task was submitted")
+        self.breached = True
+        self.envelope.update(state="uncertain", result=None)
         raise _ProtocolError(
-            f"Codex started the MCP server {_label(params.get('name'))} although this call turned plugins and apps off; "
-            + ("the call was ended after its task was sent" if self.turn_requested else "no task was submitted")
-            + ". Next: pass --allow-plugins to run with the account's plugins, apps and MCP servers, or inspect "
-            "retained output.")
+            f"Codex reported MCP server activity ({_label(params.get('name'))}: {_label(params.get('status'))}) "
+            f"although this call turned plugins and apps off; the call was ended and {submitted}. Next: pass "
+            "--allow-plugins to run with the account's plugins, apps and MCP servers, or inspect retained output.")
 
     def submit_turn(self):
         turn, self.waiting_turn = self.waiting_turn, None
@@ -1015,6 +1021,12 @@ def run(process, task: bytes, repo: str, resume: str | None, directory: Path,
             driver.close_stdin()
             driver.finish()
     except _ProtocolError as exc:
+        if driver.breached:
+            # A boundary the call set was crossed: no grace for the turn still running in the owned group.
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
         observation.fault(str(exc))
     except (subprocess.TimeoutExpired, OSError, KeyboardInterrupt):
         driver.problem("Native observation was interrupted or unavailable; preserve partial work and inspect evidence before retrying.")

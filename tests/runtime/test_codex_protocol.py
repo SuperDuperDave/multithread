@@ -120,6 +120,8 @@ while True:
         hooks.extend(dict(hook, command=hook.get('command', HOOK_COMMAND)) for hook in spec.get('extra_hooks', []))
         send_result(message, spec.get('hooks_result', {'data': [{'cwd': os.getcwd(), 'hooks': hooks}]}))
     elif method in ('thread/start', 'thread/resume'):
+        for event in spec.get('before_thread_response', []):
+            emit(event)
         thread = {'id': THREAD_ID, 'cwd': os.getcwd(), 'sessionId': THREAD_ID, 'turns': []}
         thread.update(spec.get('thread_updates', {}))
         result = {'thread': thread, 'cwd': os.getcwd(), 'model': 'fixture-native-selection',
@@ -160,6 +162,8 @@ while True:
     elif method == 'turn/interrupt':
         send_result(message, {})
     elif method == 'mcpServerStatus/list':
+        for event in spec.get('before_mcp_response', []):
+            emit(event)
         if spec.get('mcp_error'):
             emit({'id': message['id'], 'error': {'code': -32601, 'message': 'fixture: no such method'}})
         else:
@@ -389,7 +393,7 @@ class CodexProtocolTests(unittest.TestCase):
         # A server seen before a later page fails is kept, and named in the refusal.
         self.configure(mcp_pages=[[plugin], "error"])
         _, result, _ = self.invoke()
-        self.assertIn("runs 1 MCP server(s) (zoning-signal)", result["message"])
+        self.assertIn("runs at least 1 MCP server(s) (zoning-signal)", result["message"])
         self.assertEqual([{"name": "zoning-signal", "plugin": "zoning-signal@fixture"}],
                          result["provider_plugins"]["plugin_servers"])
         # Asked for, an incomplete list is recorded as such and doesn't stop the call.
@@ -398,20 +402,40 @@ class CodexProtocolTests(unittest.TestCase):
         self.assertEqual(0, code, result)
         self.assertFalse(result["provider_plugins"]["complete"])
 
-    def test_with_plugins_off_a_server_starting_after_the_list_ends_the_call(self):
-        started = {"method": "mcpServer/startupStatus/updated",
-                   "params": {"name": "late", "status": "starting", "threadId": None}}
-        self.configure(events=[started, item(), completed()])
-        code, result, _ = self.invoke()
-        self.assertNotEqual(0, code)
-        self.assertIn("started the MCP server late", result["message"])
-        self.assertIn("after its task was sent", result["message"])
-        # Another thread's server is not this call's; asked for, servers may start.
-        elsewhere = dict(started, params=dict(started["params"], threadId="another-thread"))
-        self.configure(events=[elsewhere, item(), completed()])
-        code, result, _ = self.invoke()
-        self.assertEqual(0, code, result)
-        self.configure(events=[started, item(), completed()])
+    def test_with_plugins_off_mcp_activity_at_any_point_ends_the_call(self):
+        def activity(thread=None, status="starting"):
+            return {"method": "mcpServer/startupStatus/updated",
+                    "params": {"name": "late", "status": status, "threadId": thread}}
+        cases = {
+            # Before the thread is known, and naming any thread: this app-server is the call's own.
+            "before the thread": (dict(before_thread_response=[activity(OTHER_THREAD)]), "late: starting",
+                                  "no task was submitted"),
+            "before the list": (dict(before_mcp_response=[activity()]), "late: starting", "no task was submitted"),
+            "before the turn is accepted": (dict(before_turn_response=[activity(THREAD)]), "late: starting",
+                                            "its task may already have been sent"),
+            "during the turn": (dict(events=[activity(THREAD, "failed"), item(), completed()]), "late: failed",
+                                "Codex had already accepted its task"),
+            # After the answer and completion: the answer is withdrawn, not kept.
+            "after completion": (dict(events=[item(), completed(), activity(THREAD)]), "late: starting",
+                                 "Codex had already accepted its task"),
+            # A provider that keeps working is stopped at once, not after a shutdown grace.
+            "while the turn keeps running": (dict(events=[activity()], exit_after_events=False, sleep=True),
+                                             "late: starting", "Codex had already accepted its task"),
+        }
+        for when, (spec, shown, submitted) in cases.items():
+            with self.subTest(when):
+                self.configure(**spec)
+                started = time.monotonic()
+                code, result, _ = self.invoke()
+                self.assertLess(time.monotonic() - started, 4)
+                self.assertNotEqual(0, code)
+                self.assertEqual(("uncertain", None), (result["state"], result["result"]))
+                self.assertIn(f"MCP server activity ({shown})", result["message"])
+                self.assertIn(f"the call was ended and {submitted}", result["message"])
+                if submitted == "no task was submitted":
+                    self.assertNotIn("turn/start", [row["method"] for row in self.recorded_requests()])
+        # Asked for, servers may start.
+        self.configure(events=[activity(), item(), completed()])
         code, result, _ = self.invoke("--allow-plugins")
         self.assertEqual(0, code, result)
 
