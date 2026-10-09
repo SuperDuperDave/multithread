@@ -35,9 +35,10 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
 from relay_core import cli as core_cli
 from relay_core.store import RelayStore
-from relay_core.protocol import session_target
+from relay_core.protocol import DECISION_ROLLOUT_FENCE, session_target
 from relay_runtime import cli as runtime_cli, hooks, wake
 
+SENT = " (sent 2026-10-08 12:00Z)"
 THREAD = "a0000000-0000-7000-8000-000000000001"
 OTHER = "b0000000-0000-7000-8000-000000000002"
 LIVE_TURN = "c0000000-0000-7000-8000-000000000003"
@@ -122,6 +123,20 @@ STEER_REPLIES = {
     "extended_refusal": _error(-32600, "no active turn to steer; and the input was stored"),
 }
 
+
+
+def approved_receipt(store, decision_id="handover-approval"):
+    """An answered decision in this ledger: what a receipt: approval must name since 0.4.32."""
+    store.emit({"v": 1, "id": f"intent:{decision_id}", "kind": "work.intent", "agent": "claude",
+                "session": "approval-requester", "work_id": "handover-approval", "summary": "Synthetic handover"})
+    request = store.decision_request(
+        agent="claude", session="approval-requester", decision_id=decision_id, work_id="handover-approval",
+        scope="role/handover", summary="Approve the synthetic handover", artifact="git:" + "a" * 40,
+        authority_hint="engineering", option_ids=["approve", "decline"], rollout_fence=DECISION_ROLLOUT_FENCE)
+    response = store.decision_respond(
+        request["event"]["seq"], agent="codex", session="approval-responder", judgment="Approved",
+        resolution="choice", authority_class="engineering", choice="approve", rollout_fence=DECISION_ROLLOUT_FENCE)
+    return f"receipt:{response['event']['seq']}"
 
 class FakeDaemon:
     """A WebSocket JSON-RPC server with the four methods wake and bind use."""
@@ -293,6 +308,9 @@ class WakeCase(unittest.TestCase):
                                          "commit", "-q", "--allow-empty", "-m", "seed"]):
             subprocess.run(["git", "-C", str(self.repo), *command], check=True, capture_output=True)
         self.home = self.base / "state"
+        clock = mock.patch.object(wake, "_sent_label", return_value="2026-10-08 12:00Z")
+        clock.start()
+        self.addCleanup(clock.stop)
         patcher = mock.patch("relay_core.store._expected_workspace_binding",
                              return_value=(self.repo / ".git").resolve())
         patcher.start()
@@ -411,8 +429,10 @@ class WakeCase(unittest.TestCase):
 
     def handover(self, thread=OTHER, *extra):
         generation = self.events("wake.bound")[-1]["seq"]
+        with self.store() as store:
+            approval = approved_receipt(store, f"handover-{generation}")
         return self.bind("--replace", "--expected-generation", str(generation), "--reason", "approved fixture move",
-                         "--approval-ref", "receipt:fixture-handover", *extra, thread=thread)
+                         "--approval-ref", approval, *extra, thread=thread)
 
     def conclusion(self):
         return self.events("wake.concluded")[-1]["meta"]
@@ -498,7 +518,7 @@ class SenderContextTests(WakeCase):
         expected = self.expected_sender(binding)
         self.assertEqual(expected, result["sender"])
         self.assertEqual(str(self.repo), result["ledger"])
-        text = f"Multithread wake from claude (ideas/engineer): {forwarded}"
+        text = f"Multithread wake from claude (ideas/engineer): {forwarded}{SENT}"
         self.assertEqual(text, result["text"])
         self.assert_queue_text(text)
         self.assertEqual(expected, self.events("wake.attempted")[-1]["meta"]["sender"])
@@ -513,7 +533,7 @@ class SenderContextTests(WakeCase):
         expected = self.expected_sender(binding)
         self.assertEqual(("STEERED", "observed"), (result["status"], result["sender_state"]))
         self.assertEqual(expected, result["sender"])
-        text = f"Multithread wake from claude (ideas/engineer): {self.task}"
+        text = f"Multithread wake from claude (ideas/engineer): {self.task}{SENT}"
         requests = [r["params"] for r in self.daemon.requests if r.get("method") == "turn/steer"]
         self.assertEqual([{"threadId": THREAD, "expectedTurnId": LIVE_TURN,
                           "clientUserMessageId": result["message_id"],
@@ -535,7 +555,7 @@ class SenderContextTests(WakeCase):
         self.assertEqual(("DELIVERED TO INBOX", "observed"), (result["status"], result["sender_state"]))
         expected = self.expected_sender(binding)
         self.assertEqual(expected, result["sender"])
-        text = f"Multithread wake from codex (ideas/engineer): {self.task}"
+        text = f"Multithread wake from codex (ideas/engineer): {self.task}{SENT}"
         self.assertEqual([{"type": "user", "message": {"role": "user", "content": text}}],
                          ClaudeTests.received(self))
         self.assertEqual(expected, self.events("wake.attempted")[-1]["meta"]["sender"])
@@ -547,7 +567,7 @@ class SenderContextTests(WakeCase):
                                             recipient="reviewer", agent=agent, session=session)
                 self.assertEqual("unbound", recorder["sender_state"])
                 self.assertNotIn("sender", recorder)
-                self.assertEqual(f"Multithread wake from {agent}: {self.task}", recorder["text"])
+                self.assertEqual(f"Multithread wake from {agent}: {self.task}{SENT}", recorder["text"])
 
     def test_multiple_same_session_roles_fall_back_until_explicitly_selected(self):
         self.bound()
@@ -556,12 +576,12 @@ class SenderContextTests(WakeCase):
         automatic = self.sender_wake()
         self.assertEqual(("QUEUED", "ambiguous"), (automatic["status"], automatic["sender_state"]))
         self.assertNotIn("sender", automatic)
-        self.assert_queue_text(f"Multithread wake from claude: {self.task}")
+        self.assert_queue_text(f"Multithread wake from claude: {self.task}{SENT}")
         self.assertNotIn("sender", self.events("wake.attempted")[-1]["meta"])
         explicit = self.sender_wake("--sender-role", "researcher", "--id", "selected-researcher")
         self.assertEqual(("QUEUED", "observed"), (explicit["status"], explicit["sender_state"]))
         self.assertEqual(self.expected_sender(selected), explicit["sender"])
-        self.assert_queue_text(f"Multithread wake from claude (ideas/researcher): {self.task}")
+        self.assert_queue_text(f"Multithread wake from claude (ideas/researcher): {self.task}{SENT}")
         self.assertIn((str(self.source), ("wake-ledger", "show", "researcher")), self.ledger_calls)
 
     def test_explicit_wrong_holder_or_unavailable_source_refuses_before_target_mutation(self):
@@ -592,7 +612,7 @@ class SenderContextTests(WakeCase):
         absent = self.sender_wake("--id", "known-unbound")
         self.assertEqual(("QUEUED", "unbound"), (absent["status"], absent["sender_state"]))
         self.assertNotIn("sender", absent)
-        self.assert_queue_text(f"Multithread wake from claude: {self.task}")
+        self.assert_queue_text(f"Multithread wake from claude: {self.task}{SENT}")
         self.source_failure = True
         failed = self.sender_wake("--id", "source-unavailable")
         self.assertEqual(("QUEUED", "unavailable"), (failed["status"], failed["sender_state"]))
@@ -614,7 +634,7 @@ class SenderContextTests(WakeCase):
                 result = self.sender_wake("--id", "malformed-" + str(index))
                 self.assertEqual(("QUEUED", "unavailable"), (result["status"], result["sender_state"]))
                 self.assertNotIn("sender", result)
-                self.assert_queue_text(f"Multithread wake from claude: {self.task}")
+                self.assert_queue_text(f"Multithread wake from claude: {self.task}{SENT}")
                 self.assertNotIn("sender", self.events("wake.attempted")[-1]["meta"])
 
     def test_source_role_change_preserves_duplicate_suppression_and_historical_snapshot(self):
@@ -651,13 +671,13 @@ class SenderContextTests(WakeCase):
         self.source_reply = {**self.source_snapshot(), "project": None}
         nullable = self.sender_wake("--dry-run")
         self.assertEqual(self.expected_sender(binding, project=None), nullable["sender"])
-        self.assertEqual(f"Multithread wake from claude (engineer): {self.task}", nullable["text"])
+        self.assertEqual(f"Multithread wake from claude (engineer): {self.task}{SENT}", nullable["text"])
         self.source_reply = None
         source_reads = [call for call in self.ledger_calls if Path(call[0]).is_relative_to(self.source)]
         missing = self.sender_wake("--dry-run", session=None)
         self.assertEqual(("DRY RUN", "unavailable"), (missing["status"], missing["sender_state"]))
         self.assertNotIn("sender", missing)
-        self.assertEqual(f"Multithread wake from claude: {self.task}", missing["text"])
+        self.assertEqual(f"Multithread wake from claude: {self.task}{SENT}", missing["text"])
         explicit = self.sender_wake("--dry-run", "--sender-role", "engineer", session=None)
         self.assertEqual("NOT SENT", explicit["status"])
         self.assertEqual(source_reads, [call for call in self.ledger_calls
@@ -744,7 +764,7 @@ class WakeOutcomeTests(WakeCase):
         self.assertEqual({"reachability": "reachable", "turn_state": "completed", "source": "codex_turn_list"},
                          result["recipient_state"])
         self.assertEqual("Nothing. Wait for the recipient's acknowledgement.", result["next"])
-        text = f"Multithread wake from claude: {self.task}"
+        text = f"Multithread wake from claude: {self.task}{SENT}"
         self.assertEqual([["queue", "--remote", f"unix://{self.socket}", "--thread", THREAD, "--message", text]],
                          self.codex_calls())
         self.assertNotIn("turn/steer", self.daemon.methods())
@@ -1391,7 +1411,7 @@ class WakeAdmissionTests(WakeCase):
                     store.wake_bind("operator", provider="codex", thread=OTHER, endpoint=f"unix://{self.socket}",
                                     cwd=str(self.repo), replace=True, agent="claude", session="binder",
                                     expected_generation=generation, reason="synthetic concurrent handover",
-                                    approval_ref="receipt:fixture-handover")
+                                    approval_ref=approved_receipt(store))
             return result
 
         self.ledger = rebind_after_begin
@@ -1540,7 +1560,7 @@ class WakeLedgerTests(WakeCase):
     def test_a_sequence_reference_names_its_ledger_and_must_exist(self):
         generation = self.bound()
         result = self.wake(ref=str(generation))
-        self.assertEqual(f"Multithread wake from claude: ledger sequence {generation} in {self.repo}",
+        self.assertEqual(f"Multithread wake from claude: ledger sequence {generation} in {self.repo}{SENT}",
                          result["text"])
         missing = self.wake(ref="999")
         self.assertEqual(("NOT SENT", 4), (missing["status"], missing["exit_code"]))
@@ -1551,7 +1571,7 @@ class WakeLedgerTests(WakeCase):
         # The conversation stays in the ledger where it started; only the wake crosses, naming where to read.
         generation = self.bound()
         elsewhere = self.wake(ref=f"ledger:/elsewhere/checkout#{generation}")
-        self.assertEqual(f"Multithread wake from claude: ledger sequence {generation} in /elsewhere/checkout",
+        self.assertEqual(f"Multithread wake from claude: ledger sequence {generation} in /elsewhere/checkout{SENT}",
                          elsewhere["text"])
         self.assertNotIn("ref_sha256", elsewhere, "a sequence carries no file content")
         here = self.wake(ref=str(generation))
@@ -1679,7 +1699,7 @@ class WakeLedgerTests(WakeCase):
         attempt = self.events("wake.attempted")[-1]["meta"]
         self.assertEqual([
             "QUEUED: Queued as asked. Codex accepted the queue entry; a recipient turn and consumption are unobserved.",
-            f"Message {attempt['message_id']}: \"Multithread wake from claude: {self.task}\"",
+            f"Message {attempt['message_id']}: \"Multithread wake from claude: {self.task}{SENT}\"",
             "Next: Nothing. Wait for the recipient's acknowledgement.",
         ], out.splitlines())
 
@@ -1804,7 +1824,7 @@ class ClaudeTests(WakeCase):
         self.assertEqual("Wait for the recipient's acknowledgement. The session may still hold or refuse the message "
                          "under its inbound settings (crossSessionInbound); if nothing arrives, ask the person to "
                          "check that session.", result["next"])
-        text = f"Multithread wake from codex: {self.task}"
+        text = f"Multithread wake from codex: {self.task}{SENT}"
         self.assertEqual([{"type": "user", "message": {"role": "user", "content": text}}], self.received())
         self.assertEqual(1, self.inbox.lines[0].count(b"\n"))
         self.assertTrue(self.inbox.lines[0].endswith(b"}\n"))
@@ -2774,6 +2794,96 @@ class BindTests(WakeCase):
                           "working directory. Nothing was recorded.",
                           "Next: Check `codex app-server daemon version`, then run bind again."], out.splitlines())
         self.assertEqual([], self.events("wake.bound"))
+
+    def approve(self, ref, *extra):
+        generation = self.events("wake.bound")[-1]["seq"]
+        self.daemon.threads[OTHER] = {"cwd": str(self.repo), "status": "active", "turns": []}
+        return self.bind("--replace", "--expected-generation", str(generation), "--reason", "approved move",
+                         "--approval-ref", ref, *extra, thread=OTHER)
+
+    def git_head(self, repo):
+        return subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True,
+                              text=True).stdout.strip()
+
+    def test_a_git_approval_must_be_an_object_where_it_says_and_shows_what_it_is(self):
+        # 0.4.32: an approval that doesn't resolve isn't one. Nine of ten real handovers cited a workspace commit
+        # that isn't in the bound checkout, so --approval-repo names where it is.
+        self.bound()
+        before = len(self.events())
+        missing = "git:" + "0" * 40
+        code, out = self.approve(missing)
+        self.assertEqual((4, before), (code, len(self.events())), out)
+        self.assertIn(f"--approval-ref {missing} isn't an object in {self.repo}", out)
+        self.assertIn("pass --approval-repo for the repository that holds it", out)
+        elsewhere = self.base / "approvals"
+        elsewhere.mkdir()
+        for command in (["init", "-q"], ["-c", "user.name=Fixture", "-c", "user.email=fixture@invalid",
+                                         "commit", "-q", "--allow-empty", "-m", "Approve the operator handover"]):
+            subprocess.run(["git", "-C", str(elsewhere), *command], check=True, capture_output=True)
+        ref = "git:" + self.git_head(elsewhere)
+        self.assertEqual(4, self.approve(ref)[0], "not in the bound checkout")
+        code, out = self.approve(ref, "--approval-repo", str(elsewhere))
+        self.assertEqual(0, code, out)
+        self.assertIn(f"Approval: git commit {ref[4:16]} in {elsewhere}: \"Approve the operator handover\" (", out)
+        self.assertEqual(ref, self.events("wake.bound")[-1]["meta"]["approval_ref"])
+        code, out = self.approve("git:--output=x" + "0" * 26)
+        self.assertEqual(4, code, "never an option to git")
+        self.assertIn("isn't git:<full object id>, sha256:<digest> or receipt:<ledger seq>", out)
+
+    def test_a_digest_approval_needs_its_durable_file_and_records_the_path(self):
+        self.bound()
+        approval = self.base / "approval.md"
+        approval.write_text("Approved: move operator to the other conversation\nSigned off.\n")
+        digest = "sha256:" + hashlib.sha256(approval.read_bytes()).hexdigest()
+        code, out = self.approve(digest)
+        self.assertEqual(4, code, out)
+        self.assertIn("Pass --approval-file with the path of the durable file it hashes", out)
+        code, out = self.approve(digest, "--approval-file", str(approval))
+        self.assertEqual(4, code, "the fixture lives in a temporary directory")
+        self.assertIn("which doesn't survive a restart", out)
+        with mock.patch.object(wake, "_EPHEMERAL_ROOTS", ()):
+            self.assertIn(f"has {digest}, not sha256:{'b' * 64}",
+                          self.approve("sha256:" + "b" * 64, "--approval-file", str(approval))[1])
+            code, out = self.approve(digest, "--approval-file", str(approval))
+        self.assertEqual(0, code, out)
+        self.assertIn(f"Approval: {approval}, whose sha256 matches {digest}: \"Approved: move operator", out)
+        self.assertEqual(f"approved move; approval file {approval}", self.events("wake.bound")[-1]["meta"]["reason"],
+                         "an audit can find the file without a protocol change")
+        self.assertEqual(4, self.approve(digest, "--approval-repo", str(self.repo))[0], "repo is for git: only")
+
+    def test_a_receipt_approval_must_be_an_answered_decision_here(self):
+        first = self.bound()
+        for ref, said in ((f"receipt:binding:{first}", "names the ledger sequence of a decision response"),
+                          (f"receipt:{first}", "is a wake.bound, not an answered decision"),
+                          ("receipt:999999", "names no event in this ledger")):
+            code, out = self.approve(ref)
+            self.assertEqual(4, code, out)
+            self.assertIn(said, out)
+        with self.store() as store:
+            ref = approved_receipt(store)
+        code, out = self.approve(ref)
+        self.assertEqual(0, code, out)
+        self.assertIn(f"Approval: decision handover-approval answered choice approve by codex:approval-responder at ", out)
+        self.assertIn(f"({ref}): \"", out)
+        self.assertEqual(ref, self.events("wake.bound")[-1]["meta"]["approval_ref"])
+
+    def test_pause_by_another_holder_checks_its_approval_before_admission(self):
+        self.bound()
+        err = io.StringIO()
+        with redirect_stderr(err), redirect_stdout(io.StringIO()):
+            code = runtime_cli.main(["--repo", str(self.repo), "pause", "operator", "--agent", "codex", "--session",
+                                     "someone", "--expected-generation", "1", "--reason", "x",
+                                     "--approval-ref", "git:" + "0" * 40])
+        self.assertNotEqual(0, code)
+        self.assertIn("isn't an object in", err.getvalue())
+        self.assertIn("nothing was recorded", err.getvalue())
+        rendered = core_cli._render_wake_control("pause", {
+            "duplicate": False, "binding": {"role": "operator", "generation": 7},
+            "approval": {"ref": "git:" + "a" * 40, "kind": "commit", "repo": "/srv/approvals",
+                         "subject": "Approve", "date": "2026-10-08T00:00:00+00:00"}})
+        self.assertEqual(["PAUSED: Wakes to operator are paused (binding 7); nothing is sent until they are resumed.",
+                          "Approval: git commit aaaaaaaaaaaa in /srv/approvals: \"Approve\" (2026-10-08T00:00:00+00:00)",
+                          "Next: Resume with: multithread resume operator"], rendered.splitlines())
 
     def test_bind_refuses_a_recipient_move_until_authorized_handover(self):
         first = self.bound()

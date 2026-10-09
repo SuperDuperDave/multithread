@@ -486,6 +486,9 @@ def _worker(access, args, argv):
             for message in coverage.get("messages", ()):
                 print("multithread: warning: " + message, file=sys.stderr)
         return 0
+    if args.command in {"unbind", "pause", "resume"}:
+        return core_cli.main(argv, carried={"approval_resolved": getattr(args, "approval_resolved", None),
+                                            "reason": args.reason})
     return core_cli.main(argv)
 
 
@@ -823,6 +826,15 @@ def main(argv=None, *, registry=None, command_alias_check=None):
                         args.inbox_warning = reported
             if args.provider_payload is None:
                 return 0
+        if args.command in {"unbind", "pause", "resume"}:
+            # git: and sha256: approvals are checked here, before the closed environment; the ledger checks receipt:.
+            from .wake import ApprovalUnresolved, _with_approval_file, resolve_approval
+            try:
+                args.approval_resolved = resolve_approval(args.approval_ref, args.repo or os.getcwd(),
+                                                          args.approval_repo, args.approval_file)
+                args.reason = _with_approval_file(args.reason, args.approval_resolved)
+            except ApprovalUnresolved as exc:
+                raise ValidationError(f"{exc}; nothing was recorded. Next: {exc.next_step}") from None
         stage = "admission"
         if threading.active_count() != 1:
             raise StateError("installed dispatcher requires a single-threaded fresh process")

@@ -1355,6 +1355,7 @@ class RelayStore:
         if provider == "codex":
             thread = canonical_wake_thread(thread)
         with self._transaction():
+            approval = self._approval_receipt(approval_ref)
             current = self._wake_binding(role)
             if current is None and expected_generation is not None:
                 raise ConflictError("role binding changed; expected generation is no longer bound")
@@ -1448,7 +1449,33 @@ class RelayStore:
                 "duplicate": False,
                 "binding": self._wake_state(role),
                 "replaced": current,
+                **({"approval": approval} if approval is not None else {}),
             }
+
+    def _approval_receipt(self, approval_ref: str | None) -> dict[str, Any] | None:
+        """What a receipt: approval rests on: a decision answered in this ledger. Integrity and kind, not who."""
+
+        if approval_ref is None or not approval_ref.startswith("receipt:"):
+            return None
+        target = approval_ref.removeprefix("receipt:")
+        if not target.isascii() or not target.isdigit():
+            raise ValidationError(
+                f"--approval-ref {approval_ref} can't be resolved: a receipt approval names the ledger sequence of a "
+                "decision response here, as receipt:<seq>"
+            )
+        row = self._execute("SELECT * FROM events WHERE seq = ?", (int(target),)).fetchone()
+        if row is None:
+            raise ValidationError(f"--approval-ref {approval_ref} names no event in this ledger")
+        meta = json.loads(row["meta_json"])
+        if row["kind"] != "decision.responded" or meta.get("resolution") not in ("choice", "directive"):
+            found = row["kind"] + (f" ({meta.get('resolution')})" if row["kind"] == "decision.responded" else "")
+            raise ValidationError(
+                f"--approval-ref {approval_ref} is a {found}, not an answered decision: a receipt approval must be a "
+                "decision.responded whose resolution is choice or directive"
+            )
+        return {"ref": approval_ref, "kind": row["kind"], "source": f"{row['agent']}:{row['session']}",
+                "at": row["recorded_at"], "decision_id": meta["decision_id"], "resolution": meta["resolution"],
+                "choice": meta.get("choice"), "summary": row["summary"]}
 
     def wake_control(
         self, action: str, role: str, *, agent: str, session: str,
@@ -1462,6 +1489,7 @@ class RelayStore:
             raise ValidationError("wake control is unbind, pause or resume")
         role = canonical_wake_role(role)
         with self._transaction():
+            approval = self._approval_receipt(approval_ref)
             current = self._wake_binding(role)
             if current is None:
                 if action == "unbind":
@@ -1508,6 +1536,7 @@ class RelayStore:
                 "duplicate": False,
                 "binding": self._wake_state(role),
                 "ended": current if action == "unbind" else None,
+                **({"approval": approval} if approval is not None else {}),
             }
 
     def wake_plan(
