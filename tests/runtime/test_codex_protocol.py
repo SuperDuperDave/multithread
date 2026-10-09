@@ -159,6 +159,14 @@ while True:
             raise SystemExit(spec.get('exit', 0))
     elif method == 'turn/interrupt':
         send_result(message, {})
+    elif method == 'mcpServerStatus/list':
+        if spec.get('mcp_error'):
+            emit({'id': message['id'], 'error': {'code': -32601, 'message': 'fixture: no such method'}})
+        else:
+            pages = spec.get('mcp_pages', [[]])
+            index = int(message['params'].get('cursor') or 0)
+            emit({'id': message['id'], 'result': {
+                'data': pages[index], 'nextCursor': str(index + 1) if index + 1 < len(pages) else None}})
     elif method == 'model/list':
         params = message['params']
         if spec.get('defer_model_list'):
@@ -312,6 +320,52 @@ class CodexProtocolTests(unittest.TestCase):
         self.assertEqual(value, json.loads((directory / "result.json").read_text()))
         return value
 
+    def test_plugins_are_off_unless_asked_for_and_what_runs_is_listed_before_the_task(self):
+        config = {"name": "sentinel", "pluginId": None}
+        plugin = {"name": "zoning-signal", "pluginId": "zoning-signal@fixture"}
+        # Off by default: the flag is passed, and the thread's servers are listed before its task.
+        self.configure(mcp_pages=[[config], [{"name": "notes", "pluginId": None}]])
+        code, result, _ = self.invoke()
+        self.assertEqual(0, code, result)
+        self.assertIn("features.plugins=false", self.calls_argv(result))
+        self.assertEqual({"mode": "off", "mcp_servers": ["notes", "sentinel"], "plugin_servers": [],
+                          "source": "codex_mcp_server_status", "complete": True}, result["provider_plugins"])
+        methods = [row["method"] for row in self.recorded_requests()]
+        self.assertLess(methods.index("mcpServerStatus/list"), methods.index("turn/start"))
+        # A plugin's server running anyway stops the call before its task.
+        self.configure(mcp_pages=[[config, plugin]])
+        code, result, _ = self.invoke()
+        self.assertNotEqual(0, code)
+        self.assertEqual("not_submitted", result["task_submission"])
+        self.assertNotIn("turn/start", [row["method"] for row in self.recorded_requests()])
+        self.assertIn("zoning-signal from zoning-signal@fixture", result["message"])
+        # Asked for, plugins stay on, and the result says which servers they brought.
+        code, result, _ = self.invoke("--allow-plugins")
+        self.assertEqual(0, code, result)
+        self.assertNotIn("features.plugins=false", self.calls_argv(result))
+        self.assertEqual("allowed", result["provider_plugins"]["mode"])
+        self.assertEqual([{"name": "zoning-signal", "plugin": "zoning-signal@fixture"}],
+                         result["provider_plugins"]["plugin_servers"])
+        # A Codex that can't list them leaves what runs unobserved, not empty; the flag still holds.
+        self.configure(mcp_error=True)
+        code, result, _ = self.invoke()
+        self.assertEqual(0, code, result)
+        self.assertEqual(("off", None, "unavailable"), (result["provider_plugins"]["mode"],
+                                                         result["provider_plugins"]["mcp_servers"],
+                                                         result["provider_plugins"]["source"]))
+
+    def test_a_dry_run_shows_plugins_off_and_claude_refuses_the_flag(self):
+        code, dry, _ = self.invoke("--dry-run")
+        self.assertEqual(0, code, dry)
+        self.assertIn("features.plugins=false", dry["argv"])
+        self.assertEqual(("off", "not_observed"), (dry["provider_plugins"]["mode"], dry["provider_plugins"]["source"]))
+        with redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit):
+            peer.peer_main(["claude", "--repo", str(self.repo), "--task-file", str(self.task), "--allow-plugins"])
+        self.assertIn("--allow-plugins is a Codex option", err.getvalue())
+
+    def calls_argv(self, result):
+        return json.loads(self.receipt.read_text())["argv"]
+
     def test_new_thread_returns_only_exact_final_answer_and_preserves_native_context(self):
         code, result, directory = self.invoke()
         self.assertEqual(0, code, result)
@@ -328,14 +382,15 @@ class CodexProtocolTests(unittest.TestCase):
         self.assertEqual("not_checked", result["relay_acknowledgement"])
         self.assertEqual("not_checked", result["workflow_completion"])
         receipt = json.loads(self.receipt.read_text())
-        self.assertEqual([str(self.provider), *self.native_arguments, *self.confinement(result), "app-server", "--listen", "stdio://"], receipt["argv"])
+        self.assertEqual([str(self.provider), *self.native_arguments, *self.confinement(result), "-c", "features.plugins=false", "app-server", "--listen", "stdio://"], receipt["argv"])
         self.assertEqual(self.environment, receipt["env"])
         self.assertEqual(str(self.repo), receipt["cwd"])
         requests = self.recorded_requests()
-        self.assertEqual(["initialize", "initialized", "hooks/list", "thread/start", "turn/start"], [request["method"] for request in requests])
+        self.assertEqual(["initialize", "initialized", "hooks/list", "thread/start", "mcpServerStatus/list", "turn/start"],
+                         [request["method"] for request in requests])
         self.assertEqual(str(self.repo), requests[3]["params"]["cwd"])
-        self.assertEqual(THREAD, requests[4]["params"]["threadId"])
-        self.assertEqual(self.task.read_text(), requests[4]["params"]["input"][0]["text"])
+        self.assertEqual(THREAD, requests[5]["params"]["threadId"])
+        self.assertEqual(self.task.read_text(), requests[5]["params"]["input"][0]["text"])
         self.assertEqual('ready', result['hook_readiness']['state'])
         for request in requests:
             self.assertFalse({"sandbox", "sandboxPolicy", "approvalPolicy", "approvalsReviewer", "model",
@@ -416,7 +471,7 @@ class CodexProtocolTests(unittest.TestCase):
                 requests = self.recorded_requests()
                 # The listed model advertises the effort, checked before any thread opens.
                 self.assertEqual(["initialize", "initialized", "hooks/list", "model/list",
-                                  "thread/resume" if resume else "thread/start", "turn/start"],
+                                  "thread/resume" if resume else "thread/start", "mcpServerStatus/list", "turn/start"],
                                  [row["method"] for row in requests])
                 self.assertEqual({"includeHidden": True}, requests[3]["params"])
                 self.assertEqual(checked("verified", MODEL, "requested", EFFORT, "requested",
@@ -664,7 +719,7 @@ class CodexProtocolTests(unittest.TestCase):
         self.assertEqual((MODEL, EFFORT, "unknown"),
                          (dry["requested_model"], dry["requested_effort"], dry["effective_effort"]))
         # Both settings travel in the turn request, never as native arguments.
-        self.assertEqual([str(self.provider), *self.native_arguments, *self.confinement(dry), "app-server", "--listen", "stdio://"],
+        self.assertEqual([str(self.provider), *self.native_arguments, *self.confinement(dry), "-c", "features.plugins=false", "app-server", "--listen", "stdio://"],
                          dry["argv"])
         self.assertFalse(self.calls.exists())
         # Claude keeps its own list; neither provider takes an option-like or spaced name.
@@ -815,7 +870,7 @@ class CodexProtocolTests(unittest.TestCase):
             self.assertEqual("ready", result["hook_readiness"]["state"])
             receipt = json.loads(self.receipt.read_text())
             # No invocation copy beside the user hooks: each event runs once.
-            self.assertEqual([str(self.provider), *self.confinement(result), "app-server", "--listen", "stdio://"], receipt["argv"])
+            self.assertEqual([str(self.provider), *self.confinement(result), "-c", "features.plugins=false", "app-server", "--listen", "stdio://"], receipt["argv"])
             self.configure(hook_updates={**user, "trustStatus": "untrusted"})
             code, result, _ = self.invoke()
             self.assertNotEqual(0, code)
@@ -1526,7 +1581,8 @@ class CodexProtocolTests(unittest.TestCase):
         self.assertEqual(0, code, result)
         self.assertEqual("hidden", result["read_scope"]["project_instructions"])
         argv = json.loads(self.receipt.read_text())["argv"]
-        self.assertEqual(["-c", "project_doc_max_bytes=0", "app-server"], argv[argv.index("app-server") - 2:][:3])
+        self.assertEqual(["-c", "project_doc_max_bytes=0", "-c", "features.plugins=false", "app-server"],
+                         argv[argv.index("app-server") - 4:][:5])
         (self.repo / "AGENTS.md").unlink()
         (self.repo / "AGENTS.md").write_text("public guidance\n")
         code, result, _ = self.invoke()

@@ -1480,6 +1480,10 @@ def peer_main(argv=None, *, report_entry=None):
                         help="Codex only: one more existing absolute path the peer's tools may read; repeatable. A Codex peer "
                              "otherwise reads only the checkout without what Git ignores there, its Git store and Codex's own release, "
                              "checked before launch")
+    parser.add_argument("--allow-plugins", action="store_true",
+                        help="Codex only: keep the account's Codex plugins and their MCP servers for this call. By "
+                             "default they are off, and the MCP servers the thread runs are listed in the result before "
+                             "its task is sent")
     parser.add_argument("--attach", action="append", default=[], metavar="IMAGE",
                         help="Claude only: attach a PNG, JPEG, GIF or WebP file to the task as an image; repeatable "
                              f"(at most {_MAX_ATTACHMENTS}, {_MAX_ATTACHMENT // (1024 * 1024)} MiB each, {_MAX_ATTACHMENTS_TOTAL // (1024 * 1024)} MiB in total)")
@@ -1491,6 +1495,8 @@ def peer_main(argv=None, *, report_entry=None):
         parser.error("--max-turns is a Claude option; Codex returns one native turn with its normal tool loop")
     if args.client == "claude" and args.effort is not None and args.effort not in _CLAUDE_EFFORTS:
         parser.error("argument --effort: Claude accepts " + ", ".join(_CLAUDE_EFFORTS))
+    if args.client == "claude" and args.allow_plugins:
+        parser.error("--allow-plugins is a Codex option; a Claude --tools call admits only reviewed built-in plugins")
     if args.client == "codex" and args.stream_progress:
         parser.error("Codex already uses native streaming; --stream-progress is a Claude option")
     if args.client == "codex" and (args.tools is not None or args.attach):
@@ -1648,7 +1654,12 @@ def _run_peer(args, interruption):
                                       "ignored_links": scope["linked"],
                                       "project_instructions": scope["project_instructions"],
                                       "verified": "not_checked"}
-            native = [*plan["argv"], *confinement, "app-server", "--listen", "stdio://"]
+            # Plugins stay off unless asked for: what a peer can call is what this call names, and the thread's
+            # running MCP servers are listed before its task goes out.
+            plugins = [] if args.allow_plugins else ["-c", "features.plugins=false"]
+            envelope["provider_plugins"] = {"mode": "allowed" if args.allow_plugins else "off",
+                                            "mcp_servers": None, "plugin_servers": None, "source": "not_observed"}
+            native = [*plan["argv"], *confinement, *plugins, "app-server", "--listen", "stdio://"]
         envelope["repo"] = plan["repo"]
         if args.dry_run:
             # Readiness starts a provider (Codex's hook listing), which a dry run never

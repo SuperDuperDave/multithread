@@ -31,6 +31,7 @@ _MAX_LISTING = 1024 * 1024
 # Reading the model list is bounded; when it fails or runs long, the call proceeds unchecked.
 _MODEL_LIST_PAGES = 32
 _MODEL_LIST_SECONDS = 10
+_MCP_STATUS_PAGES = 5  # bounded: what runs is listed before the task, not browsed
 # Where a setting the call does not request comes from: Codex keeps a thread's settings.
 _KEPT = {"new_thread": "the new thread's configured", "resumed_thread": "this thread's current"}
 _CLIENT_INFO = {"name": "multithread", "title": "Multithread", "version": "0.4.1"}
@@ -321,6 +322,11 @@ def list_hooks(argv, repo, *, timeout=15, on_start=None):
         return server.call("hooks/list", {"cwds": [repo]})
 
 
+def _label(value):
+    """A provider-reported name, as a bounded printable label; anything else isn't repeated."""
+    return value[:100] if isinstance(value, str) and value and value.isprintable() else "(unprintable)"
+
+
 class _Driver:
     def __init__(self, process, task, repo, resume, envelope, timeout, control, expected_hook=None,
                  hook_file=None):
@@ -358,6 +364,9 @@ class _Driver:
         self.listing_deadline = None
         self.listed_pages = 0
         self.abandoned = set()
+        self.waiting_turn = None
+        self.mcp_pages = 0
+        self.mcp_servers = []
         self.envelope.update(state="uncertain", requested_session_id=resume,
                              needs_attention=True, task_submission="not_submitted")
 
@@ -436,6 +445,40 @@ class _Driver:
                                            "advertised_efforts": efforts}
         if status == "refused":
             raise _ProtocolError(_settings_refusal(model, model_source, effort, effort_source, efforts))
+
+    def list_mcp(self, cursor):
+        self.mcp_pages += 1
+        self.request("mcpServerStatus/list", {"threadId": self.session, "detail": "toolsAndAuthOnly", "limit": 100,
+                                              **({"cursor": cursor} if cursor is not None else {})})
+
+    def mcp_listed(self, result):
+        """Record the MCP servers this thread runs, and which a plugin provides; with plugins off, any plugin server
+        stops the call before its task."""
+        plugins = self.envelope.setdefault("provider_plugins", {"mode": "allowed"})
+        page = result.get("data") if isinstance(result, dict) else None
+        if not isinstance(page, list) or any(not isinstance(server, dict) for server in page):
+            plugins.update(mcp_servers=None, plugin_servers=None, source="unavailable")
+            return self.submit_turn()
+        for server in page:
+            self.mcp_servers.append((_label(server.get("name")), _label(server.get("pluginId"))
+                                     if server.get("pluginId") is not None else None))
+        cursor = result.get("nextCursor")
+        if isinstance(cursor, str) and cursor and self.mcp_pages < _MCP_STATUS_PAGES:
+            return self.list_mcp(cursor)
+        plugin_servers = [{"name": name, "plugin": plugin} for name, plugin in self.mcp_servers if plugin is not None]
+        plugins.update(mcp_servers=sorted(name for name, _ in self.mcp_servers)[:50], plugin_servers=plugin_servers[:50],
+                       source="codex_mcp_server_status", complete=not (isinstance(cursor, str) and cursor))
+        if plugins.get("mode") == "off" and plugin_servers:
+            raise _ProtocolError("Codex runs MCP servers from plugins (" + ", ".join(
+                f"{item['name']} from {item['plugin']}" for item in plugin_servers[:5]) + ") although this call turned "
+                "plugins off; no task was submitted. Inspect retained output.")
+        self.submit_turn()
+
+    def submit_turn(self):
+        turn, self.waiting_turn = self.waiting_turn, None
+        self.turn_requested = True
+        self.envelope["task_submission"] = "requested"
+        self.request("turn/start", turn)
 
     def start_thread(self):
         params = {"cwd": self.repo}
@@ -540,6 +583,11 @@ class _Driver:
             self.pending.pop(identifier)
             self.listed(None if "error" in message else message.get("result"))
             return
+        if method == "mcpServerStatus/list":
+            # A Codex without this listing leaves what runs unobserved (not "none"); the plugins setting still holds.
+            self.pending.pop(identifier)
+            self.mcp_listed(None if "error" in message else message.get("result"))
+            return
         if ("result" in message) == ("error" in message):
             raise _ProtocolError("Unmatched or malformed native response; inspect retained output.")
         if "error" in message:
@@ -617,9 +665,8 @@ class _Driver:
                 self.check_settings(model, model_source, effort, effort_source)
             turn = {"threadId": self.session, "input": [{"type": "text", "text": self.task}]}
             turn.update((key, value) for key, value in requested.items() if value is not None)
-            self.turn_requested = True
-            self.envelope["task_submission"] = "requested"
-            self.request("turn/start", turn)
+            self.waiting_turn = turn
+            self.list_mcp(None)  # what runs is observed before any task goes out
         elif method == "turn/start":
             turn = self.validate_turn(result.get("turn"))
             self.turn = turn["id"]
