@@ -33,6 +33,21 @@ from relay_core.protocol import (  # noqa: E402
     session_target,
 )
 from relay_core.store import RelayStore  # noqa: E402
+from relay_core.protocol import DECISION_ROLLOUT_FENCE  # noqa: E402
+
+
+def approved_receipt(store, decision_id="handover-approval"):
+    """An answered decision in this ledger: what a receipt: approval must name since 0.4.32."""
+    store.emit({"v": 1, "id": f"intent:{decision_id}", "kind": "work.intent", "agent": "claude",
+                "session": "approval-requester", "work_id": "handover-approval", "summary": "Synthetic handover"})
+    request = store.decision_request(
+        agent="claude", session="approval-requester", decision_id=decision_id, work_id="handover-approval",
+        scope="role/handover", summary="Approve the synthetic handover", artifact="git:" + "a" * 40,
+        authority_hint="engineering", option_ids=["approve", "decline"], rollout_fence=DECISION_ROLLOUT_FENCE)
+    response = store.decision_respond(
+        request["event"]["seq"], agent="codex", session="approval-responder", judgment="Approved",
+        resolution="choice", authority_class="engineering", choice="approve", rollout_fence=DECISION_ROLLOUT_FENCE)
+    return f"receipt:{response['event']['seq']}"
 
 
 THREAD = "a0000000-0000-7000-8000-000000000001"
@@ -158,7 +173,7 @@ class WakeLedgerCase(unittest.TestCase):
         approval = {}
         if replace:
             approval = {"expected_generation": self.store.wake_bindings(role)["bindings"][0]["generation"],
-                        "reason": "Synthetic user-approved handover", "approval_ref": "receipt:fixture-approval"}
+                        "reason": "Synthetic user-approved handover", "approval_ref": approved_receipt(self.store)}
         return self.store.wake_bind(role, thread=thread, endpoint=endpoint, cwd="/srv/work", replace=replace,
                                     agent="claude", session="binder", **approval)
 
@@ -658,6 +673,36 @@ class WakeBindingTests(WakeLedgerCase):
         self.assertGreater(moved["binding"]["generation"], generation)
         self.assertEqual(OTHER, self.store.wake_bindings("operator")["bindings"][0]["thread"])
 
+    def test_another_holders_control_rests_on_an_answered_decision(self):
+        first = self.bind()["binding"]
+        before = self.store.events()
+        for ref, said in ((f"receipt:{first['generation']}", "is a wake.bound, not an answered decision"),
+                          ("receipt:binding:1", "names the ledger sequence of a decision response")):
+            with self.assertRaisesRegex(ValidationError, said):
+                self.store.wake_control("pause", "operator", agent="codex", session="someone-else",
+                                        expected_generation=first["generation"], reason="r", approval_ref=ref)
+        self.assertEqual(before, self.store.events(), "refused before anything is written")
+        self.store.emit({"v": 1, "id": "intent:escalated", "kind": "work.intent", "agent": "claude",
+                         "session": "approval-requester", "work_id": "escalated", "summary": "Escalated"})
+        request = self.store.decision_request(
+            agent="claude", session="approval-requester", decision_id="escalated", work_id="escalated",
+            scope="role/handover", summary="Approve?", artifact="git:" + "a" * 40, authority_hint="engineering",
+            option_ids=["approve", "decline"], rollout_fence=DECISION_ROLLOUT_FENCE)
+        escalated = self.store.decision_respond(
+            request["event"]["seq"], agent="codex", session="approval-responder", judgment="Needs David",
+            resolution="escalate", authority_class="human-only", choice=None, rollout_fence=DECISION_ROLLOUT_FENCE)
+        with self.assertRaisesRegex(ValidationError, r"is a decision.responded \(escalate\), not an answered"):
+            self.store.wake_control("pause", "operator", agent="codex", session="someone-else",
+                                    expected_generation=first["generation"], reason="r",
+                                    approval_ref=f"receipt:{escalated['event']['seq']}")
+        ref = approved_receipt(self.store)
+        paused = self.store.wake_control("pause", "operator", agent="codex", session="someone-else",
+                                         expected_generation=first["generation"], reason="r", approval_ref=ref)
+        self.assertEqual(("decision.responded", "choice", "approve", ref),
+                         tuple(paused["approval"][key] for key in ("kind", "resolution", "choice", "ref")))
+        self.assertIn("Approval: decision handover-approval answered choice approve by codex:approval-responder",
+                      core_cli._render_wake_control("pause", paused))
+
     def test_pause_resume_and_unbind_change_only_the_current_generation(self):
         with self.assertRaisesRegex(ConflictError, "isn't bound in this ledger, so there is nothing to pause"):
             self.store.wake_control("pause", "operator", agent="claude", session="binder")
@@ -683,19 +728,20 @@ class WakeBindingTests(WakeLedgerCase):
 
     def test_foreign_replacement_requires_authority_and_current_generation(self):
         first = self.bind()["binding"]
+        approval = approved_receipt(self.store)
         before = self.store.events()
         options = dict(thread=OTHER, endpoint=ENDPOINT, cwd="/srv/work", replace=True, agent="codex", session=OTHER)
         with self.assertRaisesRegex(ConflictError, "explicit user authorization"):
             self.store.wake_bind("operator", **options)
         with self.assertRaisesRegex(ConflictError, "binding changed"):
             self.store.wake_bind("operator", **options, expected_generation=first["generation"] + 1,
-                                 reason="Approved synthetic transfer", approval_ref="receipt:approval")
+                                 reason="Approved synthetic transfer", approval_ref=approval)
         with self.assertRaisesRegex(ValidationError, "immutable"):
             self.store.wake_bind("operator", **options, expected_generation=first["generation"],
                                  reason="Approved synthetic transfer", approval_ref="mutable.md")
         self.assertEqual(before, self.store.events(), "all refused mutations must be write-free")
         moved = self.store.wake_bind("operator", **options, expected_generation=first["generation"],
-                                    reason="Approved synthetic transfer", approval_ref="receipt:approval")
+                                    reason="Approved synthetic transfer", approval_ref=approval)
         notices = [event for event in self.store.events() if event["kind"] == "work.handoff"]
         self.assertEqual({session_target("codex", THREAD), session_target("codex", OTHER)}, {event["target"] for event in notices})
         self.assertEqual({f"receipt:binding:{moved['binding']['generation']}"},
@@ -740,12 +786,13 @@ class WakeBindingTests(WakeLedgerCase):
 
     def test_handover_notices_preserve_long_valid_claude_identities(self):
         agent, old, new = "a" * 200, "o" * 200, "n" * 200
+        approval = approved_receipt(self.store)
         first = self.store.wake_bind("reviewer", provider="claude", endpoint="unix:///srv/old.sock",
                                      replace=False, agent=agent, session=old)["binding"]
         moved = self.store.wake_bind("reviewer", provider="claude", endpoint="unix:///srv/new.sock",
                                      replace=True, agent=agent, session=new,
                                      expected_generation=first["generation"], reason="Approved synthetic transfer",
-                                     approval_ref="receipt:approval")["binding"]
+                                     approval_ref=approval)["binding"]
         self.assertGreater(moved["generation"], first["generation"])
         for session in (old, new):
             notices = self.store.inbox(agent, session=session)["pending_signals"]

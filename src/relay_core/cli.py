@@ -319,6 +319,8 @@ def build_parser() -> argparse.ArgumentParser:
         control.add_argument("--expected-generation", type=int)
         control.add_argument("--reason")
         control.add_argument("--approval-ref")
+        control.add_argument("--approval-repo", help="repository holding a git: approval; default this checkout")
+        control.add_argument("--approval-file", help="durable file whose digest a sha256: approval names")
 
     wake_ledger = commands.add_parser(
         "wake-ledger",
@@ -391,13 +393,16 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def main(argv: Sequence[str] | None = None, *, carried: Mapping[str, Any] | None = None) -> int:
+    """carried: values the installed front door settled before admission, such as a resolved approval."""
     parser = build_parser()
     raw_argv = list(argv if argv is not None else sys.argv[1:])
     if "--json" in raw_argv:
         raw_argv = [item for item in raw_argv if item != "--json"]
         raw_argv.insert(0, "--json")
     args = parse(parser, raw_argv)
+    for key, value in (carried or {}).items():
+        setattr(args, key, value)
     if args.command == "hook":
         return _run_hook(args)
 
@@ -576,9 +581,11 @@ def _dispatch(store: RelayStore, args: argparse.Namespace) -> Any:
         return store.acknowledge(args.seq, agent=agent, session=session)
     if args.command in {"unbind", "pause", "resume"}:
         agent, session = _actor(args)
-        return store.wake_control(args.command, args.role, agent=agent, session=session,
-                                  expected_generation=args.expected_generation,
-                                  reason=args.reason, approval_ref=args.approval_ref)
+        result = store.wake_control(args.command, args.role, agent=agent, session=session,
+                                    expected_generation=args.expected_generation,
+                                    reason=args.reason, approval_ref=args.approval_ref)
+        resolved = getattr(args, "approval_resolved", None)  # git: and sha256: refs, checked before admission
+        return {**result, "approval": resolved} if resolved is not None else result
     if args.command == "wake-ledger":
         return _dispatch_wake(store, args)
     if args.command == "events":
@@ -713,7 +720,28 @@ def _wake_sender(args: argparse.Namespace) -> dict[str, Any] | None:
     return canonical_wake_sender(_read_json_object(io.BytesIO(data)))
 
 
+def describe_approval(approval: Mapping[str, Any]) -> str:
+    """What an approval reference rests on, for a reader to judge: integrity and kind were checked, not who."""
+    kind = approval["kind"]
+    if kind == "decision.responded":
+        answer = approval["resolution"] + (f" {approval['choice']}" if approval.get("choice") else "")
+        return (f"decision {approval['decision_id']} answered {answer} by {approval['source']} at {approval['at']} "
+                f"({approval['ref']}): \"{approval['summary']}\"")
+    if kind == "file":
+        return f"{approval['path']}, whose sha256 matches {approval['ref']}: \"{approval['first_line']}\""
+    detail = f": \"{approval['subject']}\" ({approval['date']})" if approval.get("subject") is not None else ""
+    return f"git {kind} {approval['ref'].removeprefix('git:')[:12]} in {approval['repo']}{detail}"
+
+
 def _render_wake_control(command: str, result: Mapping[str, Any]) -> str:
+    text = _render_wake_control_outcome(command, result)
+    if result.get("approval") is not None:
+        head, _, tail = text.partition("\n")
+        text = f"{head}\nApproval: {describe_approval(result['approval'])}\n{tail}"
+    return text
+
+
+def _render_wake_control_outcome(command: str, result: Mapping[str, Any]) -> str:
     binding = result["binding"]
     role = binding["role"]
     if command == "unbind":

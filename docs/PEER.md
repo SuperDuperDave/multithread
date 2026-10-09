@@ -445,7 +445,9 @@ multithread wake operator --ref /absolute/path/task.md --agent claude --session 
 ```
 
 Without an observed sender role, the conversation receives
-`Multithread wake from claude: /absolute/path/task.md`.
+`Multithread wake from claude: /absolute/path/task.md (sent 2026-10-08 23:05Z)`.
+A queued wake can arrive long after it was sent; the time lets its reader check
+that the work is still pending before acting on it.
 A ledger sequence also works as `--ref`; the message then names this checkout's
 ledger. The binding and every attempt live in the ledger of the checkout you
 run them in, or of `--repo`.
@@ -473,7 +475,7 @@ leave it unaware. An older Multithread reads such a ledger's events, briefs
 and inbox, but refuses its wake bindings until this release is reinstalled.
 
 On unreleased main, an exact sender binding adds compact context:
-`Multithread wake from claude (project/reviewer): /absolute/path/task.md`.
+`Multithread wake from claude (project/reviewer): /absolute/path/task.md (sent …)`.
 The source is the command's original current directory; `--sender-repo` selects
 another source checkout, independently of the recipient's `--repo`. A Codex
 sender matches its exact conversation, while a Claude sender matches the binding's
@@ -794,12 +796,26 @@ role. A Claude binding needs no refresh: its session reports its inbox. A differ
 recipient needs the holder's release, or actual user authorization for the
 handover. For that authorized replacement, add `--replace
 --expected-generation N --reason 'why this handover is authorized'
---approval-ref sha256:FULL_64_HEX_DIGEST` to the new `bind` command, preserving
-the approved scope and charter. The immutable reference identifies the reviewed
-approval artifact. These flags audit authority already held; they do not grant
-permission or authenticate a user. For another holder's `unbind`, `pause` or
-`resume`, the same authorization and generation/reason/approval-reference flags
-are required. A stale generation refuses; inspect again before deciding.
+--approval-ref <reference>` to the new `bind` command, preserving the approved
+scope and charter. The reference must resolve, or nothing is recorded:
+
+- `git:<full object id>` is an object in the bound checkout, or in the
+  repository `--approval-repo <path>` names. Nothing is fetched.
+- `sha256:<digest>` is the digest of the durable file `--approval-file <path>`
+  names, outside `/tmp`, `/var/tmp`, `/dev/shm` and `/run`. Its path is added to
+  the recorded reason so an audit can find it.
+- `receipt:<seq>` is an answered decision in this ledger: a
+  `decision.responded` whose resolution is `choice` or `directive`.
+
+The result shows what the reference rests on: a commit's repository, subject
+and date; the file's path and first line; or the decision's answer and who gave
+it. This checks the reference's integrity and kind, not who approved: the
+approval repository and file are the caller's choice, and a decision response
+is an agent's answer, not a person's signature. These flags audit authority
+already held; they do not grant permission or authenticate a user. For another
+holder's `unbind`, `pause` or `resume`, the same authorization and
+generation/reason/approval flags are required. A stale generation refuses;
+inspect again before deciding.
 
 An authorized handover records targeted notices for the old and new recipients.
 Outstanding messages keep their original recipients and binding generations;
