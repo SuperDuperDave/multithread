@@ -131,9 +131,11 @@ while True:
                                              else 'on-request'),
                   'approvalsReviewer': spec.get('reviewer', 'user' if 'approvals_reviewer="user"' in sys.argv
                                                 else 'auto_review'),
-                  'sandbox': {'type': 'workspaceWrite', 'writableRoots': [os.getcwd()],
-                              'networkAccess': False, 'excludeTmpdirEnvVar': False,
-                              'excludeSlashTmp': False}}
+                  # The profile this server's own argv selected, read-only and offline, unless the fixture says not.
+                  'sandbox': spec.get('sandbox', {'type': 'readOnly', 'networkAccess': False}),
+                  'activePermissionProfile': spec.get('profile', {'id': next(
+                      (a.split('=', 1)[1].strip('"') for a in sys.argv if a.startswith('default_permissions=')), None),
+                      'extends': None})}
         result.update(spec.get('thread_result_updates', {}))
         send_result(message, result)
     elif method == 'turn/start':
@@ -336,8 +338,9 @@ class CodexProtocolTests(unittest.TestCase):
         entries = [peer._toml_path(root) + ' = "read"' for root in [":minimal", *scope["roots"]]]
         entries += [peer._toml_path(os.path.join(scope["roots"][0], path)) + ' = "none"' for path in scope["hidden"]]
         hidden_instructions = ["-c", "project_doc_max_bytes=0"] if scope["project_instructions"] == "hidden" else []
-        return ["-c", 'default_permissions="multithread-peer-read"',
-                "-c", "permissions.multithread-peer-read.filesystem={" + ", ".join(entries) + "}", *hidden_instructions]
+        profile = scope["profile"]
+        return ["-c", f'default_permissions="{profile}"',
+                "-c", f"permissions.{profile}.filesystem={{" + ", ".join(entries) + "}", *hidden_instructions]
 
     def recorded_requests(self):
         return [json.loads(line) for line in self.requests.read_text().splitlines()]
@@ -553,8 +556,11 @@ class CodexProtocolTests(unittest.TestCase):
         self.assertEqual(self.task.read_text(), requests[6]["params"]["input"][0]["text"])
         self.assertEqual('ready', result['hook_readiness']['state'])
         for request in requests:
-            self.assertFalse({"sandbox", "sandboxPolicy", "approvalPolicy", "approvalsReviewer", "model",
-                              "effort", "config"} & set(request.get("params", {})))
+            self.assertFalse({"sandbox", "sandboxPolicy", "model", "effort", "config"} & set(request.get("params", {})))
+        # Escalation off travels in every request that can carry it.
+        for index in (3, 6):
+            self.assertEqual(("never", "user"), (requests[index]["params"]["approvalPolicy"],
+                                                 requests[index]["params"]["approvalsReviewer"]))
         # With no request, the turn keeps the thread's own settings, as Codex reported them.
         self.assertEqual({"source": "codex_thread_start", "reported_model": "fixture-native-selection",
                           "relation": "not_requested"}, result["model_observation"])
@@ -637,10 +643,11 @@ class CodexProtocolTests(unittest.TestCase):
                 self.assertEqual(checked("verified", MODEL, "requested", EFFORT, "requested",
                                          [EFFORT, "fixture-other-effort"]), result["settings_check"])
                 opened = next(row for row in requests if row["method"] in ("thread/start", "thread/resume"))
-                self.assertEqual({"cwd": str(self.repo), **({"threadId": resume} if resume else {})},
-                                 opened["params"])
+                self.assertEqual({"cwd": str(self.repo), "approvalPolicy": "never", "approvalsReviewer": "user",
+                                  **({"threadId": resume} if resume else {})}, opened["params"])
                 turn = next(row for row in requests if row["method"] == "turn/start")
                 self.assertEqual({"threadId": THREAD, "model": MODEL, "effort": EFFORT,
+                                  "approvalPolicy": "never", "approvalsReviewer": "user",
                                   "input": [{"type": "text", "text": self.task.read_text()}]}, turn["params"])
                 request = json.loads((directory / "request.json").read_text())
                 for record in (result, request):
@@ -1657,12 +1664,17 @@ class CodexProtocolTests(unittest.TestCase):
         self.assertEqual(["-c", 'approval_policy="never"', "-c", 'approvals_reviewer="user"'],
                          argv[argv.index("app-server") - 12:argv.index("app-server") - 8])
         self.assertEqual(("never", "user"), (result["native_approval_policy"], result["native_approvals_reviewer"]))
-        for request in self.recorded_requests():
-            self.assertNotIn("approvalsReviewer", request.get("params", {}))
-        # A Codex that keeps the account's escalation settings refuses before the task.
+        opened = next(r for r in self.recorded_requests() if r.get("method") == "thread/start")
+        self.assertEqual(("never", "user"), (opened["params"]["approvalPolicy"], opened["params"]["approvalsReviewer"]))
+        # A Codex that keeps the account's escalation settings, or a sandbox other than this call's profile, refuses
+        # before the task.
         for spec, shown in ((dict(reviewer="auto_review"), "reviewer auto_review"),
                             (dict(approval_policy="on-request"), "approval policy on-request"),
-                            (dict(reviewer="guardian_subagent", approval_policy="never"), "reviewer guardian_subagent")):
+                            (dict(reviewer="guardian_subagent", approval_policy="never"), "reviewer guardian_subagent"),
+                            (dict(sandbox={"type": "readOnly", "networkAccess": True}), "read-only, offline profile"),
+                            (dict(sandbox={"type": "workspaceWrite", "networkAccess": False}), "read-only, offline profile"),
+                            (dict(profile={"id": "multithread-peer-read", "extends": None}), "read-only, offline profile"),
+                            (dict(profile={"id": None, "extends": ":workspace"}), "read-only, offline profile")):
             with self.subTest(spec=spec):
                 self.configure(**spec)
                 code, result, _ = self.invoke()
@@ -1682,7 +1694,8 @@ class CodexProtocolTests(unittest.TestCase):
                 self.assertEqual(("uncertain", None), (result["state"], result["result"]))
                 self.assertIn(f"changed this call's approval settings ({shown})", result["message"])
         # Any approval review that happens anyway ends the call at once and withdraws the answer.
-        for method in ("item/autoApprovalReview/started", "item/autoApprovalReview/completed", "guardianWarning"):
+        for method in ("item/autoApprovalReview/started", "item/autoApprovalReview/completed",
+                       "autoApprovalReview/strictReviewRequired", "guardianWarning"):
             with self.subTest(method=method):
                 review = {"method": method, "params": {"threadId": THREAD, "turnId": TURN}}
                 self.configure(events=[item(), completed(), review], exit_after_events=False, sleep=True)
@@ -1714,7 +1727,9 @@ class CodexProtocolTests(unittest.TestCase):
         code, result, directory = self.invoke("--read", str(named))
         self.assertEqual(0, code, result)
         checkout = os.path.realpath(self.repo)
-        self.assertEqual({"profile": "multithread-peer-read", "hidden": [], "ignored_links": [], "project_instructions": "none",
+        # A fresh profile name per call, so no static configuration in the checkout can merge into it.
+        self.assertRegex(result["read_scope"]["profile"], r"^multithread-peer-read-[0-9a-f]{12}$")
+        self.assertEqual({"profile": result["read_scope"]["profile"], "hidden": [], "ignored_links": [], "project_instructions": "none",
                           "roots": [checkout, os.path.join(checkout, ".git"), str(self.provider.parent),
                                     os.path.realpath(named)],
                           "verified": {"outside_file": "absent", "hidden_unreadable": 0,

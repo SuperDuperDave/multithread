@@ -550,7 +550,8 @@ class LaunchProviderTests(unittest.TestCase):
         value = json.loads(output.getvalue())
         native = [str(self.provider), *expected["native_arguments"]]
         self.assertEqual(native, value["argv"][:len(native)])
-        self.assertEqual(["-c", 'default_permissions="multithread-peer-read"'], value["argv"][len(native):len(native) + 2])
+        self.assertEqual("-c", value["argv"][len(native)])
+        self.assertRegex(value["argv"][len(native) + 1], r'^default_permissions="multithread-peer-read-[0-9a-f]{12}"$')
         self.assertEqual(["app-server", "--listen", "stdio://"], value["argv"][-3:])
 
     def test_claude_hook_keeps_the_launcher_spelling_it_was_given(self):

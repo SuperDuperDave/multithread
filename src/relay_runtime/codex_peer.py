@@ -37,8 +37,10 @@ _FEATURE_PAGES = 5  # Codex 0.161 lists its 160 features in one page
 # feature list must confirm each before the task goes out.
 _ALWAYS_OFF = ("multi_agent", "multi_agent_v2")
 _PLUGINS_OFF = ("plugins", "apps")
-_APPS_SERVER = "codex_apps"
-_APPROVAL_POLICIES = ("untrusted", "on-failure", "on-request", "never")  # Codex's one server for the account's ChatGPT apps (connectors); it has no pluginId
+_APPS_SERVER = "codex_apps"  # Codex's one server for the account's ChatGPT apps (connectors); it has no pluginId
+_APPROVAL_POLICIES = ("untrusted", "on-failure", "on-request", "never")
+# A peer never escalates: asked for in every request that can carry it, and confirmed in Codex's response.
+_NO_ESCALATION = {"approvalPolicy": "never", "approvalsReviewer": "user"}
 # Where a setting the call does not request comes from: Codex keeps a thread's settings.
 _KEPT = {"new_thread": "the new thread's configured", "resumed_thread": "this thread's current"}
 _CLIENT_INFO = {"name": "multithread", "title": "Multithread", "version": "0.4.1"}
@@ -569,7 +571,7 @@ class _Driver:
         self.request("turn/start", turn)
 
     def start_thread(self):
-        params = {"cwd": self.repo}
+        params = {"cwd": self.repo, **_NO_ESCALATION}
         if self.resume:
             params["threadId"] = self.resume
         self.request("thread/resume" if self.resume else "thread/start", params)
@@ -749,6 +751,16 @@ class _Driver:
                     f"Codex reports approval policy {_label(policy)} with reviewer {_label(reviewer)} for this thread; "
                     "a peer call requires 'never' and 'user', so nothing can escalate out of its sandbox. No task was "
                     "submitted. Next: check the Codex version and configuration, or inspect retained output.")
+            # The sandbox is exactly this call's read-only profile: a checkout's own configuration can't widen it.
+            scope = self.envelope.get("read_scope")
+            if isinstance(scope, dict):
+                expected = {"id": scope.get("profile"), "extends": None}
+                if (result.get("sandbox") != {"type": "readOnly", "networkAccess": False}
+                        or result.get("activePermissionProfile") != expected):
+                    raise _ProtocolError(
+                        "Codex reports a sandbox other than this call's read-only, offline profile for this thread; no "
+                        "task was submitted. Next: check for a .codex configuration in the checkout, or inspect "
+                        "retained output.")
             # The same turn request carries any override on a new or resumed
             # thread. The opened thread's settings describe only what it keeps.
             requested = {"model": self.envelope.get("requested_model"),
@@ -764,7 +776,7 @@ class _Driver:
                     else (reported[key] if _identity(reported[key]) else None, kept)
                     for key in ("model", "effort"))
                 self.check_settings(model, model_source, effort, effort_source)
-            turn = {"threadId": self.session, "input": [{"type": "text", "text": self.task}]}
+            turn = {"threadId": self.session, "input": [{"type": "text", "text": self.task}], **_NO_ESCALATION}
             turn.update((key, value) for key, value in requested.items() if value is not None)
             self.waiting_turn = turn
             self.list_features(None)  # what the thread may do is confirmed before any task goes out
@@ -830,7 +842,7 @@ class _Driver:
                                      + ", ".join(f"{key} {_label(value) if isinstance(value, str) else '(structured)'}"
                                                  for key, value in drifted.items())
                                      + ") although a peer call keeps escalation off")
-        if method.startswith("item/autoApprovalReview/") or method == "guardianWarning":
+        if "autoApprovalReview" in method or method.lower().startswith("guardian"):
             # Escalation is off; a review of one means a command asked to leave the sandbox anyway.
             return self.end_call(f"Codex started an approval review ({_label(method)}) although this call turned "
                                  "escalation off")

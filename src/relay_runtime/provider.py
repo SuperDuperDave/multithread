@@ -901,7 +901,9 @@ def _codex_read_scope(provider, repo, named):
     # through a link is unreadable when its target lies outside the scope, which the check proves; otherwise the
     # target's own visibility governs it.
     direct = [path for path in hidden if os.path.realpath(os.path.join(roots[0], path)) == os.path.join(roots[0], path)]
-    scope = {"roots": roots, "hidden": direct, "linked": [path for path in hidden if path not in direct]}
+    # A fresh profile name per call, so no static configuration in the checkout can merge into it.
+    scope = {"roots": roots, "hidden": direct, "linked": [path for path in hidden if path not in direct],
+             "profile": f"{_PEER_READ_PROFILE}-{uuid.uuid4().hex[:12]}"}
     # Codex refuses to start a thread whose project instructions it may not read; private ones are left out.
     names = [name for name in _CODEX_INSTRUCTIONS if os.path.lexists(os.path.join(roots[0], name))]
     scope["project_instructions"] = ("hidden" if any(not _readable(scope, os.path.join(roots[0], name)) for name in names)
@@ -938,8 +940,8 @@ def _late_ignored(repo, scope):
 def _codex_read_arguments(scope):
     entries = [_toml_path(path) + ' = "read"' for path in [":minimal", *scope["roots"]]]
     entries += [_toml_path(os.path.join(scope["roots"][0], path)) + ' = "none"' for path in scope["hidden"]]
-    arguments = ["-c", f'default_permissions="{_PEER_READ_PROFILE}"',
-                 "-c", f"permissions.{_PEER_READ_PROFILE}.filesystem={{{', '.join(entries)}}}"]
+    arguments = ["-c", f'default_permissions="{scope["profile"]}"',
+                 "-c", f"permissions.{scope['profile']}.filesystem={{{', '.join(entries)}}}"]
     if scope["project_instructions"] == "hidden":
         arguments += ["-c", "project_doc_max_bytes=0"]
     return arguments
@@ -1653,7 +1655,7 @@ def _run_peer(args, interruption):
             stage = "read_scope"
             scope = _codex_read_scope(plan["argv"][0], plan["repo"], args.read)
             confinement = _codex_read_arguments(scope)
-            envelope["read_scope"] = {"profile": _PEER_READ_PROFILE, "roots": scope["roots"], "hidden": scope["hidden"],
+            envelope["read_scope"] = {"profile": scope["profile"], "roots": scope["roots"], "hidden": scope["hidden"],
                                       "ignored_links": scope["linked"],
                                       "project_instructions": scope["project_instructions"],
                                       "verified": "not_checked"}
