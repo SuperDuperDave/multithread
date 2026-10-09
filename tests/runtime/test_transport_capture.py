@@ -142,6 +142,103 @@ class CaptureFilesTests(unittest.TestCase):
         (self.root / "transport").mkdir(mode=0o700)
         self.assert_incomplete(c.finish(0, clean=True))
 
+    def test_directory_modes_changed_before_seal_refuse(self):
+        for parent_mode, transport_mode in ((0o755, 0o700), (0o777, 0o700),
+                                             (0o700, 0o755), (0o700, 0o777),
+                                             (0o755, 0o777)):
+            with self.subTest(parent=parent_mode, transport=transport_mode), tempfile.TemporaryDirectory() as folder:
+                root = Path(folder)
+                c = native_io.TransportCapture(root, {})
+                self.complete(c)
+                root.chmod(parent_mode)
+                (root / "transport").chmod(transport_mode)
+                self.assert_incomplete(c.finish(0, clean=True))
+                self.assertEqual(parent_mode, stat.S_IMODE(root.stat().st_mode))
+                self.assertEqual(transport_mode, stat.S_IMODE((root / "transport").stat().st_mode))
+
+    def test_directory_owner_and_type_changed_before_seal_refuse(self):
+        original = os.fstat
+        for target in ("parent", "transport"):
+            for field in ("owner", "type"):
+                with self.subTest(target=target, field=field), tempfile.TemporaryDirectory() as folder:
+                    c = native_io.TransportCapture(Path(folder), {})
+                    self.complete(c)
+                    inode = (Path(folder) / ("transport" if target == "transport" else ".")).stat().st_ino
+                    def changed(fd):
+                        info = original(fd)
+                        if info.st_ino == inode:
+                            values = list(info)
+                            values[4 if field == "owner" else 0] = (
+                                info.st_uid + 1 if field == "owner" else stat.S_IFREG | 0o700)
+                            return os.stat_result(values)
+                        return info
+                    with mock.patch.object(native_io.os, "fstat", side_effect=changed):
+                        self.assert_incomplete(c.finish(0, clean=True))
+
+    def test_replaced_call_directory_cannot_redirect_inventory_path(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder) / "call"
+            root.mkdir(mode=0o700)
+            c = native_io.TransportCapture(root, {})
+            self.complete(c)
+            root.rename(Path(folder) / "moved-call")
+            root.mkdir(mode=0o700)
+            (Path(folder) / "moved-call/transport").rename(root / "transport")
+            self.assert_incomplete(c.finish(0, clean=True))
+
+    def test_directory_publication_mutations_refuse(self):
+        original_sync, original_stat = os.fsync, os.fstat
+        for target in ("parent", "transport"):
+            for action in ("mode", "owner", "type", "replacement"):
+                with self.subTest(target=target, action=action), tempfile.TemporaryDirectory() as folder:
+                    root = Path(folder) / "call"
+                    root.mkdir(mode=0o700)
+                    c = native_io.TransportCapture(root, {})
+                    self.complete(c)
+                    path = root if target == "parent" else root / "transport"
+                    inode = path.stat().st_ino
+                    mutated = False
+                    def sync(fd):
+                        nonlocal mutated
+                        original_sync(fd)
+                        if fd == c.directory_fd and not mutated:
+                            mutated = True
+                            if action == "mode":
+                                path.chmod(0o777)
+                            elif action == "replacement":
+                                path.rename(Path(folder) / "moved")
+                                path.mkdir(mode=0o700)
+                                if target == "parent":
+                                    (Path(folder) / "moved/transport").rename(root / "transport")
+                    def changed(fd):
+                        info = original_stat(fd)
+                        if mutated and action in ("owner", "type") and info.st_ino == inode:
+                            values = list(info)
+                            values[4 if action == "owner" else 0] = (
+                                info.st_uid + 1 if action == "owner" else stat.S_IFREG | 0o700)
+                            return os.stat_result(values)
+                        return info
+                    with (mock.patch.object(native_io.os, "fsync", side_effect=sync),
+                          mock.patch.object(native_io.os, "fstat", side_effect=changed)):
+                        self.assert_incomplete(c.finish(0, clean=True))
+                    self.assertTrue(mutated)
+                    inventory = next(Path(folder).rglob("inventory.json"))
+                    self.assertEqual("inventory_only", json.loads(inventory.read_bytes())["status"])
+
+    def test_construction_rechecks_privacy_after_transport_creation(self):
+        original = os.mkdir
+        for target in ("parent", "transport"):
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as folder:
+                root = Path(folder)
+                def mkdir(path, *args, **kwargs):
+                    original(path, *args, **kwargs)
+                    (root if target == "parent" else root / "transport").chmod(0o755)
+                with mock.patch.object(native_io.os, "mkdir", side_effect=mkdir):
+                    c = native_io.TransportCapture(root, {})
+                self.complete(c)
+                self.assert_incomplete(c.finish(0, clean=True))
+                self.assertFalse((root / "transport/context.json").exists())
+
     def test_each_initial_recording_operation_failure_refuses_without_throwing(self):
         for operation in ("open", "mkdir", "write", "fsync"):
             with self.subTest(operation=operation), tempfile.TemporaryDirectory() as folder:
@@ -319,6 +416,17 @@ class CaptureTransportTests(unittest.TestCase):
         self.assertEqual(len(ids), len(set(ids)))
         self.assertEqual("call\n", self.calls.read_text())
         self.assertFalse((directory / "transport/inventory.json").exists())
+
+    def test_directory_privacy_fault_preserves_native_answer(self):
+        original = native_io.TransportCapture.finish
+        def finish(capture, *args, **kwargs):
+            Path(capture.path).chmod(0o755)
+            return original(capture, *args, **kwargs)
+        with mock.patch.object(native_io.TransportCapture, "finish", new=finish):
+            code, result, _ = self.invoke("--capture-transport", "e" * 64)
+        self.assertEqual((0, ANSWER), (code, result["result"]))
+        self.assertEqual("incomplete", result["transport_capture"]["status"])
+        self.assertEqual("call\n", self.calls.read_text())
 
     def test_protocol_fault_or_missing_ack_does_not_qualify(self):
         for spec in ({"events": [item(), completed(), []]},

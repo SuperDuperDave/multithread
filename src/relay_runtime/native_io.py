@@ -479,7 +479,9 @@ class TransportCapture:
 
     def __init__(self, directory, context):
         self.path = os.fspath(directory)
+        self.parent_fd = None
         self.directory_fd = None
+        self.parent_identity = self.directory_identity = None
         self.files = {}
         self.counts = {name: 0 for name in self.NAMES}
         self.hashes = {name: hashlib.sha256() for name in self.NAMES}
@@ -489,17 +491,15 @@ class TransportCapture:
         self.report = {"status": "incomplete", "capture_authenticated": False,
                        "review_accepted": False, "release_approved": False}
         try:
-            parent = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
-            try:
-                info = os.fstat(parent)
-                if info.st_uid != os.getuid() or info.st_mode & 0o077:
-                    raise OSError("call directory is not private")
-                os.mkdir("transport", mode=0o700, dir_fd=parent)
-                self.directory_fd = os.open("transport", os.O_RDONLY | os.O_DIRECTORY |
-                                            os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent)
-                os.fsync(parent)
-            finally:
-                os.close(parent)
+            self.parent_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            self.parent_identity = self._private_directory(self.parent_fd, self.path)
+            os.mkdir("transport", mode=0o700, dir_fd=self.parent_fd)
+            self.directory_fd = os.open("transport", os.O_RDONLY | os.O_DIRECTORY |
+                                        os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=self.parent_fd)
+            self.directory_identity = self._private_directory(
+                self.directory_fd, "transport", dir_fd=self.parent_fd)
+            os.fsync(self.parent_fd)
+            self._check_directories()
             for kind, name in self.NAMES.items():
                 self.files[kind] = os.open(name, os.O_RDWR | os.O_CREAT | os.O_EXCL |
                                           os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=self.directory_fd)
@@ -509,6 +509,25 @@ class TransportCapture:
             self._append("context", data)
         except (OSError, ValueError, TypeError):
             self.failed = True
+
+    @staticmethod
+    def _private_directory(fd, path, *, dir_fd=None, expected=None):
+        retained = os.fstat(fd)
+        visible = os.stat(path, dir_fd=dir_fd, follow_symlinks=False)
+        identity = (retained.st_dev, retained.st_ino)
+        if (identity != (visible.st_dev, visible.st_ino)
+                or expected is not None and identity != expected
+                or any(not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid()
+                       or stat.S_IMODE(info.st_mode) != 0o700 for info in (retained, visible))):
+            raise OSError("capture directory identity or privacy changed")
+        return identity
+
+    def _check_directories(self):
+        # Keep both descriptors through sealing; the public path must still
+        # name this private parent and its original private transport child.
+        self._private_directory(self.parent_fd, self.path, expected=self.parent_identity)
+        self._private_directory(self.directory_fd, "transport", dir_fd=self.parent_fd,
+                                expected=self.directory_identity)
 
     def _append(self, kind, data):
         pending = memoryview(data)
@@ -572,11 +591,8 @@ class TransportCapture:
                     or not self.eof or not self.stdin_closed
                     or not self.counts["stdin"] or not self.counts["stdout"]):
                 raise ValueError("capture did not reach a clean whole end")
+            self._check_directories()
             self._event("leader_reaped", exit_code=exit_code)
-            retained = os.fstat(self.directory_fd)
-            visible = os.stat(os.path.join(self.path, "transport"), follow_symlinks=False)
-            if (retained.st_dev, retained.st_ino) != (visible.st_dev, visible.st_ino):
-                raise OSError("capture directory path changed")
             if set(os.listdir(self.directory_fd)) != set(self.NAMES.values()):
                 raise OSError("capture directory inventory changed")
             members = []
@@ -623,16 +639,14 @@ class TransportCapture:
                     dst_dir_fd=self.directory_fd, follow_symlinks=False)
             os.unlink("inventory.tmp", dir_fd=self.directory_fd)
             os.fsync(self.directory_fd)
-            visible = os.stat(os.path.join(self.path, "transport"), follow_symlinks=False)
-            if (retained.st_dev, retained.st_ino) != (visible.st_dev, visible.st_ino):
-                raise OSError("capture directory path changed during publication")
+            self._check_directories()
             self.report.update(status="complete", inventory_sha256=hashlib.sha256(inventory).hexdigest(),
                                path="transport/inventory.json", stdout_eof=True, events=self.sequence)
         except (OSError, ValueError, TypeError):
             self.failed = True
         finally:
             self.finished = True
-            for fd in [*self.files.values(), self.directory_fd]:
+            for fd in [*self.files.values(), self.directory_fd, self.parent_fd]:
                 if fd is not None:
                     try:
                         os.close(fd)
@@ -640,6 +654,7 @@ class TransportCapture:
                         self.failed = True
             self.files.clear()
             self.directory_fd = None
+            self.parent_fd = None
             if self.failed:
                 self.report["status"] = "incomplete"
                 self.report.pop("inventory_sha256", None)

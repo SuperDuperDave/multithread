@@ -488,6 +488,12 @@ manifest independently. No environment/profile snapshot is captured.
 transport recording reached observed EOF, closed input and a clean natural
 zero exit, with no unresolved driver input/problem or capture fault. It also
 requires a private closed file inventory and completed file/directory syncs.
+The call and transport directories retain their descriptors and original
+device/inode identities. Construction and checks before/after publication
+require both visible names to match those directories, owned by the current
+UID with mode0700. Observed directory changes refuse completion without
+repairing permissions. These checks do not authenticate custody or exclude
+changes between observations by another process with the same UID.
 The atomically linked `inventory.json` is explicitly `inventory_only`;
 alone it never proves completion. Require the matching receipt and inventory
 digest and independently verify all member bytes. A publication/sync failure
@@ -496,7 +502,9 @@ may leave an inventory but gives an incomplete capture receipt.
 Caps are16MiB per stream,8192 journal events and64KiB per chunk. Overflow,
 recording failures, unknown closure, protocol faults, interruption, timeout,
 forced cleanup or changed entry observations make capture incomplete.
-Partial files stay private. Recording does not retry native input, extend
+Files are created0600 inside0700 directories; external permission changes
+can compromise that privacy and make an observed capture incomplete.
+Recording does not retry native input, extend
 cleanup deadlines or withdraw an otherwise valid answer; normal call exit0
 can therefore coexist with an incomplete capture. Inspect both outcomes.
 
