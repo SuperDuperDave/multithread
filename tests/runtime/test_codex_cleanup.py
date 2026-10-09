@@ -136,16 +136,18 @@ class CodexCleanupTests(unittest.TestCase):
         self.assertTrue(result["needs_attention"])
         self.assert_observation(result, directory)
 
-    def test_cleanup_keeps_the_same_16_mib_prefix_bound(self):
+    def test_cleanup_protocol_fault_stops_before_unbounded_termination_output(self):
         self.configure(events=[], sleep=True)
-        # Short lines freeze invalid protocol interpretation without requiring
-        # one huge parser allocation. Raw cleanup capture still reaches its cap.
+        # The first invalid record disables boundary interpretation, so the owned group
+        # is stopped rather than being allowed to continue filling the raw capture.
         self.termination_output(extra="for _ in range(4100):\n    os.write(sys.stdout.fileno(), b'x' * 4095 + b'\\n')")
         code, result, directory = self.invoke("--timeout", "1")
         self.assertNotEqual(0, code)
         self.assertEqual("uncertain", result["state"])
-        self.assertTrue(result["stdout_observation"]["truncated"])
-        self.assertEqual(16 * 1024 * 1024 + 1, len(self.assert_observation(result, directory)))
+        self.assertFalse(result["stdout_observation"]["truncated"])
+        self.assertLess(len(self.assert_observation(result, directory)), 16 * 1024 * 1024)
+        self.assertIsNone(result["result"])
+        self.assertIsNotNone(result["process_exit_code"])
 
     def test_active_protocol_fault_cannot_be_repaired_by_shutdown_final(self):
         self.configure(events=[{"broken": "active protocol"}], sleep=True)
@@ -155,7 +157,9 @@ class CodexCleanupTests(unittest.TestCase):
         self.assertNotEqual(0, code)
         self.assertEqual("uncertain", result["state"])
         self.assertIsNone(result["result"])
-        self.assertIn(b"Unverified later answer", self.assert_observation(result, directory))
+        # An active protocol fault sends SIGKILL, so the provider cannot use its
+        # SIGTERM handler to write a later answer after boundary observation failed.
+        self.assertNotIn(b"Unverified later answer", self.assert_observation(result, directory))
 
     def test_buffered_terminal_stops_acceptance_without_advertising_active_target(self):
         class Control:

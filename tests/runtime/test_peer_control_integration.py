@@ -18,7 +18,7 @@ class PeerControlIntegrationTests(unittest.TestCase):
     invoke = protocol.CodexProtocolTests.invoke
     recorded_requests = protocol.CodexProtocolTests.recorded_requests
 
-    def exercise(self, mode):
+    def exercise(self, mode, extra_events=()):
         handler = '''
     elif method == 'turn/steer':
         assert message['params']['threadId'] == THREAD_ID
@@ -38,7 +38,7 @@ class PeerControlIntegrationTests(unittest.TestCase):
         source = self.provider.read_text().replace("    elif method == 'turn/interrupt':", handler + "    elif method == 'turn/interrupt':")
         self.executable(self.provider, source.split("\n", 1)[1])
         self.configure(events=[], exit_after_events=False, steering_mode=mode,
-                       terminal_events=[protocol.item(), protocol.completed()])
+                       terminal_events=[protocol.item(), protocol.completed(), *extra_events])
         directory = self.base / "evidence-1"
         message = self.base / "update.txt"
         message.write_text("Additional scoped input")
@@ -102,6 +102,14 @@ class PeerControlIntegrationTests(unittest.TestCase):
         self.assertEqual(0, code, result)
         self.assertTrue(result['needs_attention'])
         self.assertEqual(protocol.ANSWER, result['result'])
+        self.assertEqual(1, sent, receipt)
+        self.assertEqual('uncertain', receipt['state'])
+
+    def test_lost_ack_does_not_preserve_answer_after_protocol_fault(self):
+        (code, result, _), sent, receipt = self.exercise('lost_ack', [{"broken": "after completion"}])
+        self.assertNotEqual(0, code, result)
+        self.assertEqual('uncertain', result['state'])
+        self.assertIsNone(result['result'])
         self.assertEqual(1, sent, receipt)
         self.assertEqual('uncertain', receipt['state'])
 

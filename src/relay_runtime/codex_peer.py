@@ -1098,12 +1098,13 @@ class _Driver:
             if resolve_pending and identifier is not None:
                 self.control.resolve(identifier, "uncertain", "Native steering acknowledgement was not observed; do not resend automatically.")
 
-    def problem(self, message):
+    def problem(self, message, *, observation_lost=True):
         # A Codex peer enforces its boundary throughout shutdown, too. Once interpretation is lost,
         # a previously completed turn no longer proves that boundary held for the whole call.
         self.had_problem = True
-        self.envelope.update(state="uncertain", result=None)
-        if self.process.returncode is None:
+        if observation_lost or not self.outcome_recorded:
+            self.envelope.update(state="uncertain", result=None)
+        if observation_lost and self.process.returncode is None:
             try:
                 os.killpg(self.process.pid, signal.SIGKILL)
             except ProcessLookupError:
@@ -1181,13 +1182,26 @@ def run(process, task: bytes, repo: str, resume: str | None, directory: Path,
                         continue
                     observation.read()
             if driver.pending or driver.outgoing:
-                raise _ProtocolError("Native output ended with unresolved requests; their outcomes are uncertain.")
+                if (driver.outcome_recorded and not driver.outgoing and all(
+                        method == "turn/steer" and control_id is not None
+                        for method, control_id in driver.pending.values())):
+                    # EOF is observed and the completed answer is validated. A missing steering
+                    # acknowledgement leaves that input uncertain, without losing stream interpretation.
+                    driver.problem("Native output ended without steering acknowledgements; inspect retained input receipts.",
+                                   observation_lost=False)
+                else:
+                    raise _ProtocolError("Native output ended with unresolved requests; their outcomes are uncertain.")
             driver.close_stdin()
             driver.finish()
     except _ProtocolError as exc:
         observation.fault(str(exc))
-    except (subprocess.TimeoutExpired, OSError, KeyboardInterrupt):
-        driver.problem("Native observation was interrupted or unavailable; preserve partial work and inspect evidence before retrying.")
+    except (subprocess.TimeoutExpired, KeyboardInterrupt):
+        # Cancellation does not disable interpretation: bounded shutdown output is still checked.
+        driver.problem("Native observation was interrupted; preserve partial work and inspect evidence before retrying.",
+                       observation_lost=False)
+        raise
+    except OSError:
+        driver.problem("Native observation was unavailable; preserve partial work and inspect evidence before retrying.")
         raise
     finally:
         driver.observation_only = True
