@@ -385,6 +385,7 @@ class _Driver:
         self.stdin_closed = False
         self.interrupt_requested = False
         self.observation_only = False
+        self.capture = None
         self.outcome_recorded = False
         self.had_problem = False
         self.catalog = None
@@ -1084,6 +1085,8 @@ class _Driver:
         if not self.stdin_closed:
             self.stdin_closed = True
             self.process.stdin.close()
+            if self.capture is not None:
+                self.capture.event("stdin_closed")
 
     def preserve(self, resolve_pending=True):
         self.envelope["permission_denials"] = self.denials
@@ -1149,6 +1152,7 @@ def run(process, task: bytes, repo: str, resume: str | None, directory: Path,
     observation = observer if observer is not None else Observation(process, directory, envelope)
     observation.driver = driver
     observation.retain = driver.retain
+    driver.capture = getattr(observation, "capture", None)
     try:
         with selectors.DefaultSelector() as selector:
             os.set_blocking(process.stdin.fileno(), False)
@@ -1173,11 +1177,15 @@ def run(process, task: bytes, repo: str, resume: str | None, directory: Path,
                 for key, ready in selector.select(min(0.1, driver.remaining())):
                     if key.data == "stdin":
                         try:
-                            count = os.write(process.stdin.fileno(), driver.outgoing)
+                            pending = (driver.outgoing[:driver.capture.MAX_CHUNK]
+                                       if driver.capture is not None else driver.outgoing)
+                            count = os.write(process.stdin.fileno(), pending)
                         except BlockingIOError:
                             continue
                         if count <= 0:
                             raise _ProtocolError("Native input closed before a request was delivered; inspect retained output.")
+                        if driver.capture is not None:
+                            driver.capture.bytes("stdin", pending[:count])
                         del driver.outgoing[:count]
                         continue
                     observation.read()
@@ -1205,6 +1213,8 @@ def run(process, task: bytes, repo: str, resume: str | None, directory: Path,
         raise
     finally:
         driver.observation_only = True
+        if driver.capture is not None and (driver.pending or driver.outgoing or driver.had_problem):
+            driver.capture.fault()
         try:
             observation.snapshot()
         finally:

@@ -10,6 +10,7 @@ import json
 import math
 import os
 import re
+import stat
 
 
 MAX_OUTPUT = 16 * 1024 * 1024
@@ -231,6 +232,7 @@ class Observation:
         self.eof = False
         self.interpret = True
         self.closed = False
+        self.capture = None
         fd = os.open(directory / "stdout.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
         self.output = os.fdopen(fd, "wb")
         os.set_blocking(process.stdout.fileno(), False)
@@ -265,6 +267,15 @@ class Observation:
             data = os.read(self.process.stdout.fileno(), min(65536, max(1, limit)))
         except BlockingIOError:
             return False
+        except OSError:
+            if self.capture is not None:
+                self.capture.fault()
+            raise
+        if self.capture is not None:
+            if data:
+                self.capture.bytes("stdout", data)
+            else:
+                self.capture.event("stdout_eof")
         if not data:
             self.eof = True
             if self.buffer and self.interpret:
@@ -351,6 +362,8 @@ class Observation:
         return True
 
     def fault(self, message):
+        if self.capture is not None:
+            self.capture.fault()
         self.interpret = False
         self.settle_deferred()
         self.buffer.clear()
@@ -409,3 +422,215 @@ class Observation:
             self.process.stdout.close()
             if self.process.stdin is not None:
                 self.process.stdin.close()
+
+
+def capture_entry(path):
+    """Bounded entry-file observation, not proof of the executed binary/tree."""
+    fd = None
+    try:
+        resolved = os.path.realpath(path)
+        fd = os.open(resolved, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode) or before.st_size > 512 * 1024 * 1024:
+            raise OSError("unsupported executable entry")
+        digest = hashlib.sha256()
+        size = 0
+        while True:
+            data = os.read(fd, 65536)
+            if not data:
+                break
+            size += len(data)
+            if size > 512 * 1024 * 1024:
+                raise OSError("entry grew beyond bound")
+            digest.update(data)
+        after = os.fstat(fd)
+        visible = os.stat(resolved, follow_symlinks=False)
+        if ((before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+                != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+                or (after.st_dev, after.st_ino) != (visible.st_dev, visible.st_ino)
+                or size != after.st_size):
+            raise OSError("entry changed")
+        return {"status": "entry_file_observed", "resolved_path": resolved, "bytes": size,
+                "sha256": digest.hexdigest(), "execution_identity_verified": False,
+                "device": after.st_dev, "inode": after.st_ino, "mode": after.st_mode,
+                "mtime_ns": after.st_mtime_ns, "ctime_ns": after.st_ctime_ns}
+    except (OSError, ValueError, TypeError):
+        return {"status": "unavailable", "execution_identity_verified": False}
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+class TransportCapture:
+    """Opt-in byte custody for this driver's owned stdio transport only.
+
+    File/journal consistency and complete observed EOF are not authenticated
+    provenance, sandbox qualification or accepted review. Capture faults are
+    sticky and never alter an otherwise useful returned answer.
+    """
+    MAX_BYTES = 16 * 1024 * 1024
+    MAX_EVENTS = 8192
+    MAX_CHUNK = 65536
+    NAMES = {"stdin": "stdin.bin", "stdout": "stdout.bin",
+             "journal": "journal.jsonl", "context": "context.json"}
+
+    def __init__(self, directory, context):
+        self.directory_fd = None
+        self.files = {}
+        self.counts = {name: 0 for name in self.NAMES}
+        self.hashes = {name: hashlib.sha256() for name in self.NAMES}
+        self.sequence = 0
+        self.failed = False
+        self.eof = self.stdin_closed = self.finished = False
+        self.report = {"status": "incomplete", "capture_authenticated": False,
+                       "review_accepted": False, "release_approved": False}
+        try:
+            parent = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            try:
+                info = os.fstat(parent)
+                if info.st_uid != os.getuid() or info.st_mode & 0o077:
+                    raise OSError("call directory is not private")
+                os.mkdir("transport", mode=0o700, dir_fd=parent)
+                self.directory_fd = os.open("transport", os.O_RDONLY | os.O_DIRECTORY |
+                                            os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent)
+                os.fsync(parent)
+            finally:
+                os.close(parent)
+            for kind, name in self.NAMES.items():
+                self.files[kind] = os.open(name, os.O_RDWR | os.O_CREAT | os.O_EXCL |
+                                          os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=self.directory_fd)
+            data = (json.dumps(context, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n").encode()
+            if len(data) > 65536:
+                raise ValueError("capture context exceeded its bound")
+            self._append("context", data)
+        except (OSError, ValueError, TypeError):
+            self.failed = True
+
+    def _append(self, kind, data):
+        pending = memoryview(data)
+        while pending:
+            count = os.write(self.files[kind], pending)
+            if count <= 0:
+                raise OSError("capture file write made no progress")
+            pending = pending[count:]
+        self.hashes[kind].update(data)
+        self.counts[kind] += len(data)
+
+    def _event(self, kind, **fields):
+        if self.sequence >= self.MAX_EVENTS:
+            raise ValueError("capture journal exceeded its bound")
+        self.sequence += 1
+        data = (json.dumps({"seq": self.sequence, "kind": kind, **fields},
+                           sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n").encode()
+        self._append("journal", data)
+
+    def bytes(self, stream, data):
+        """Record only a successful syscall's transferred bytes, before interpretation."""
+        if self.failed or self.finished:
+            return
+        try:
+            if (stream not in ("stdin", "stdout") or not 0 < len(data) <= self.MAX_CHUNK
+                    or stream == "stdin" and self.stdin_closed or stream == "stdout" and self.eof
+                    or self.counts[stream] + len(data) > self.MAX_BYTES):
+                raise ValueError("capture stream exceeded its bound or closed")
+            offset = self.counts[stream]
+            self._append(stream, data)
+            self._event(stream, offset=offset, bytes=len(data), sha256=hashlib.sha256(data).hexdigest())
+        except (OSError, ValueError, TypeError):
+            self.failed = True
+
+    def event(self, kind):
+        if self.failed or self.finished:
+            return
+        try:
+            if kind == "stdout_eof" and not self.eof:
+                self.eof = True
+            elif kind == "stdin_closed" and not self.stdin_closed:
+                self.stdin_closed = True
+            else:
+                raise ValueError("unknown or duplicate close event")
+            self._event(kind)
+        except (OSError, ValueError, TypeError):
+            self.failed = True
+
+    def fault(self):
+        # Never copy native exception contents, user text or secret values.
+        self.failed = True
+        self.report["status"] = "incomplete"
+        self.report.pop("inventory_sha256", None)
+
+    def finish(self, exit_code, *, clean):
+        """Inventory after the existing owner finishes cleanup; never wait or kill."""
+        if self.finished:
+            return self.report
+        try:
+            if (self.failed or not clean or type(exit_code) is not int or exit_code != 0
+                    or not self.eof or not self.stdin_closed
+                    or not self.counts["stdin"] or not self.counts["stdout"]):
+                raise ValueError("capture did not reach a clean whole end")
+            self._event("leader_reaped", exit_code=exit_code)
+            if set(os.listdir(self.directory_fd)) != set(self.NAMES.values()):
+                raise OSError("capture directory inventory changed")
+            members = []
+            for kind, name in self.NAMES.items():
+                fd = self.files[kind]
+                os.fsync(fd)
+                info = os.fstat(fd)
+                if (info.st_uid != os.getuid() or info.st_nlink != 1
+                        or info.st_mode & 0o777 != 0o600
+                        or not stat.S_ISREG(info.st_mode) or info.st_size != self.counts[kind]):
+                    raise OSError("capture file changed")
+                observed = hashlib.sha256()
+                offset = 0
+                while offset < info.st_size:
+                    data = os.pread(fd, min(65536, info.st_size - offset), offset)
+                    if not data:
+                        raise OSError("capture file became unavailable")
+                    observed.update(data)
+                    offset += len(data)
+                if observed.digest() != self.hashes[kind].digest():
+                    raise OSError("capture file bytes changed")
+                members.append({"path": name, "bytes": info.st_size, "sha256": observed.hexdigest()})
+            # An inventory is never an approval or sufficient completion marker.
+            # Completion requires the matching caller receipt after directory fsync.
+            inventory = (json.dumps({"schema": 1, "status": "inventory_only", "members": members,
+                                     "capture_authenticated": False, "review_accepted": False,
+                                     "release_approved": False}, sort_keys=True) + "\n").encode()
+            fd = os.open("inventory.tmp", os.O_WRONLY | os.O_CREAT | os.O_EXCL |
+                         os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=self.directory_fd)
+            try:
+                pending = memoryview(inventory)
+                while pending:
+                    count = os.write(fd, pending)
+                    if count <= 0:
+                        raise OSError("capture inventory write made no progress")
+                    pending = pending[count:]
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            # The newly created private directory has no pre-existing inventory.
+            os.link("inventory.tmp", "inventory.json", src_dir_fd=self.directory_fd,
+                    dst_dir_fd=self.directory_fd, follow_symlinks=False)
+            os.unlink("inventory.tmp", dir_fd=self.directory_fd)
+            os.fsync(self.directory_fd)
+            self.report.update(status="complete", inventory_sha256=hashlib.sha256(inventory).hexdigest(),
+                               path="transport/inventory.json", stdout_eof=True, events=self.sequence)
+        except (OSError, ValueError, TypeError):
+            self.failed = True
+        finally:
+            self.finished = True
+            for fd in [*self.files.values(), self.directory_fd]:
+                if fd is not None:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        self.failed = True
+            self.files.clear()
+            self.directory_fd = None
+            if self.failed:
+                self.report["status"] = "incomplete"
+                self.report.pop("inventory_sha256", None)
+        return self.report

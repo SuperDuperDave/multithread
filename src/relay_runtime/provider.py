@@ -1284,6 +1284,8 @@ def _wait(process, timeout, observer=None, feedback=None):
 
 
 def _stop(process, observer=None, *, immediate=False):
+    if observer is not None and getattr(observer, "capture", None) is not None:
+        observer.capture.fault()
     # This call owns this process group only. Give the provider its normal
     # SIGTERM cleanup before escalation; never touch another native session.
     # A restricted session holding an adversarial task gets no grace.
@@ -1490,6 +1492,10 @@ def peer_main(argv=None, *, report_entry=None):
     parser.add_argument("--allow-apps", action="store_true",
                         help="Codex only: let the account's ChatGPT apps (connectors such as mail, drive and databases) "
                              "run in this call as Codex's one apps server. Independent of --allow-plugins")
+    parser.add_argument("--capture-transport", metavar="PACKET_SHA256", type=_capture_digest,
+                        help="Codex only: privately retain bounded exact stdin/stdout bytes and an observation journal; "
+                             "supply the selected public/synthetic packet manifest SHA256. Disabled by default; "
+                             "complete capture does not authenticate provenance or approve a review")
     parser.add_argument("--attach", action="append", default=[], metavar="IMAGE",
                         help="Claude only: attach a PNG, JPEG, GIF or WebP file to the task as an image; repeatable "
                              f"(at most {_MAX_ATTACHMENTS}, {_MAX_ATTACHMENT // (1024 * 1024)} MiB each, {_MAX_ATTACHMENTS_TOTAL // (1024 * 1024)} MiB in total)")
@@ -1497,6 +1503,8 @@ def peer_main(argv=None, *, report_entry=None):
     parser.add_argument("--json", action="store_true", help="return a structured result; this DOES launch unless --dry-run is used; exit 0 means a returned turn, so also check needs_attention and task evidence")
     args = parser.parse_args(raw)
     args.report_entry = report_entry
+    if args.client != "codex" and args.capture_transport is not None:
+        parser.error("--capture-transport is a Codex option")
     if args.client == "codex" and args.max_turns is not None:
         parser.error("--max-turns is a Claude option; Codex returns one native turn with its normal tool loop")
     if args.client == "claude" and args.effort is not None and args.effort not in _CLAUDE_EFFORTS:
@@ -1517,6 +1525,12 @@ def peer_main(argv=None, *, report_entry=None):
             parser.error(str(exc))
     with _call_signals() as interruption:
         return _run_peer(args, interruption)
+
+
+def _capture_digest(value):
+    if not re.fullmatch(r"[0-9a-f]{64}", value):
+        raise argparse.ArgumentTypeError("expected a lowercase SHA256 for the selected packet manifest")
+    return value
 
 
 def _producer_runtime():
@@ -1594,6 +1608,8 @@ def _run_peer(args, interruption):
     plan = None
     process = None
     observer = None
+    capture = None
+    capture_entries = None
     completed = False  # set only when the provider's stream ended normally and was fully awaited
     control = None
     code = 1
@@ -1728,6 +1744,17 @@ def _run_peer(args, interruption):
             os.fsync(stream.fileno())
         _record(directory, "checkpoint.json", _call_checkpoint(envelope, "before_spawn"))
         _sync_directory(directory)
+        if getattr(args, "capture_transport", None) is not None:
+            from .native_io import TransportCapture, capture_entry
+            capture_entries = {"launcher": capture_entry(str(args.relay or account_launcher())),
+                               "provider": capture_entry(native[0])}
+            capture = TransportCapture(directory, {
+                "schema": 1, "producer_runtime": envelope["producer_runtime"],
+                "argv": native, "cwd": plan["repo"], "call_id": control.call["call_id"],
+                "task_sha256": hashlib.sha256(task).hexdigest(),
+                "packet_manifest_sha256": args.capture_transport, "packet_pin_source": "caller_selected",
+                "entries_before_spawn": capture_entries, "source_oid": None,
+                "provenance": "manual_required; entry hashes do not identify executed wrappers or eliminate substitution"})
         # This durable breadcrumb survives an interrupted caller. Provider stdout
         # and stderr can contain private task context; they are never auto-published.
         print("multithread peer: session " + _display_text(session or "assigned by provider")
@@ -1760,6 +1787,7 @@ def _run_peer(args, interruption):
                     else:
                         from . import claude_peer as driver
                     observer = driver.Observation(process, directory, envelope)
+                    observer.capture = capture
                 if interruption["signal"] is not None:
                     raise KeyboardInterrupt
                 envelope.update(state="uncertain", provider_started=True)
@@ -1901,6 +1929,16 @@ def _run_peer(args, interruption):
             record["result_excerpt"], record["result_excerpt_truncated"] = None, False
     if restricted and envelope.get("state") != "returned":
         withhold_text()
+    if capture is not None:
+        from .native_io import capture_entry
+        after = {"launcher": capture_entry(str(args.relay or account_launcher())),
+                 "provider": capture_entry(native[0])}
+        if after != capture_entries or any(x["status"] == "unavailable" for x in after.values()):
+            capture.fault()
+        envelope["transport_capture"] = capture.finish(
+            process.returncode if process is not None else None,
+            clean=bool(completed and code == 0 and envelope.get("state") == "returned"
+                       and not envelope.get("needs_attention")))
     preparation = _follow_up_preparation(args, plan, envelope) if code == 0 else None
     if preparation is not None:
         envelope["follow_up_preparation"] = preparation

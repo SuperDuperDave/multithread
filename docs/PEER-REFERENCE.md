@@ -458,3 +458,50 @@ Use that substitution for `control send` too. Printed installed-launcher
 inspection commands require a runtime that contains v0.3 control support;
 with v0.2.0, inspect through the source entry instead. Source-entry execution
 does not prove that the installed runtime contains these additions.
+
+
+## Optional Codex transport evidence
+
+`--capture-transport PACKET_SHA256` retains bounded raw stdio evidence inside
+this same native Codex call. Supply the lowercase SHA256 of the independently
+selected public/synthetic packet manifest. It is disabled by default, refused
+for Claude and not carried into a follow-up automatically. A dry run creates
+no capture. This option adds recording; it does not change native permissions,
+features, hook trust or provider selection.
+
+Private `transport/` contains accepted `stdin.bin` bytes, original
+`stdout.bin` bytes before retention/parsing, a sequenced `journal.jsonl`,
+and `context.json`. The journal gives chunk offsets, counts and hashes in
+parent observation order. It does not establish the provider's internal
+execution order. Bytes after terminal completion are included during existing
+bounded cleanup. Only an empty pipe read establishes stdout EOF.
+
+The context records the actual argv/cwd, call identity, task digest, caller
+packet pin and retained producer-runtime manifest identity when available.
+Launcher/provider entry files are observed before/after the call; their hashes
+and metadata cannot authenticate an executed wrapper, companion binary or
+exclude substitution. Source OID is explicitly unavailable in this context;
+bind the retained runtime manifest to reviewed source and the closed release
+manifest independently. No environment/profile snapshot is captured.
+
+`transport_capture.status=complete` in the matching call receipt means
+transport recording reached observed EOF, closed input and a clean natural
+zero exit, with no unresolved driver input/problem or capture fault. It also
+requires a private closed file inventory and completed file/directory syncs.
+The atomically linked `inventory.json` is explicitly `inventory_only`;
+alone it never proves completion. Require the matching receipt and inventory
+digest and independently verify all member bytes. A publication/sync failure
+may leave an inventory but gives an incomplete capture receipt.
+
+Caps are16MiB per stream,8192 journal events and64KiB per chunk. Overflow,
+recording failures, unknown closure, protocol faults, interruption, timeout,
+forced cleanup or changed entry observations make capture incomplete.
+Partial files stay private. Recording does not retry native input, extend
+cleanup deadlines or withdraw an otherwise valid answer; normal call exit0
+can therefore coexist with an incomplete capture. Inspect both outcomes.
+
+Every capture leaves `capture_authenticated`, `review_accepted` and
+`release_approved` false. Provenance, actual confinement/hooks, protocol
+semantics, truthful substantive coverage and independent review remain
+separate qualifications. Availability of this option in source is not proof
+that the currently installed producer contains it.
