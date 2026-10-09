@@ -759,12 +759,16 @@ def _seated_plugins():
     return _SEATED_BY_INERT_SETTINGS if machine is not None and _inert_managed_settings(machine) else ()
 
 
+class _Unchecked(str):
+    """A managed source that could not be read: nothing was found there, but nothing was ruled out either."""
+
+
 def _managed_claude_sources(cwd, observed=None):
     """Managed Claude settings this machine would apply to a restricted call: a best-effort preflight.
 
-    Present, or unreadable, sources are returned; an empty list means none was found. `observed` receives
-    windows_policy_reused when an earlier clean read stood in for a failed one, and windows_interop when most
-    recent fresh reads failed.
+    Present, or unreadable (as _Unchecked), sources are returned; an empty list means none was found.
+    `observed` receives windows_policy_reused when an earlier clean read stood in for a failed one, and
+    windows_interop when most recent fresh reads failed.
     """
     found = []
     machine = _MANAGED_CLAUDE_SETTINGS.get(platform.system())
@@ -782,12 +786,29 @@ def _managed_claude_sources(cwd, observed=None):
                                                                 ("windows_interop", health)) if value is not None})
             for parent, (listed, failure) in listings.items():
                 if listed is None:
-                    found.append(parent + f"\\ClaudeCode (unreadable after {len(_REG_BACKOFF) + 1} attempts: {failure})")
+                    found.append(_Unchecked(
+                        parent + f"\\ClaudeCode (unreadable after {len(_REG_BACKOFF) + 1} attempts: {failure})"))
                     continue
                 # reg.exe prints full hive names (HKEY_LOCAL_MACHINE\\...), so match the path below the hive.
                 if any(line.strip().lower().endswith("\\software\\policies\\claudecode") for line in listed):
                     found.append(parent + "\\ClaudeCode")
     return found
+
+
+def _managed_refusal(managed):
+    """Say what was found apart from what could not be checked: a failed read is not a finding, and still refuses."""
+    present = [source for source in managed if not isinstance(source, _Unchecked)]
+    unchecked = [source for source in managed if isinstance(source, _Unchecked)]
+    if present:
+        text = ("Managed Claude settings were found (" + ", ".join(present) + "); they stay in force under "
+                "--restricted, hooks included, so a --tools call cannot establish its registry.")
+        if unchecked:
+            text += " These could not be checked either: " + ", ".join(unchecked) + "."
+    else:
+        text = ("Managed Claude settings could not be ruled out: the Windows policy read failed ("
+                + ", ".join(unchecked) + "). Nothing was found, but a --tools call runs only when it can check. "
+                "Retry; if this repeats, WSL may need a restart.")
+    return text + " No provider was started."
 
 
 # A Codex peer's tools may read only what the call names; nothing else of this account.
@@ -1581,8 +1602,7 @@ def _run_peer(args, interruption):
         managed = _managed_claude_sources(plan["repo"], observed) if args.tools is not None else []
         envelope.update(observed)
         if managed:
-            raise LaunchError("Managed Claude settings were found (" + ", ".join(managed) + "); they stay in force under "
-                              "--restricted, hooks included, so a --tools call cannot establish its registry. No provider was started.")
+            raise LaunchError(_managed_refusal(managed))
         identity = reviewed = None
         if args.tools is not None:
             # A restricted call runs only an exact binary whose restricted behaviour was reviewed, by resolved path.

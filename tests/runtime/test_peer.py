@@ -1240,8 +1240,9 @@ class PeerTests(unittest.TestCase):
                                   ("unexpected status", [2, ""], "exit 2"),
                                   ("timed out", [0, "", 2], "timed out")):
             with self.subTest(registry=name):
-                self.assertEqual([hkcu + f"\\ClaudeCode (unreadable after 4 attempts: {why})"],
-                                 sources(keys=dict(listing, **{hkcu: answer})))
+                unread = sources(keys=dict(listing, **{hkcu: answer}))
+                self.assertEqual([hkcu + f"\\ClaudeCode (unreadable after 4 attempts: {why})"], unread)
+                self.assertIsInstance(unread[0], peer._Unchecked, "a failed read is not a finding")
         # WSL's bridge to Windows fails a call now and then (a live training step was refused by one); a read
         # that recovers on a retry decides alone, and a policy key found on the retry still refuses.
         # A success that lists nothing recognizable is a failed read, retried; it refuses if it never recovers.
@@ -1272,6 +1273,23 @@ class PeerTests(unittest.TestCase):
             code, _, _ = self.invoke("--dry-run")
             self.assertEqual(0, code, "an unrestricted call is unaffected")
             self.assertEqual(1, found.call_count)
+        # A failed read is reported as unchecked, never as found, and still refuses (a summary once turned
+        # "(unreadable)" into "something wrote policy").
+        unread = peer._Unchecked("HKEY_CURRENT_USER\\SOFTWARE\\Policies\\ClaudeCode "
+                                 "(unreadable after 4 attempts: timed out)")
+        for managed, says, never in (
+                ([unread], "could not be ruled out: the Windows policy read failed (" + unread + "). Nothing was found",
+                 "were found"),
+                (["/etc/claude-code", unread], "were found (/etc/claude-code); they stay in force",
+                 "Nothing was found")):
+            with self.subTest(managed=managed), mock.patch.object(peer, "_managed_claude_sources",
+                                                                  return_value=managed):
+                code, result, _ = self.invoke("--tools", "none")
+                self.assertNotEqual(0, code)
+                self.assertEqual(("unavailable", False), (result["state"], result["provider_started"]))
+                self.assertIn(says, result["message"])
+                self.assertNotIn(never, result["message"])
+                self.assertIn(unread, result["message"])
         self.assertFalse(self.calls.exists())
 
     def test_only_the_inert_machine_setting_lets_a_restricted_call_through(self):
