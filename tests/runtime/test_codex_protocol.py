@@ -247,10 +247,10 @@ def usage_notification(usage, *, thread=THREAD, turn=TURN):
         "threadId": thread, "turnId": turn, "tokenUsage": usage}}
 
 
-def settings_notification(model=MODEL, effort=EFFORT, *, thread=THREAD):
+def settings_notification(model=MODEL, effort=EFFORT, *, thread=THREAD, policy="never", reviewer="user"):
     return {"method": "thread/settings/updated", "params": {"threadId": thread, "threadSettings": {
         "model": model, "effort": effort, "modelProvider": "fixture-native-provider", "cwd": "/fixture",
-        "approvalPolicy": "on-request", "approvalsReviewer": "user", "sandboxPolicy": {"type": "readOnly"},
+        "approvalPolicy": policy, "approvalsReviewer": reviewer, "sandboxPolicy": {"type": "readOnly"},
         "collaborationMode": {"mode": "default"}}}}
 
 
@@ -1670,6 +1670,17 @@ class CodexProtocolTests(unittest.TestCase):
                 self.assertEqual("not_submitted", result["task_submission"])
                 self.assertNotIn("turn/start", [row["method"] for row in self.recorded_requests()])
                 self.assertIn(shown, result["message"])
+        # Settings that drift away from never/user, on any thread and at any time, end the call too.
+        for update, shown in ((settings_notification(policy="on-request"), "approvalPolicy on-request"),
+                              (settings_notification(reviewer="auto_review", thread=OTHER_THREAD),
+                               "approvalsReviewer auto_review"),
+                              (settings_notification(policy={"granular": {}}), "approvalPolicy (structured)")):
+            with self.subTest(update=shown):
+                self.configure(events=[item(), completed(), update], exit_after_events=False, sleep=True)
+                code, result, _ = self.invoke()
+                self.assertNotEqual(0, code)
+                self.assertEqual(("uncertain", None), (result["state"], result["result"]))
+                self.assertIn(f"changed this call's approval settings ({shown})", result["message"])
         # Any approval review that happens anyway ends the call at once and withdraws the answer.
         for method in ("item/autoApprovalReview/started", "item/autoApprovalReview/completed", "guardianWarning"):
             with self.subTest(method=method):

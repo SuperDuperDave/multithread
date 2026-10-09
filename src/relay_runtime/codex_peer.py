@@ -815,6 +815,21 @@ class _Driver:
             raise _ProtocolError("Malformed native notification; inspect retained output.")
         if method == "mcpServer/startupStatus/updated":
             return self.mcp_started(params)
+        if method == "thread/settings/updated" and isinstance(params.get("threadSettings"), dict):
+            # Escalation must stay off for the whole call, on any thread this app-server runs.
+            settings = params["threadSettings"]
+            drifted = {key: settings[key] for key, safe in (("approvalPolicy", "never"), ("approvalsReviewer", "user"))
+                       if key in settings and settings[key] != safe}
+            if drifted:
+                self.envelope.update(native_approval_policy=settings.get("approvalPolicy")
+                                     if settings.get("approvalPolicy") in _APPROVAL_POLICIES else None,
+                                     native_approvals_reviewer=settings.get("approvalsReviewer")
+                                     if settings.get("approvalsReviewer") in ("user", "auto_review", "guardian_subagent")
+                                     else None)
+                return self.end_call("Codex changed this call's approval settings ("
+                                     + ", ".join(f"{key} {_label(value) if isinstance(value, str) else '(structured)'}"
+                                                 for key, value in drifted.items())
+                                     + ") although a peer call keeps escalation off")
         if method.startswith("item/autoApprovalReview/") or method == "guardianWarning":
             # Escalation is off; a review of one means a command asked to leave the sandbox anyway.
             return self.end_call(f"Codex started an approval review ({_label(method)}) although this call turned "
