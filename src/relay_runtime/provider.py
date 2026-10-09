@@ -1657,9 +1657,11 @@ def _run_peer(args, interruption):
                                       "ignored_links": scope["linked"],
                                       "project_instructions": scope["project_instructions"],
                                       "verified": "not_checked"}
-            # A peer starts no child threads, and plugins and apps stay off unless asked for: what a peer can call is
+            # A peer never escalates out of its sandbox (no approvals asked, none granted elsewhere), starts no child
+            # threads, and plugins and apps stay off unless asked for: what a peer can call is
             # what this call names. Codex confirms each for the thread, and lists its MCP servers, before the task.
-            plugins = ["-c", "features.multi_agent=false", "-c", "features.multi_agent_v2=false",
+            plugins = ["-c", 'approval_policy="never"', "-c", 'approvals_reviewer="user"',
+                       "-c", "features.multi_agent=false", "-c", "features.multi_agent_v2=false",
                        *([] if args.allow_plugins else ["-c", "features.plugins=false", "-c", "features.apps=false"])]
             envelope["provider_plugins"] = {"mode": "allowed" if args.allow_plugins else "off",
                                             "mcp_servers": None, "plugin_servers": None, "source": "not_observed"}

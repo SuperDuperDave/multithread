@@ -131,7 +131,7 @@ else:
                 for name,value in hooks.items()]}]}
         elif method == 'thread/start':
             hook('SessionStart')
-            result = {'thread':{'id':session, 'cwd':os.getcwd(), 'turns':[]}, 'cwd':os.getcwd()}
+            result = {'thread':{'id':session, 'cwd':os.getcwd(), 'turns':[]}, 'cwd':os.getcwd(), 'approvalPolicy':'never', 'approvalsReviewer':'user'}
         elif method == 'mcpServerStatus/list': result = {'data':[], 'nextCursor':None}
         elif method == 'experimentalFeature/list':
             result = {'data':[{'name':n, 'enabled':False} for n in ('multi_agent', 'multi_agent_v2', 'plugins', 'apps')], 'nextCursor':None}

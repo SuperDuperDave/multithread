@@ -125,8 +125,12 @@ while True:
         thread = {'id': THREAD_ID, 'cwd': os.getcwd(), 'sessionId': THREAD_ID, 'turns': []}
         thread.update(spec.get('thread_updates', {}))
         result = {'thread': thread, 'cwd': os.getcwd(), 'model': 'fixture-native-selection',
-                  'modelProvider': 'fixture-native-provider', 'approvalPolicy': 'on-request',
-                  'approvalsReviewer': spec.get('reviewer', 'user'),
+                  'modelProvider': 'fixture-native-provider',
+                  # What the server's own argv asked for, unless the fixture says Codex ignored it.
+                  'approvalPolicy': spec.get('approval_policy', 'never' if 'approval_policy="never"' in sys.argv
+                                             else 'on-request'),
+                  'approvalsReviewer': spec.get('reviewer', 'user' if 'approvals_reviewer="user"' in sys.argv
+                                                else 'auto_review'),
                   'sandbox': {'type': 'workspaceWrite', 'writableRoots': [os.getcwd()],
                               'networkAccess': False, 'excludeTmpdirEnvVar': False,
                               'excludeSlashTmp': False}}
@@ -538,7 +542,7 @@ class CodexProtocolTests(unittest.TestCase):
         self.assertEqual("not_checked", result["relay_acknowledgement"])
         self.assertEqual("not_checked", result["workflow_completion"])
         receipt = json.loads(self.receipt.read_text())
-        self.assertEqual([str(self.provider), *self.native_arguments, *self.confinement(result), "-c", "features.multi_agent=false", "-c", "features.multi_agent_v2=false", "-c", "features.plugins=false", "-c", "features.apps=false", "app-server", "--listen", "stdio://"], receipt["argv"])
+        self.assertEqual([str(self.provider), *self.native_arguments, *self.confinement(result), "-c", 'approval_policy="never"', "-c", 'approvals_reviewer="user"', "-c", "features.multi_agent=false", "-c", "features.multi_agent_v2=false", "-c", "features.plugins=false", "-c", "features.apps=false", "app-server", "--listen", "stdio://"], receipt["argv"])
         self.assertEqual(self.environment, receipt["env"])
         self.assertEqual(str(self.repo), receipt["cwd"])
         requests = self.recorded_requests()
@@ -875,7 +879,7 @@ class CodexProtocolTests(unittest.TestCase):
         self.assertEqual((MODEL, EFFORT, "unknown"),
                          (dry["requested_model"], dry["requested_effort"], dry["effective_effort"]))
         # Both settings travel in the turn request, never as native arguments.
-        self.assertEqual([str(self.provider), *self.native_arguments, *self.confinement(dry), "-c", "features.multi_agent=false", "-c", "features.multi_agent_v2=false", "-c", "features.plugins=false", "-c", "features.apps=false", "app-server", "--listen", "stdio://"],
+        self.assertEqual([str(self.provider), *self.native_arguments, *self.confinement(dry), "-c", 'approval_policy="never"', "-c", 'approvals_reviewer="user"', "-c", "features.multi_agent=false", "-c", "features.multi_agent_v2=false", "-c", "features.plugins=false", "-c", "features.apps=false", "app-server", "--listen", "stdio://"],
                          dry["argv"])
         self.assertFalse(self.calls.exists())
         # Claude keeps its own list; neither provider takes an option-like or spaced name.
@@ -1026,7 +1030,7 @@ class CodexProtocolTests(unittest.TestCase):
             self.assertEqual("ready", result["hook_readiness"]["state"])
             receipt = json.loads(self.receipt.read_text())
             # No invocation copy beside the user hooks: each event runs once.
-            self.assertEqual([str(self.provider), *self.confinement(result), "-c", "features.multi_agent=false", "-c", "features.multi_agent_v2=false", "-c", "features.plugins=false", "-c", "features.apps=false", "app-server", "--listen", "stdio://"], receipt["argv"])
+            self.assertEqual([str(self.provider), *self.confinement(result), "-c", 'approval_policy="never"', "-c", 'approvals_reviewer="user"', "-c", "features.multi_agent=false", "-c", "features.multi_agent_v2=false", "-c", "features.plugins=false", "-c", "features.apps=false", "app-server", "--listen", "stdio://"], receipt["argv"])
             self.configure(hook_updates={**user, "trustStatus": "untrusted"})
             code, result, _ = self.invoke()
             self.assertNotEqual(0, code)
@@ -1645,12 +1649,38 @@ class CodexProtocolTests(unittest.TestCase):
                 self.assertTrue(result["needs_attention"])
                 self.assertTrue(result["permission_denials"])
 
-    def test_native_auto_review_selection_is_preserved(self):
-        self.configure(reviewer="auto_review")
+    def test_a_peer_never_escalates_out_of_its_sandbox(self):
+        # Asked for on every call, and confirmed by Codex before the task.
         code, result, _ = self.invoke()
         self.assertEqual(0, code, result)
+        argv = self.calls_argv(result)
+        self.assertEqual(["-c", 'approval_policy="never"', "-c", 'approvals_reviewer="user"'],
+                         argv[argv.index("app-server") - 12:argv.index("app-server") - 8])
+        self.assertEqual(("never", "user"), (result["native_approval_policy"], result["native_approvals_reviewer"]))
         for request in self.recorded_requests():
             self.assertNotIn("approvalsReviewer", request.get("params", {}))
+        # A Codex that keeps the account's escalation settings refuses before the task.
+        for spec, shown in ((dict(reviewer="auto_review"), "reviewer auto_review"),
+                            (dict(approval_policy="on-request"), "approval policy on-request"),
+                            (dict(reviewer="guardian_subagent", approval_policy="never"), "reviewer guardian_subagent")):
+            with self.subTest(spec=spec):
+                self.configure(**spec)
+                code, result, _ = self.invoke()
+                self.assertNotEqual(0, code)
+                self.assertEqual("not_submitted", result["task_submission"])
+                self.assertNotIn("turn/start", [row["method"] for row in self.recorded_requests()])
+                self.assertIn(shown, result["message"])
+        # Any approval review that happens anyway ends the call at once and withdraws the answer.
+        for method in ("item/autoApprovalReview/started", "item/autoApprovalReview/completed", "guardianWarning"):
+            with self.subTest(method=method):
+                review = {"method": method, "params": {"threadId": THREAD, "turnId": TURN}}
+                self.configure(events=[item(), completed(), review], exit_after_events=False, sleep=True)
+                started = time.monotonic()
+                code, result, _ = self.invoke()
+                self.assertLess(time.monotonic() - started, 4)
+                self.assertNotEqual(0, code)
+                self.assertEqual(("uncertain", None), (result["state"], result["result"]))
+                self.assertIn(f"Codex started an approval review ({method})", result["message"])
 
     def test_unknown_server_requests_are_not_implicitly_authorized(self):
         request = {"id": "unsupported-server-request", "method": "fixture/unknown/request", "params": {}}
@@ -1737,8 +1767,8 @@ class CodexProtocolTests(unittest.TestCase):
         self.assertEqual(0, code, result)
         self.assertEqual("hidden", result["read_scope"]["project_instructions"])
         argv = json.loads(self.receipt.read_text())["argv"]
-        self.assertEqual(["-c", "project_doc_max_bytes=0", "-c", "features.multi_agent=false", "-c", "features.multi_agent_v2=false", "-c", "features.plugins=false", "-c", "features.apps=false", "app-server"],
-                         argv[argv.index("app-server") - 10:][:11])
+        self.assertEqual(["-c", "project_doc_max_bytes=0", "-c", 'approval_policy="never"', "-c", 'approvals_reviewer="user"', "-c", "features.multi_agent=false", "-c", "features.multi_agent_v2=false", "-c", "features.plugins=false", "-c", "features.apps=false", "app-server"],
+                         argv[argv.index("app-server") - 14:][:15])
         (self.repo / "AGENTS.md").unlink()
         (self.repo / "AGENTS.md").write_text("public guidance\n")
         code, result, _ = self.invoke()

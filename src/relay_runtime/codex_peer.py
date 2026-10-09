@@ -37,7 +37,8 @@ _FEATURE_PAGES = 5  # Codex 0.161 lists its 160 features in one page
 # feature list must confirm each before the task goes out.
 _ALWAYS_OFF = ("multi_agent", "multi_agent_v2")
 _PLUGINS_OFF = ("plugins", "apps")
-_APPS_SERVER = "codex_apps"  # Codex's one server for the account's ChatGPT apps (connectors); it has no pluginId
+_APPS_SERVER = "codex_apps"
+_APPROVAL_POLICIES = ("untrusted", "on-failure", "on-request", "never")  # Codex's one server for the account's ChatGPT apps (connectors); it has no pluginId
 # Where a setting the call does not request comes from: Codex keeps a thread's settings.
 _KEPT = {"new_thread": "the new thread's configured", "resumed_thread": "this thread's current"}
 _CLIENT_INFO = {"name": "multithread", "title": "Multithread", "version": "0.4.1"}
@@ -541,21 +542,25 @@ class _Driver:
         is the call's own, so no other thread's servers run in it. An answer already recorded is withdrawn."""
         if (self.envelope.get("provider_plugins") or {}).get("mode") != "off":
             return
+        self.end_call(f"Codex reported MCP server activity ({_label(params.get('name'))}: "
+                      f"{_label(params.get('status'))}) although this call turned plugins and apps off",
+                      "pass --allow-plugins to run with the account's plugins, apps and MCP servers")
+
+    def end_call(self, what, remedy=None):
+        """A boundary the call set was crossed: withdraw any recorded answer and stop the call's own process group at
+        once, wherever this is read, during the turn or while its server shuts down. A reaped leader is left to
+        cleanup."""
         submitted = {"requested": "its task may already have been sent",
                      "accepted": "Codex had already accepted its task"}.get(self.envelope.get("task_submission"),
                                                                             "no task was submitted")
         self.envelope.update(state="uncertain", result=None)
-        # A boundary the call set was crossed: no grace for work still running in the call's own process group,
-        # wherever this is read, during the turn or while its server shuts down. A reaped leader is left to cleanup.
         if self.process.returncode is None:
             try:
                 os.killpg(self.process.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
-        raise _ProtocolError(
-            f"Codex reported MCP server activity ({_label(params.get('name'))}: {_label(params.get('status'))}) "
-            f"although this call turned plugins and apps off; the call was ended and {submitted}. Next: pass "
-            "--allow-plugins to run with the account's plugins, apps and MCP servers, or inspect retained output.")
+        raise _ProtocolError(f"{what}; the call was ended and {submitted}. Next: "
+                             + (f"{remedy}, or inspect retained output." if remedy else "inspect retained output."))
 
     def submit_turn(self):
         turn, self.waiting_turn = self.waiting_turn, None
@@ -735,6 +740,15 @@ class _Driver:
             reviewer = result.get("approvalsReviewer")
             if reviewer in ("user", "auto_review", "guardian_subagent"):
                 self.envelope["native_approvals_reviewer"] = reviewer
+            # A peer never escalates out of its sandbox: no approval is asked for, and none could be granted by a
+            # reviewer other than this client, which declines. Codex must report both before the task goes out.
+            policy = result.get("approvalPolicy")
+            self.envelope["native_approval_policy"] = policy if policy in _APPROVAL_POLICIES else None
+            if policy != "never" or reviewer != "user":
+                raise _ProtocolError(
+                    f"Codex reports approval policy {_label(policy)} with reviewer {_label(reviewer)} for this thread; "
+                    "a peer call requires 'never' and 'user', so nothing can escalate out of its sandbox. No task was "
+                    "submitted. Next: check the Codex version and configuration, or inspect retained output.")
             # The same turn request carries any override on a new or resumed
             # thread. The opened thread's settings describe only what it keeps.
             requested = {"model": self.envelope.get("requested_model"),
@@ -801,6 +815,10 @@ class _Driver:
             raise _ProtocolError("Malformed native notification; inspect retained output.")
         if method == "mcpServer/startupStatus/updated":
             return self.mcp_started(params)
+        if method.startswith("item/autoApprovalReview/") or method == "guardianWarning":
+            # Escalation is off; a review of one means a command asked to leave the sandbox anyway.
+            return self.end_call(f"Codex started an approval review ({_label(method)}) although this call turned "
+                                 "escalation off")
         relevant = ("turn/started", "turn/completed", "item/completed", "item/agentMessage/delta",
                     "thread/tokenUsage/updated", "error", "thread/settings/updated", "model/rerouted")
         if method not in relevant:
