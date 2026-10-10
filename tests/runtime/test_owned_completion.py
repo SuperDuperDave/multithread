@@ -13,7 +13,7 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'src'))
-from relay_runtime import provider
+from relay_runtime import claude_peer, codex_peer, provider
 import test_codex_protocol as protocol
 
 
@@ -36,13 +36,17 @@ class OwnedCompletionTests(unittest.TestCase):
             f"            Path({str(receipt)!r}).write_text(str(child))")
         self.executable(self.provider, source.split('\n', 1)[1])
         pidfd = None
+        original_waitid = os.waitid
+        def track(*args):
+            nonlocal pidfd
+            if receipt.exists() and pidfd is None:
+                # Retain the child while this fixture's unreaped leader still
+                # pins its group; never reopen a cached PID after retirement.
+                pidfd = os.pidfd_open(int(receipt.read_text()))
+            return original_waitid(*args)
         try:
-            code, result, _ = self.invoke('--capture-transport', 'e' * 64)
-            child = int(receipt.read_text())
-            try:
-                pidfd = os.pidfd_open(child)
-            except ProcessLookupError:
-                pass
+            with mock.patch.object(os, 'waitid', side_effect=track):
+                code, result, _ = self.invoke('--capture-transport', 'e' * 64)
             if pidfd is not None:
                 poll = select.poll()
                 poll.register(pidfd, select.POLLIN)
@@ -146,23 +150,18 @@ class OwnedCompletionTests(unittest.TestCase):
                 marker = self.base / ('waitid-child-' + str(failure))
                 self.configure(spawn_child=str(marker), sleep=True)
                 original = os.waitid
+                pidfd = leader_fd = None
                 def unavailable(*args):
+                    nonlocal pidfd, leader_fd
                     if marker.exists():
+                        if leader_fd is None:
+                            leader_fd = os.pidfd_open(args[1])
+                            pidfd = os.pidfd_open(int(marker.read_text()))
                         raise OSError(failure, 'synthetic unavailable exit observation')
                     return original(*args)
-                pidfd = leader_fd = None
                 try:
                     with mock.patch.object(os, 'waitid', side_effect=unavailable):
                         code, result, _ = self.invoke()
-                    try:
-                        leader_fd = os.pidfd_open(json.loads(self.receipt.read_text())['pid'])
-                    except ProcessLookupError:
-                        pass
-                    child = int(marker.read_text())
-                    try:
-                        pidfd = os.pidfd_open(child)
-                    except ProcessLookupError:
-                        pass
                     if pidfd is not None:
                         poll = select.poll()
                         poll.register(pidfd, select.POLLIN)
@@ -268,3 +267,57 @@ class OwnedCompletionTests(unittest.TestCase):
         import hashlib
         self.assertEqual(binding['receipt_sha256'],
                          hashlib.sha256((directory / 'result.json').read_bytes()).hexdigest())
+
+    def test_restricted_claude_revokes_answer_without_signalling_released_group(self):
+        for state in ('retired', 'lost', 'reaped', 'owned'):
+            with self.subTest(ownership=state):
+                process = mock.Mock(pid=12345, returncode=0 if state == 'reaped' else None)
+                process._owned_group_retired = state == 'retired'
+                process._owned_child_lost = state == 'lost'
+                driver = object.__new__(claude_peer._Driver)
+                driver.process, driver.envelope = process, {'partial_result': 'synthetic'}
+                driver.results = [{'result_excerpt': 'synthetic', 'result_excerpt_truncated': True}]
+                with mock.patch.object(os, 'killpg') as kill:
+                    driver.stop_restricted()
+                self.assertTrue(driver.registry_failed)
+                self.assertNotIn('partial_result', driver.envelope)
+                self.assertIsNone(driver.results[0]['result_excerpt'])
+                if state == 'owned':
+                    kill.assert_called_once_with(process.pid, signal.SIGKILL)
+                else:
+                    kill.assert_not_called()
+
+    def test_configuration_server_signals_only_before_reap(self):
+        states = []
+        original = os.killpg
+        server = codex_peer.AppServer([str(self.provider)], self.repo)
+        def kill(group, sig):
+            states.append(server.process.returncode)
+            # Never act on the old implementation's already-reaped cached ID.
+            if server.process.returncode is None:
+                original(group, sig)
+        with mock.patch.dict(os.environ, self.environment, clear=True):
+            with mock.patch.object(os, 'killpg', side_effect=kill):
+                with server:
+                    pass
+        self.assertTrue(states)
+        self.assertTrue(all(state is None for state in states), 'configuration server signalled after reap')
+        self.assertIsNotNone(server.process.returncode)
+        self.assertTrue(server.process.stdin.closed and server.process.stdout.closed)
+
+    def test_configuration_server_refuses_missing_exit_observation_before_spawn(self):
+        with mock.patch.object(os, 'waitid', None):
+            with mock.patch.object(subprocess, 'Popen') as spawn:
+                with self.assertRaises(codex_peer._ProtocolError):
+                    with codex_peer.AppServer(['synthetic'], self.repo):
+                        pass
+                spawn.assert_not_called()
+
+    def test_nonstream_cleanup_has_bounded_reap_after_owned_signal(self):
+        process = mock.Mock(pid=12345, returncode=None)
+        process._owned_child_lost = False
+        process.wait.side_effect = subprocess.TimeoutExpired('synthetic', 1)
+        with mock.patch.object(os, 'killpg'):
+            with self.assertRaises(subprocess.TimeoutExpired):
+                provider._stop(process, immediate=True)
+        process.wait.assert_called_once_with(timeout=1)

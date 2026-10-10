@@ -1282,6 +1282,11 @@ def _call_final_json(process, task, timeout, feedback, envelope):
                 raise
 
 
+def _supports_owned_exit():
+    return callable(getattr(os, "waitid", None)) and all(
+        hasattr(os, name) for name in ("P_PID", "WEXITED", "WNOHANG", "WNOWAIT"))
+
+
 class _ExitObservationUnavailable(OSError):
     """The exit syscall is unavailable while unreaped child ownership remains."""
 
@@ -1362,7 +1367,7 @@ def _stop(process, observer=None, *, immediate=False):
         pass
     process._owned_group_retired = True
     if observer is None:
-        process.wait()
+        process.wait(timeout=1)
     else:
         try:
             _wait(process, 1, observer)
@@ -1831,7 +1836,7 @@ def _run_peer(args, interruption):
                 # the provider and not a change to its execution permissions.
                 interruption["starting"] = True
                 try:
-                    if not all(hasattr(os, name) for name in ("waitid", "WNOWAIT", "WEXITED", "WNOHANG")):
+                    if not _supports_owned_exit():
                         raise LaunchError("This host cannot retain owned process-group identity through cleanup; no provider was started.")
                     process = subprocess.Popen(native, cwd=plan["repo"], stdin=subprocess.PIPE,
                                                stdout=output, stderr=errors, start_new_session=True)

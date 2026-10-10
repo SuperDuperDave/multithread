@@ -25,7 +25,7 @@ class ObservationLossTests(unittest.TestCase):
         self.root = Path(self.temp.name)
 
     def driver(self, process=None):
-        process = process or SimpleNamespace(pid=123456, returncode=0)
+        process = process or SimpleNamespace(pid=123456, returncode=None)
         envelope = {}
         driver = codex_peer._Driver(process, b"synthetic task", "/fixture", None, envelope, 2, None)
         driver.session, driver.turn = protocol.THREAD, protocol.TURN
@@ -66,7 +66,7 @@ class ObservationLossTests(unittest.TestCase):
                     self.assertEqual(bytearray(), observer.buffer)
                     kill.assert_called_once_with(driver.process.pid, signal.SIGKILL)
 
-    def test_cleanup_fallback_revokes_reaped_answer_despite_sink_failure(self):
+    def test_cleanup_fallback_revokes_returned_answer_despite_sink_failure(self):
         driver, envelope = self.driver()
         observer = self.observation(driver, envelope)
         observer.buffer.extend(b"synthetic deferred suffix\n")
@@ -137,7 +137,7 @@ class ObservationLossTests(unittest.TestCase):
         self.assertTrue(observer.interpret)
         self.assertIn("evidence_recording", envelope)
 
-    def test_reaped_leader_fault_kills_owned_descendant_without_shutdown_grace(self):
+    def test_exited_unreaped_leader_fault_kills_owned_descendant_without_shutdown_grace(self):
         for fault in ("protocol", "overflow", "boundary"):
             with self.subTest(fault=fault), tempfile.TemporaryDirectory() as folder:
                 root = Path(folder)
@@ -158,15 +158,11 @@ class ObservationLossTests(unittest.TestCase):
                                            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                            stderr=subprocess.DEVNULL, start_new_session=True)
                 def cleanup():
-                    try:
-                        os.killpg(process.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-                    process.wait(timeout=2)
+                    provider._retire_owned_group(process)
                     process.stdin.close()
                     process.stdout.close()
                 try:
-                    self.assertEqual(0, process.wait(timeout=2))
+                    self.assertEqual(0, provider._wait(process, 2))
                     child = int(pid_file.read_text())
                     self.assertTrue(self.alive(child))
                     driver, envelope = self.driver(process)
@@ -189,6 +185,20 @@ class ObservationLossTests(unittest.TestCase):
                 finally:
                     cleanup()
 
+
+
+    def test_known_reaped_or_lost_group_revokes_answer_without_signalling(self):
+        for state in ('reaped', 'retired', 'lost'):
+            with self.subTest(ownership=state):
+                process = SimpleNamespace(pid=123456, returncode=0 if state == 'reaped' else None,
+                                          _owned_group_retired=state == 'retired',
+                                          _owned_child_lost=state == 'lost')
+                driver, envelope = self.driver(process)
+                with mock.patch.object(codex_peer.os, 'killpg') as kill:
+                    driver.problem('synthetic post-ownership observation fault')
+                self.assertEqual('uncertain', envelope['state'])
+                self.assertIsNone(envelope['result'])
+                kill.assert_not_called()
 
 class ActiveObservationLossTests(unittest.TestCase):
     setUp = protocol.CodexProtocolTests.setUp

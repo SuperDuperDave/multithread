@@ -334,10 +334,13 @@ class _Driver:
         self.envelope.pop("partial_result", None)
         for record in self.results:
             record["result_excerpt"], record["result_excerpt_truncated"] = None, False
+        if (getattr(self.process, "returncode", None) is not None
+                or getattr(self.process, "_owned_group_retired", False) is True
+                or getattr(self.process, "_owned_child_lost", False) is True):
+            return
         try:
-            # The provider leads its own group, and descendants that outlive the leader keep it. The kernel never
-            # reissues a number still used as a group ID, so while any remain this reaches only them; an emptied
-            # group's number can be reused, an accepted risk shared with the ordinary cleanup.
+            # Revocation still applies after retirement, but a released child
+            # cannot pin the cached process-group identity for another signal.
             os.killpg(self.process.pid, signal.SIGKILL)
         except (ProcessLookupError, PermissionError, AttributeError, TypeError):
             pass

@@ -263,6 +263,9 @@ class AppServer:
         self.deadline = None
 
     def __enter__(self):
+        from .provider import _supports_owned_exit
+        if not _supports_owned_exit():
+            raise _ProtocolError("Owned exit observation is unavailable; no configuration server was started.")
         self.process = subprocess.Popen([*self.argv, "app-server", "--listen", "stdio://"], cwd=self.cwd,
                                         stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                         stderr=subprocess.DEVNULL, start_new_session=True)
@@ -321,22 +324,27 @@ class AppServer:
                 self.buffer.extend(chunk)
 
     def __exit__(self, *_exc):
+        from .provider import _wait, _retire_owned_group, _ExitObservationUnavailable
         process = self.process
         try:
-            process.stdin.close()
-        except OSError:
-            pass
-        try:
-            process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            pass
-        # Descendants can outlive the server; end only the group this call created.
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        process.wait()
-        process.stdout.close()
+            try:
+                process.stdin.close()
+            except OSError:
+                pass
+            try:
+                _wait(process, 5)
+            except (subprocess.TimeoutExpired, _ExitObservationUnavailable):
+                pass
+            finally:
+                # Observe without reap, retire while the leader still pins its
+                # group, then reap. ECHILD's ownership-loss guard remains sticky.
+                _retire_owned_group(process)
+        finally:
+            try:
+                process.stdout.close()
+            finally:
+                if not process.stdin.closed:
+                    process.stdin.close()
         return False
 
 
@@ -1116,7 +1124,8 @@ class _Driver:
         if self.observation_lost or not self.outcome_recorded:
             self.envelope.update(state="uncertain", result=None)
         self.envelope.update(needs_attention=True, message=message)
-        if (observation_lost and getattr(self.process, "_owned_group_retired", False) is not True
+        if (observation_lost and getattr(self.process, "returncode", None) is None
+                and getattr(self.process, "_owned_group_retired", False) is not True
                 and getattr(self.process, "_owned_child_lost", False) is not True):
             # Signal only while the child still pins its owned group identity.
             try:
