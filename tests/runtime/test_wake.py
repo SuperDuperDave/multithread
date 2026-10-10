@@ -2119,8 +2119,8 @@ class ClaudeTests(WakeCase):
         with redirect_stdout(io.StringIO()) as out:
             runtime_cli._hook_warning(args, "ledger", enrolled=True)
         shown = json.loads(out.getvalue())
-            self.assertTrue(shown["systemMessage"].startswith(warning + ". "), "a failed brief still carries it")
-        self.assertTrue(shown["hookSpecificOutput"]["additionalContext"].startswith(warning + "\n\n"))
+        self.assertTrue(shown["systemMessage"].startswith(warning + ". "), "a failed brief still carries it")
+        self.assertTrue(shown["hookSpecificOutput"]["additionalContext"].startswith(warning + ". "))
 
     def test_a_process_id_reused_while_connecting_receives_nothing(self):
         # Opus on 6dc7d72: the start-time check after connecting is the only guard against reuse in that moment.
