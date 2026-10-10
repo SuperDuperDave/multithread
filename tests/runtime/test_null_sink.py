@@ -81,12 +81,18 @@ class NullSinkTests(unittest.TestCase):
         directory.mkdir()
         symlink = self.base / "symlink"
         symlink.symlink_to("/dev/null")
-        socket_path = self.base / "socket"
-        with socket.socket(socket.AF_UNIX) as listener:
-            listener.bind(str(socket_path))
-            for replacement in (regular, fifo, directory, symlink, socket_path):
-                with self.subTest(shape=replacement.name):
-                    self.assert_substitution_refused(replacement)
+        # AF_UNIX has a fixed pathname limit; TMPDIR may be a long CI staging path.
+        # Only this real socket fixture needs a short, privately owned directory.
+        with tempfile.TemporaryDirectory(prefix="relay-sock-", dir="/tmp") as short:
+            self.assertEqual(0o700, stat.S_IMODE(os.stat(short).st_mode))
+            self.assertEqual(os.geteuid(), os.stat(short).st_uid)
+            socket_path = Path(short) / "socket"
+            self.assertLess(len(os.fsencode(socket_path)), 108)
+            with socket.socket(socket.AF_UNIX) as listener:
+                listener.bind(str(socket_path))
+                for replacement in (regular, fifo, directory, symlink, socket_path):
+                    with self.subTest(shape=replacement.name):
+                        self.assert_substitution_refused(replacement)
         self.assertEqual(b"must remain unchanged", regular.read_bytes())
 
     def test_real_wrong_character_device_refuses_without_leaking_descriptor(self):

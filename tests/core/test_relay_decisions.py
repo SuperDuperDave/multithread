@@ -927,8 +927,20 @@ class DecisionSourceProfileTests(unittest.TestCase):
     def test_original_source_cli_refuses_the_disposable_repository(self) -> None:
         result = self._run(CLI, self.owner)
         self.assertEqual(74, result.returncode, msg=result.stderr.decode())
-        self.assertIn(b"refuses a foreign workspace", result.stderr)
         self.assertFalse((self.owner / ".relay").exists())
+        self.assertEqual(b"", result.stdout)
+        # A checkout is bound to its own Git directory; an exported source tree
+        # has no binding. Both must refuse the disposable owner before writes.
+        source_git = subprocess.run(
+            ["git", "-C", str(SOURCE_DIR), "rev-parse", "--git-common-dir"],
+            capture_output=True, timeout=15, env=sanitized_env(),
+        )
+        if source_git.returncode == 0:
+            self.assertIn(b"refuses a foreign workspace", result.stderr)
+        else:
+            self.assertEqual(128, source_git.returncode, source_git.stderr.decode())
+            self.assertIn(b"not a git repository", source_git.stderr.lower())
+            self.assertIn(b"refuses an unbound workspace", result.stderr)
 
     def test_copied_candidate_succeeds_only_for_its_owner_repository(self) -> None:
         ok = self._run(self.cli, self.owner)

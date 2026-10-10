@@ -2848,14 +2848,19 @@ class BindTests(WakeCase):
 
     def test_a_digest_approval_needs_its_durable_file_and_records_the_path(self):
         self.bound()
-        approval = self.base / "approval.md"
+        # tempfile's default can be durable private CI staging. Put the negative
+        # fixture explicitly under a production nondurable root instead.
+        temporary = tempfile.TemporaryDirectory(prefix="relay-approval-", dir="/tmp")
+        self.addCleanup(temporary.cleanup)
+        approval = Path(temporary.name) / "approval.md"
+        self.assertTrue(approval.resolve().is_relative_to(Path("/tmp").resolve()))
         approval.write_text("Approved: move operator to the other conversation\nSigned off.\n")
         digest = "sha256:" + hashlib.sha256(approval.read_bytes()).hexdigest()
         code, out = self.approve(digest)
         self.assertEqual(4, code, out)
         self.assertIn("Pass --approval-file with the path of the durable file it hashes", out)
         code, out = self.approve(digest, "--approval-file", str(approval))
-        self.assertEqual(4, code, "the fixture lives in a temporary directory")
+        self.assertEqual(4, code, "the fixture lives under the nondurable /tmp root")
         self.assertIn("which isn't a durable place", out)
         with mock.patch.object(core_cli, "_NOT_DURABLE", ()):
             wrong = self.approve("sha256:" + "b" * 64, "--approval-file", str(approval))[1]
