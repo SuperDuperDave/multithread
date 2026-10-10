@@ -388,6 +388,7 @@ class _Driver:
         self.capture = None
         self.outcome_recorded = False
         self.had_problem = False
+        self.observation_lost = False
         self.catalog = None
         self.listing = None
         self.listing_deadline = None
@@ -604,17 +605,12 @@ class _Driver:
 
     def end_call(self, what, remedy=None):
         """A boundary the call set was crossed: withdraw any recorded answer and stop the call's own process group at
-        once, wherever this is read, during the turn or while its server shuts down. A reaped leader is left to
-        cleanup."""
+        once, wherever this is read, during the turn or while its server shuts down. The group may outlive its
+        leader."""
         submitted = {"requested": "its task may already have been sent",
                      "accepted": "Codex had already accepted its task"}.get(self.envelope.get("task_submission"),
                                                                             "no task was submitted")
-        self.envelope.update(state="uncertain", result=None)
-        if self.process.returncode is None:
-            try:
-                os.killpg(self.process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+        self.problem(what)
         raise _ProtocolError(f"{what}; the call was ended and {submitted}. Next: "
                              + (f"{remedy}, or inspect retained output." if remedy else "inspect retained output."))
 
@@ -1105,16 +1101,20 @@ class _Driver:
         # A Codex peer enforces its boundary throughout shutdown, too. Once interpretation is lost,
         # a previously completed turn no longer proves that boundary held for the whole call.
         self.had_problem = True
-        if observation_lost or not self.outcome_recorded:
+        self.observation_lost = self.observation_lost or observation_lost
+        if self.observation_lost or not self.outcome_recorded:
             self.envelope.update(state="uncertain", result=None)
-        if observation_lost and self.process.returncode is None:
+        self.envelope.update(needs_attention=True, message=message)
+        if observation_lost:
+            # Reaping the leader says nothing about descendants in its owned group.
             try:
                 os.killpg(self.process.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
-        self.envelope.update(needs_attention=True, message=message)
 
     def finish(self, require_answer=True):
+        if self.observation_lost:
+            return
         if self.terminal is None:
             raise _ProtocolError("Native output ended without a matching terminal turn; work may have occurred.")
         self.envelope.update(provider_subtype=self.terminal,
@@ -1209,7 +1209,7 @@ def run(process, task: bytes, repo: str, resume: str | None, directory: Path,
                        observation_lost=False)
         raise
     except OSError:
-        driver.problem("Native observation was unavailable; preserve partial work and inspect evidence before retrying.")
+        observation.fault("Native observation was unavailable; preserve partial work and inspect evidence before retrying.")
         raise
     finally:
         driver.observation_only = True

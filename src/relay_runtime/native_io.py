@@ -365,13 +365,19 @@ class Observation:
         if self.capture is not None:
             self.capture.fault()
         self.interpret = False
-        self.settle_deferred()
-        self.buffer.clear()
-        self.searched = 0
-        if self.driver is not None:
-            self.driver.problem(message)
-        else:
-            self.envelope.update(needs_attention=True, message=message)
+        # Revocation and owned-group termination precede fallible evidence writes.
+        # A broken sink cannot leave an old answer valid or queued bytes interpretable.
+        try:
+            if self.driver is not None:
+                self.driver.problem(message)
+            else:
+                self.envelope.update(needs_attention=True, message=message)
+        finally:
+            try:
+                self.settle_deferred()
+            finally:
+                self.buffer.clear()
+                self.searched = 0
 
     def drain(self):
         """Read at most four ready chunks; never wait, send, retry or exceed cap."""

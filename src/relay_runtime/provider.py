@@ -1141,9 +1141,9 @@ def _drain(observer):
     try:
         return observer.drain()
     except (ControlError, OSError):
-        # An unavailable receipt must not prevent termination of our process.
-        # Freeze interpretation; retain whatever raw output can still be read.
-        observer.interpret = False
+        # Native read/interpretation failures already transition through Observation.fault
+        # before fallible retention. Receipt/snapshot failures alone do not revoke a
+        # validated answer or disable continued native observation.
         observer.envelope.update(needs_attention=True,
                                  evidence_recording="Native cleanup or input receipt observation is unavailable; inspect retained evidence.")
         return False

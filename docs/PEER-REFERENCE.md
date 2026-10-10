@@ -66,6 +66,11 @@ closes native input and leads to owned-process cleanup. Only the captured prefix
 is retained. A Codex protocol-observation fault or capture overflow withdraws any
 previously completed answer (`state: uncertain`, `result: null`) and stops the
 owned process group immediately: the call can no longer monitor its boundary.
+Revocation precedes fallible evidence retention and remains in force even if
+queued completion bytes arrive during cleanup. The owned group is stopped even
+when its leader has already exited. Input-receipt or final evidence-recording
+failure alone leaves an independently validated answer with attention; usable
+native observation continues during checked cancellation and bounded shutdown.
 An unrestricted Claude call can preserve a previously observed answer with
 `needs_attention`; a restricted Claude call withholds it unless the entire
 stream was verified to its normal end.
