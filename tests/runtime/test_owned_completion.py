@@ -137,3 +137,134 @@ class OwnedCompletionTests(unittest.TestCase):
         self.assertFalse((directory / 'result.json').exists())
         self.assertFalse((displaced / 'capture-complete.json').exists())
         self.assertFalse((directory / 'capture-complete.json').exists())
+
+
+    def test_unavailable_waitid_still_terminates_owned_provider_and_descendant(self):
+        import errno
+        for failure in (errno.EPERM, errno.EINVAL, errno.ENOSYS):
+            with self.subTest(errno=failure):
+                marker = self.base / ('waitid-child-' + str(failure))
+                self.configure(spawn_child=str(marker), sleep=True)
+                original = os.waitid
+                def unavailable(*args):
+                    if marker.exists():
+                        raise OSError(failure, 'synthetic unavailable exit observation')
+                    return original(*args)
+                pidfd = leader_fd = None
+                try:
+                    with mock.patch.object(os, 'waitid', side_effect=unavailable):
+                        code, result, _ = self.invoke()
+                    try:
+                        leader_fd = os.pidfd_open(json.loads(self.receipt.read_text())['pid'])
+                    except ProcessLookupError:
+                        pass
+                    child = int(marker.read_text())
+                    try:
+                        pidfd = os.pidfd_open(child)
+                    except ProcessLookupError:
+                        pass
+                    if pidfd is not None:
+                        poll = select.poll()
+                        poll.register(pidfd, select.POLLIN)
+                        self.assertTrue(poll.poll(1000), 'owned descendant survived unusable waitid')
+                finally:
+                    if pidfd is not None:
+                        try:
+                            signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                        os.close(pidfd)
+                    if leader_fd is not None:
+                        try:
+                            signal.pidfd_send_signal(leader_fd, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                        os.close(leader_fd)
+
+    def test_lost_child_ownership_never_signals_cached_process_group(self):
+        import errno
+        with mock.patch.object(os, 'waitid', side_effect=ChildProcessError(errno.ECHILD, 'synthetic lost child')):
+            with mock.patch.object(os, 'killpg') as kill:
+                process = mock.Mock(pid=12345, returncode=None)
+                with self.assertRaises(ChildProcessError):
+                    provider._owned_exit(process)
+                provider._retire_owned_group(process)
+                provider._stop(process, immediate=True)
+                process.wait.assert_not_called()
+                kill.assert_not_called()
+
+    def test_marker_is_final_semantic_commit_without_later_revoking_checks(self):
+        from relay_runtime.native_io import TransportCapture
+        original_record = provider._atomic_record
+        original_check = TransportCapture._check_directories
+        committed = False
+        def record(directory, name, value, **kwargs):
+            nonlocal committed
+            original_record(directory, name, value, **kwargs)
+            if name == 'capture-complete.json':
+                committed = True
+        def check(capture):
+            if committed:
+                raise OSError('synthetic semantic validation after final commit')
+            original_check(capture)
+        with mock.patch.object(provider, '_atomic_record', side_effect=record):
+            with mock.patch.object(TransportCapture, '_check_directories', check):
+                code, result, directory = self.invoke('--capture-transport', 'e' * 64)
+        self.assertEqual(0, code, result)
+        self.assertEqual('complete', result['transport_capture']['status'])
+        self.assertTrue((directory / 'capture-complete.json').exists())
+
+    def test_post_commit_directory_close_fault_is_cleanup_diagnostic(self):
+        original_record, original_close = provider._atomic_record, os.close
+        committed = False
+        def record(directory, name, value, **kwargs):
+            nonlocal committed
+            original_record(directory, name, value, **kwargs)
+            if name == 'capture-complete.json':
+                committed = True
+        def close(fd):
+            directory = stat.S_ISDIR(os.fstat(fd).st_mode)
+            original_close(fd)
+            if committed and directory:
+                raise OSError('synthetic directory descriptor close fault')
+        with mock.patch.object(provider, '_atomic_record', side_effect=record):
+            with mock.patch.object(os, 'close', side_effect=close):
+                code, result, directory = self.invoke('--capture-transport', 'e' * 64)
+        self.assertEqual(0, code, result)
+        self.assertEqual('complete', result['transport_capture']['status'])
+        self.assertTrue(result['transport_capture']['post_commit_cleanup_unavailable'])
+        self.assertTrue((directory / 'capture-complete.json').exists())
+
+    def test_uncertain_marker_publication_retracts_binding_best_effort(self):
+        original = provider._atomic_record
+        def record(directory, name, value, **kwargs):
+            original(directory, name, value, **kwargs)
+            if name == 'capture-complete.json':
+                raise OSError('synthetic reported marker sync failure')
+        with mock.patch.object(provider, '_atomic_record', side_effect=record):
+            code, result, directory = self.invoke('--capture-transport', 'e' * 64)
+        self.assertNotEqual(0, code)
+        self.assertEqual(protocol.ANSWER, result['result'])
+        self.assertEqual('incomplete', result['transport_capture']['status'])
+        self.assertFalse((directory / 'capture-complete.json').exists())
+
+    def test_unretractable_marker_never_attests_caller_finalization(self):
+        original_record, original_unlink = provider._atomic_record, os.unlink
+        def record(directory, name, value, **kwargs):
+            original_record(directory, name, value, **kwargs)
+            if name == 'capture-complete.json':
+                raise OSError('synthetic reported marker sync failure')
+        def unlink(path, **kwargs):
+            if path == 'capture-complete.json':
+                raise OSError('synthetic unavailable marker retraction')
+            return original_unlink(path, **kwargs)
+        with mock.patch.object(provider, '_atomic_record', side_effect=record):
+            with mock.patch.object(os, 'unlink', side_effect=unlink):
+                code, result, directory = self.invoke('--capture-transport', 'e' * 64)
+        self.assertNotEqual(0, code)
+        self.assertEqual('incomplete', result['transport_capture']['status'])
+        binding = json.loads((directory / 'capture-complete.json').read_text())
+        self.assertIs(False, binding['proves_caller_finalization'])
+        import hashlib
+        self.assertEqual(binding['receipt_sha256'],
+                         hashlib.sha256((directory / 'result.json').read_bytes()).hexdigest())

@@ -9,6 +9,7 @@ workflow completion. Provider configuration comes from the installed worker.
 import argparse
 from collections import Counter
 from contextlib import contextmanager
+import errno
 import fcntl
 import hashlib
 import json
@@ -1281,11 +1282,24 @@ def _call_final_json(process, task, timeout, feedback, envelope):
                 raise
 
 
+class _ExitObservationUnavailable(OSError):
+    """The exit syscall is unavailable while unreaped child ownership remains."""
+
+
 def _owned_exit(process):
     """Observe our child's exit without releasing its PID/process-group identity."""
     if process.returncode is not None:
         return process.returncode
-    observed = os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+    try:
+        observed = os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+    except OSError as exc:
+        # ECHILD can mean another reaper relinquished ownership. Never signal
+        # that cached group ID. These syscall-capability failures do not reap.
+        if exc.errno == errno.ECHILD:
+            process._owned_child_lost = True
+        if exc.errno in (errno.EPERM, errno.EACCES, errno.EINVAL, errno.ENOSYS):
+            raise _ExitObservationUnavailable(exc.errno, "Native exit observation is unavailable") from None
+        raise
     if observed is None:
         return None
     return observed.si_status if observed.si_code == os.CLD_EXITED else -observed.si_status
@@ -1294,7 +1308,7 @@ def _owned_exit(process):
 def _retire_owned_group(process):
     # WNOWAIT kept the leader's PID reserved. Signal the created group before
     # reaping it; never use a cached PID after ownership was relinquished.
-    if process.returncode is not None:
+    if process.returncode is not None or getattr(process, "_owned_child_lost", False) is True:
         return
     try:
         os.killpg(process.pid, signal.SIGKILL)
@@ -1323,7 +1337,7 @@ def _wait(process, timeout, observer=None, feedback=None):
 def _stop(process, observer=None, *, immediate=False):
     if observer is not None and getattr(observer, "capture", None) is not None:
         observer.capture.fault()
-    if process.returncode is not None:
+    if process.returncode is not None or getattr(process, "_owned_child_lost", False) is True:
         # A reaped leader cannot pin the former group's identity. Normal
         # ownership retirement already signaled it before reaping.
         if observer is not None:
@@ -1924,6 +1938,16 @@ def _run_peer(args, interruption):
                         _retire_owned_group(process)
                         if observer is not None:
                             _drain(observer)
+            except _ExitObservationUnavailable:
+                # Capability failure left our child unreaped. Retire the group
+                # before the portable waitpid path releases its identity.
+                try:
+                    _retire_owned_group(process)
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+                envelope["owned_process_cleanup"] = "Exit observation unavailable; inspect owned termination and retained evidence"
+                _call_problem(envelope, "Owned exit observation was unavailable; inspect retained evidence.")
+                code = 1
             except (OSError, subprocess.TimeoutExpired):
                 _call_problem(envelope, "Owned process cleanup could not be confirmed; inspect retained evidence.")
                 code = 1

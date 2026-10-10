@@ -588,7 +588,7 @@ class TransportCapture:
         self.report["status"] = "incomplete"
         self.report.pop("inventory_sha256", None)
 
-    def close_directories(self):
+    def close_directories(self, *, committed=False):
         for attribute in ("directory_fd", "parent_fd"):
             fd = getattr(self, attribute)
             setattr(self, attribute, None)
@@ -596,34 +596,50 @@ class TransportCapture:
                 try:
                     os.close(fd)
                 except OSError:
-                    self.fault()
+                    if committed:
+                        # Closing an already-used directory descriptor cannot
+                        # change the bytes bound at the semantic commit point.
+                        self.report["post_commit_cleanup_unavailable"] = True
+                    else:
+                        self.fault()
 
     def publish_receipt(self, directory, envelope, record):
-        """Bind a durable matching receipt; inventory/receipt flags alone never complete capture.
+        """Commit byte-binding evidence after every semantic capture precondition.
 
-        The marker is created only after result.json's file and parent sync
-        have succeeded. If its own publication fails, a surviving marker
-        can bind only that already-durable receipt, never an unconfirmed one.
-        These are observations of our files, not authenticated custody.
+        Publication is the final semantic commit. Later descriptor cleanup is
+        diagnostic, not evidence about the committed bytes. A surviving marker
+        after uncertain sync proves recovered binding, not caller-observed
+        successful finalization or authenticated custody.
         """
+        marker_started = committed = False
         try:
             self._check_directories()
             self.report["completion_binding"] = "capture-complete.json"
             record(directory, "result.json", envelope, sync_directory=True, directory_fd=self.parent_fd)
             self._check_directories()
             body = json.dumps(envelope, ensure_ascii=True, sort_keys=True).encode("utf-8")
+            marker_started = True
             record(directory, "capture-complete.json", {
                 "schema": 1, "status": "receipt_binding",
                 "receipt_sha256": hashlib.sha256(body).hexdigest(),
                 "inventory_sha256": self.report["inventory_sha256"],
+                "proves_caller_finalization": False,
                 "capture_authenticated": False, "review_accepted": False, "release_approved": False},
                 sync_directory=True, directory_fd=self.parent_fd)
-            self._check_directories()
+            committed = True
         except OSError:
             self.fault()
+            if marker_started:
+                # Retraction is best effort: failure cannot turn uncertainty
+                # into success, and recovered files never attest caller success.
+                try:
+                    os.unlink("capture-complete.json", dir_fd=self.parent_fd)
+                    os.fsync(self.parent_fd)
+                except OSError:
+                    pass
             raise
         finally:
-            self.close_directories()
+            self.close_directories(committed=committed)
 
     def finish(self, exit_code, *, clean, keep_directories=False):
         """Inventory after the existing owner finishes cleanup; never wait or kill."""

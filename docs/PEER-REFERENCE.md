@@ -497,14 +497,18 @@ transport recording reached observed EOF, closed input and a clean natural
 zero exit, with bounded owned-group termination before leader reap and no
 unresolved driver input/problem or capture fault. Exit observation uses
 WNOWAIT so the leader's PID remains reserved through group cleanup; hosts
-without that capability refuse before starting. Escaped groups are outside
-this cleanup scope. It also
+without the API names refuse before starting. A runtime capability error
+(EPERM/EACCES/EINVAL/ENOSYS) requests owned-group termination before the
+portable reap path; its outcome remains unqualified. ECHILD or an already
+reaped leader never permits signalling a cached group ID. Escaped groups are
+outside this cleanup scope. It also
 requires a private closed file inventory and completed file/directory syncs.
 The call and transport directories retain their descriptors and original
-device/inode identities. Construction and checks before/after publication
-require both visible names to match those directories, owned by the current
-UID with mode0700. Observed directory changes refuse completion without
-repairing permissions. These checks do not authenticate custody or exclude
+device/inode identities. Construction, inventory publication and checks
+immediately before the final marker commit require both visible names to
+match those directories, owned by the current UID with mode0700. Observed
+directory changes before that commit refuse completion without repairing
+permissions. These checks do not authenticate custody or exclude
 changes between observations by another process with the same UID.
 The atomically linked `inventory.json` is explicitly `inventory_only`;
 alone it never proves completion. Neither does a receipt's complete flag.
@@ -515,10 +519,20 @@ the retained call-directory descriptor only after receipt file and parent
 directory syncs succeed. Failure after receipt rename but before its parent
 sync can leave a premature complete flag without a binding; consumers must
 treat that as incomplete. A marker publication failure makes the displayed
-capture incomplete; any surviving matching marker refers to a receipt whose
-durability was already confirmed. Lost markers after a host failure give
-incomplete evidence, never inferred completion. These files do not prove
-power-loss behavior, authenticated custody or release acceptance.
+capture incomplete and attempts to retract the marker through the retained
+parent descriptor. Retraction can itself fail. A surviving matching marker
+then establishes recovered byte binding to a previously durable receipt;
+it does not establish that the original caller observed successful marker
+sync or finalization (`proves_caller_finalization=false`). Original successful
+finalization requires the separately observed caller outcome. Marker
+publication and parent sync are the final semantic commit: no later path
+validation can revoke that commit. Directory-descriptor close failures after
+commit are `post_commit_cleanup_unavailable` diagnostics; capture-member
+close failures before commit still refuse completion. Same-UID changes after
+the last observation remain outside the custody guarantee. Lost markers after
+a host failure give incomplete evidence, never inferred completion. These
+files do not prove power-loss behavior, authenticated custody or release
+acceptance.
 
 Caps are16MiB per stream,8192 journal events and64KiB per chunk. Overflow,
 recording failures, unknown closure, protocol faults, interruption, timeout,

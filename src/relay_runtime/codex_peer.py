@@ -1116,8 +1116,9 @@ class _Driver:
         if self.observation_lost or not self.outcome_recorded:
             self.envelope.update(state="uncertain", result=None)
         self.envelope.update(needs_attention=True, message=message)
-        if observation_lost and getattr(self.process, "_owned_group_retired", False) is not True:
-            # Reaping the leader says nothing about descendants in its owned group.
+        if (observation_lost and getattr(self.process, "_owned_group_retired", False) is not True
+                and getattr(self.process, "_owned_child_lost", False) is not True):
+            # Signal only while the child still pins its owned group identity.
             try:
                 os.killpg(self.process.pid, signal.SIGKILL)
             except ProcessLookupError:
