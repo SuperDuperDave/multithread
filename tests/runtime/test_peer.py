@@ -1418,33 +1418,38 @@ class PeerTests(unittest.TestCase):
 
     def test_a_late_fault_drops_a_stored_partial_and_kills_what_outlives_the_leader(self):
         from relay_runtime import claude_peer
-        # The leader exits and is reaped while a descendant keeps running in its group: a restricted fault kills the
-        # descendant at once, with no shutdown grace.
+        # The exited leader stays unreaped until group retirement. A restricted
+        # fault kills its owned descendant at once, with no shutdown grace.
         process = subprocess.Popen(["sh", "-c", "sleep 30 & echo $!; exit 0"], start_new_session=True,
                                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         descendant = int(process.stdout.readline())
         process.stdout.close()
-        process.wait()
-        os.killpg(process.pid, 0)  # the descendant still holds the group
-        def running():  # a killed process awaiting its reaper is a zombie, not a survivor
+        descendant_fd = None
+        try:
+            self.assertEqual(0, peer._wait(process, 2))
+            self.assertIsNone(process.returncode)
+            descendant_fd = os.pidfd_open(descendant)
+            envelope = {"partial_result": "words written before the fault"}
+            driver = claude_peer._Driver(process, b"task", str(self.repo), None, envelope, 1, None, tools=[])
+            driver.results = [{"result_excerpt": "THE ANSWER", "result_excerpt_truncated": False}]
+            self.assertIsInstance(driver.fault("outside the registry"), claude_peer.ProtocolError)
+            driver.problem("outside the registry")
+            self.assertNotIn("partial_result", envelope)
+            self.assertIsNone(driver.results[0]["result_excerpt"])
+            import select
+            poll = select.poll()
+            poll.register(descendant_fd, select.POLLIN)
+            self.assertTrue(poll.poll(1000), "the owned descendant outlived the restricted fault")
+        finally:
             try:
-                stat = Path(f"/proc/{descendant}/stat").read_text()
-            except (FileNotFoundError, ProcessLookupError):  # reaped between opening and reading
-                return False
-            return stat.rsplit(")", 1)[1].split()[0] not in ("Z", "X")
-        envelope = {"partial_result": "words written before the fault"}
-        driver = claude_peer._Driver(process, b"task", str(self.repo), None, envelope, 1, None, tools=[])
-        driver.results = [{"result_excerpt": "THE ANSWER", "result_excerpt_truncated": False}]
-        self.assertIsInstance(driver.fault("outside the registry"), claude_peer.ProtocolError)
-        driver.problem("outside the registry")  # every fault of a restricted call ends here
-        self.assertNotIn("partial_result", envelope)
-        self.assertIsNone(driver.results[0]["result_excerpt"])
-        deadline = time.monotonic() + 5
-        while time.monotonic() < deadline and running():
-            time.sleep(0.02)
-        if running():
-            os.kill(descendant, signal.SIGKILL)
-            self.fail("the descendant outlived the restricted fault")
+                peer._retire_owned_group(process)
+            finally:
+                if descendant_fd is not None:
+                    try:
+                        signal.pidfd_send_signal(descendant_fd, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    os.close(descendant_fd)
 
     def test_parallel_calls_read_the_windows_policy_once_and_one_at_a_time(self):
         # WSL's interop drops some launches made in a burst (each fails after 10 s), so parallel restricted calls

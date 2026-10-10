@@ -321,3 +321,29 @@ class OwnedCompletionTests(unittest.TestCase):
             with self.assertRaises(subprocess.TimeoutExpired):
                 provider._stop(process, immediate=True)
         process.wait.assert_called_once_with(timeout=1)
+
+    def test_late_server_request_keeps_answer_but_marks_capture_incomplete(self):
+        request = {'id': 7001, 'method': 'item/permissions/requestApproval', 'params': {}}
+        self.configure(later_events=[request])
+        code, result, directory = self.invoke('--capture-transport', 'e' * 64)
+        self.assertEqual((0, protocol.ANSWER), (code, result['result']))
+        self.assertEqual([request['method']], result['unsupported_native_requests'])
+        self.assertTrue(result['needs_attention'])
+        self.assertEqual('incomplete', result['transport_capture']['status'])
+        self.assertFalse((directory / 'capture-complete.json').exists())
+
+    def test_late_server_request_attention_survives_finish_without_response(self):
+        from types import SimpleNamespace
+        driver = codex_peer._Driver(SimpleNamespace(pid=12345, returncode=0),
+                                   b'synthetic task', '/fixture', None, {}, 2, None)
+        driver.session, driver.turn = protocol.THREAD, protocol.TURN
+        driver.message(json.dumps(protocol.item()).encode())
+        driver.message(json.dumps(protocol.completed()).encode())
+        driver.observation_only = True
+        pending_output = bytes(driver.outgoing)
+        driver.message(json.dumps({'id': 7002, 'method': 'synthetic/unknown', 'params': {}}).encode())
+        self.assertTrue(driver.envelope['needs_attention'])
+        driver.finish()
+        self.assertEqual(protocol.ANSWER, driver.envelope['result'])
+        self.assertTrue(driver.envelope['needs_attention'])
+        self.assertEqual(pending_output, bytes(driver.outgoing))

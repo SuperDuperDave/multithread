@@ -710,6 +710,11 @@ class _Driver:
             raise _ProtocolError("Malformed native server request; inspect retained output.")
         if self.observation_only:
             self.detail(self.unknown_requests, method[:200])
+            # Cleanup has closed stdin, so record the request without sending
+            # another response. Preserve a validated answer but do not call
+            # the remaining protocol/capture clean after an unanswered request.
+            self.problem("Native requests arrived after task completion; inspect retained output.",
+                         observation_lost=False)
             return
         if method in ("item/commandExecution/requestApproval", "item/fileChange/requestApproval"):
             result = {"decision": "decline"}
