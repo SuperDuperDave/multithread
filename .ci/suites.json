@@ -1,0 +1,17 @@
+{
+  "schema": 1,
+  "suites": {
+    "linux": {
+      "host_class": "linux",
+      "context": "ci/linux",
+      "env_pass": [],
+      "steps": [
+        {
+          "name": "tests",
+          "argv": ["python3", "-B", "tests/run_tests.py", "--strict"],
+          "timeout": 1200
+        }
+      ]
+    }
+  }
+}
