@@ -1,6 +1,8 @@
 """Installed provider-hook acceptance; no provider process or real account config."""
 
 import hashlib
+from contextlib import redirect_stdout
+import io
 import fcntl
 import json
 import os
@@ -13,6 +15,7 @@ import subprocess
 import tempfile
 from types import SimpleNamespace
 import unittest
+from unittest import mock
 
 import test_installed as installed
 from relay_runtime import cli as runtimecli
@@ -106,14 +109,21 @@ class ProviderHookTests(unittest.TestCase):
         self.assertNotIn("not being recorded", result.stdout)
         self.assertTrue(value["systemMessage"].startswith(
             "Multithread could not deliver verified ledger context for this step (" + because
-            + "); this session's record may be incomplete. Run: "), value["systemMessage"])
+            + "); this session's record may be incomplete. "), value["systemMessage"])
         self.assertNotIn("MULTITHREAD BRIEF", context)
         self.assertNotIn("\n", context)
         fix = " setup --repo " + shlex.quote(str(repo or self.fixture.repo)) + " --check"
         self.assertTrue(context.endswith(fix), context)
         self.assertIn(because, value["systemMessage"])
-        self.assertTrue(value["systemMessage"].endswith(fix))
-        self.assertLess(len(result.stdout), 1024)
+        self.assertIn("exact setup --check command", value["systemMessage"])
+        self.assertNotIn(fix, value["systemMessage"])
+        # The command is lossless, so its size depends on the filesystem paths.
+        # The remaining serialized UTF-8 warning has a fixed overhead budget.
+        repair = runtimecli._hook_repair_command(repo or self.fixture.repo)
+        self.assertEqual(1, context.count(repair))
+        bounded = {**value, "hookSpecificOutput": {**output, "additionalContext": context.removesuffix(repair)}}
+        overhead = json.dumps(bounded, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        self.assertLess(len(overhead), 2048)
         return value
 
     def silent(self, result, *, degraded=False):
@@ -578,6 +588,51 @@ RelayStore.brief = fail_brief
         self.context(self.hook("claude", "UserPromptSubmit", "bounded-session"),
                      "claude", "UserPromptSubmit", "bounded-session")
         self.assertEqual(rows, self.rows())
+
+
+class HookWarningContractTests(unittest.TestCase):
+    def test_exact_repair_runs_once_for_long_unicode_control_and_shell_paths(self):
+        with tempfile.TemporaryDirectory(prefix="relay-warning-", dir="/tmp") as short:
+            base = Path(short)
+            launcher = base / "launcher '雪\n"
+            record = base / "argv.json"
+            launcher.write_text("#!/usr/bin/python3 -IS\nimport json,sys\n"
+                                + "open(" + repr(str(record)) + ", 'w').write(json.dumps(sys.argv[1:]))\n")
+            launcher.chmod(0o700)
+            plain_launcher = base / "launcher"
+            plain_launcher.write_text(launcher.read_text())
+            plain_launcher.chmod(0o700)
+            marker = base / "injected"
+            paths = [base / "short", base / ("x" * 200) / ("雪" * 80),
+                     base / ("quote' ;$(touch " + str(marker) + ")\n\t雪\n")]
+            for repo in paths:
+                for reason in runtimecli._WARNING_REASONS:
+                    with self.subTest(repo=str(repo), reason=reason):
+                        out = io.StringIO()
+                        args = SimpleNamespace(repo=repo, provider_event="SessionStart",
+                                               inbox_warning="😀" * 300 + "\nforged context")
+                        with redirect_stdout(out), mock.patch.object(runtimecli, "account_launcher",
+                                                                     return_value=launcher if "\n" in str(repo)
+                                                                     else plain_launcher):
+                            runtimecli._hook_warning(args, reason, enrolled=True)
+                        value = json.loads(out.getvalue())
+                        context = value["hookSpecificOutput"]["additionalContext"]
+                        repair = context.split("the fix starts with: ", 1)[1]
+                        self.assertNotIn("\n", context)
+                        self.assertNotIn("\t", context)
+                        self.assertIn("record may be incomplete", context)
+                        self.assertNotIn("MULTITHREAD BRIEF", context)
+                        self.assertNotIn(repair, value["systemMessage"])
+                        bounded = json.loads(out.getvalue())
+                        bounded["hookSpecificOutput"]["additionalContext"] = context.removesuffix(repair)
+                        self.assertLess(len(json.dumps(bounded, ensure_ascii=False,
+                                        separators=(",", ":")).encode("utf-8")), 2048)
+                        result = subprocess.run(["/bin/sh", "-c", repair], capture_output=True, timeout=5,
+                                                env={"PATH": "/usr/bin:/bin"})
+                        self.assertEqual(0, result.returncode, result.stderr)
+                        self.assertEqual(["setup", "--repo", str(repo.absolute()), "--check"],
+                                         json.loads(record.read_text()))
+                        self.assertFalse(marker.exists())
 
 
 class PendingReminderCacheTests(unittest.TestCase):

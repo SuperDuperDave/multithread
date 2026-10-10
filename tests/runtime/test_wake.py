@@ -2119,7 +2119,7 @@ class ClaudeTests(WakeCase):
         with redirect_stdout(io.StringIO()) as out:
             runtime_cli._hook_warning(args, "ledger", enrolled=True)
         shown = json.loads(out.getvalue())
-        self.assertTrue(shown["systemMessage"].startswith(warning + "\n"), "a failed brief still carries it")
+            self.assertTrue(shown["systemMessage"].startswith(warning + ". "), "a failed brief still carries it")
         self.assertTrue(shown["hookSpecificOutput"]["additionalContext"].startswith(warning + "\n\n"))
 
     def test_a_process_id_reused_while_connecting_receives_nothing(self):
@@ -2458,7 +2458,7 @@ class SignalWakeTests(ClaudeTests):
             core_cli.main(["--repo", str(other), "--home", str(self.other_home), "brief", "--agent", "claude",
                            "--session", "self"])
         self.assertIn("Wakes pointing at another checkout's ledger", out.getvalue())
-        self.assertIn(f'at="{self.repo}" ref_seq={seq}', out.getvalue())
+        self.assertIn(f'at={core_cli._quoted(self.repo, 160)} ref_seq={seq}', out.getvalue())
         with redirect_stdout(io.StringIO()):
             core_cli.main(["--repo", str(self.repo), "--home", str(self.home), "brief", "--agent", "claude",
                            "--session", "self"])
@@ -2648,6 +2648,26 @@ class SignalWakeTests(ClaudeTests):
         self.assertEqual([], self.signals())
 
 
+class BoundedDiagnosticTests(unittest.TestCase):
+    def test_approval_display_is_one_bounded_line_without_changing_the_reference(self):
+        for raw, shown in [("short/雪", "short/雪"), ("a" * 160, "a" * 160),
+                           ("a" * 161, "a" * 159 + "…"),
+                           ("quote'\n\t\x00雪", "quote'\\n\\t\\u0000雪")]:
+            with self.subTest(raw=raw):
+                self.assertEqual(shown, core_cli._shown(raw))
+                self.assertLessEqual(len(shown), 160)
+                self.assertNotIn("\n", shown)
+
+    def test_brief_display_retains_json_quoting_and_the_declared_character_limit(self):
+        for raw, shown in [('short"雪\n', 'short"雪\n'), ("a" * 160, "a" * 160),
+                           ("a" * 161, "a" * 157 + "...")]:
+            with self.subTest(raw=raw):
+                encoded = core_cli._quoted(raw, 160)
+                self.assertEqual(shown, json.loads(encoded))
+                self.assertNotIn("\n", encoded)
+                self.assertLessEqual(len(json.loads(encoded)), 160)
+
+
 class BindTests(WakeCase):
     def test_paused_role_stays_paused_through_refresh_and_authorized_handover(self):
         self.bound()
@@ -2823,7 +2843,7 @@ class BindTests(WakeCase):
         missing = "git:" + "0" * 40
         code, out = self.approve(missing)
         self.assertEqual((4, before), (code, len(self.events())), out)
-        self.assertIn(f"--approval-ref {missing} isn't an object in {self.repo}", out)
+        self.assertIn(f"--approval-ref {missing} isn't an object in {core_cli._shown(self.repo)}", out)
         self.assertIn("pass --approval-repo for the repository that holds it", out)
         elsewhere = self.base / "approvals"
         elsewhere.mkdir()
@@ -2834,13 +2854,15 @@ class BindTests(WakeCase):
         self.assertEqual(4, self.approve(ref)[0], "not in the bound checkout")
         code, out = self.approve(ref, "--approval-repo", str(elsewhere))
         self.assertEqual(0, code, out)
-        self.assertIn(f"Approval: git commit {ref[4:16]} in {elsewhere}: \"Approve the operator handover\" (", out)
+        self.assertIn(f"Approval: git commit {ref[4:16]} in {core_cli._shown(elsewhere)}: \"Approve the operator handover\" (", out)
         self.assertEqual(ref, self.events("wake.bound")[-1]["meta"]["approval_ref"])
+        self.assertEqual(str(elsewhere), core_cli.resolve_approval(ref, self.repo,
+                         approval_repo=str(elsewhere))["repo"], "structured identity is never clipped")
         (self.base / "not-a-repo").mkdir()
         for nowhere in (self.base / "no-such-repo", self.base / "not-a-repo"):
             code, out = self.approve(ref, "--approval-repo", str(nowhere))
             self.assertEqual(4, code, out)
-            self.assertIn(f"{nowhere} isn't a readable git repository", out, "not a missing object")
+            self.assertIn(f"{core_cli._shown(nowhere)} isn't a readable git repository", out, "not a missing object")
             self.assertIn("Pass --approval-repo with the repository that holds the approval", out)
         code, out = self.approve("git:--output=x" + "0" * 26)
         self.assertEqual(4, code, "never an option to git")
@@ -2889,7 +2911,7 @@ class BindTests(WakeCase):
             finally:
                 approval.chmod(0o600)
             self.assertEqual(4, code, out)
-            self.assertIn(f"--approval-file {approval} can't be read", out)
+            self.assertIn(f"--approval-file {core_cli._shown(approval)} can't be read", out)
             self.assertIn("Make it readable by this user", out)
             code, out = self.approve(digest, "--approval-file", str(pipe))  # opening a pipe must not wait for a writer
             self.assertEqual(4, code, out)

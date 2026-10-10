@@ -318,6 +318,18 @@ def _enrolled(repo, registry=None):
         return False
 
 
+def _hook_repair_command(repo):
+    """One-line shell command retaining exact filesystem argument bytes."""
+    argv = [str(account_launcher()), "setup", "--repo", str(Path(repo).absolute()), "--check"]
+    if all(character.isprintable() for word in argv for character in word):
+        return shlex.join(argv)
+    # Shell quotes permit literal newlines. For control/surrogate paths use an
+    # ASCII Python byte literal instead, retaining even trailing newline bytes.
+    encoded = [os.fsencode(word) for word in argv]
+    code = "import os; os.execv(" + repr(encoded[0]) + ", " + repr(encoded) + ")"
+    return shlex.join(["/usr/bin/python3", "-I", "-S", "-c", code])
+
+
 def _hook_warning(args, reason, *, enrolled=None, registry=None):
     """Make a missed ledger step visible: one line for the agent, one for the person.
 
@@ -328,7 +340,7 @@ def _hook_warning(args, reason, *, enrolled=None, registry=None):
     repo = args.repo or os.getcwd()
     if event not in _WARNED_EVENTS or not (_enrolled(repo, registry) if enrolled is None else enrolled):
         return
-    fix = shlex.join([str(account_launcher()), "setup", "--repo", str(Path(repo).absolute()), "--check"])
+    fix = _hook_repair_command(repo)
     because = _WARNING_REASONS[reason]
     # One failed invocation shows only that this step's context is missing:
     # earlier or later events of the session may still have been recorded.
@@ -336,10 +348,17 @@ def _hook_warning(args, reason, *, enrolled=None, registry=None):
                "deliver verified ledger context this time (" + because + "). This session's Multithread record may "
                "be incomplete, and this step shows no brief. Tell the person; the fix starts with: " + fix)
     shown = ("Multithread could not deliver verified ledger context for this step (" + because + "); this "
-             "session's record may be incomplete. Run: " + fix)
+             "session's record may be incomplete. See the agent's warning for the exact setup --check command.")
     inboxes = getattr(args, "inbox_warning", None)
     if inboxes:
-        context, shown = inboxes + "\n\n" + context, inboxes + "\n" + shown
+        # Human context is a bounded projection, never an executable identity.
+        notice = core_cli._shown(inboxes, 512)
+        encoded = notice.encode("utf-8")
+        if len(encoded) > 512:
+            notice = encoded[:509].decode("utf-8", errors="ignore") + "…"
+        if notice.endswith("…") and notice != inboxes:
+            notice += " [inbox notice clipped]"
+        context, shown = notice + ". " + context, notice + ". " + shown
     print(json.dumps({"systemMessage": shown,
                       "hookSpecificOutput": {"hookEventName": event, "additionalContext": context}},
                      ensure_ascii=False, separators=(",", ":")))

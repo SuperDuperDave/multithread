@@ -147,6 +147,17 @@ that refused or failed) returns one visible warning instead of context:
 MULTITHREAD WARNING: this checkout is enrolled, but Multithread's SessionStart hook could not deliver verified ledger context this time (REASON). This session's Multithread record may be incomplete, and this step shows no brief. Tell the person; the fix starts with: /ABSOLUTE/ACCOUNT/HOME/.local/bin/multithread setup --repo /ABSOLUTE/CHECKOUT --check
 ```
 
+The warning carries the exact runnable repair command once, in the agent's
+additional context; the person-facing message points to that warning.
+The context is one line. Ordinary paths use POSIX shell quoting; paths with
+control or surrogate characters use an isolated Python execv command with
+exact filesystem byte literals, including trailing newlines. No command or
+authoritative path is clipped. Optional inbox notices are control-escaped
+and clipped to512 UTF-8 bytes, with an explicit clipping note. Fixed inbox
+custody warnings fit without clipping. The serialized UTF-8 warning has
+less than2048 bytes of fixed overhead, plus the JSON-encoded repair command;
+it has no universal1024-character limit across arbitrary path lengths.
+
 One failed invocation shows only that this step's context is missing: the
 startup event may already be saved, and later steps may succeed. The warning
 also carries a `systemMessage` for the person. REASON is one of: the
