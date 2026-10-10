@@ -1922,7 +1922,6 @@ def _run_peer(args, interruption):
                         _call_problem(envelope, "The owned provider required cleanup; inspect its observed turn and retained evidence.")
                     else:
                         _retire_owned_group(process)
-                        envelope["owned_process_cleanup"] = "owned group termination requested before leader reap"
                         if observer is not None:
                             _drain(observer)
             except (OSError, subprocess.TimeoutExpired):
