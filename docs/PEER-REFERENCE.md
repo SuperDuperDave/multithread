@@ -71,6 +71,9 @@ queued completion bytes arrive during cleanup. The owned group is stopped even
 when its leader has already exited. Input-receipt or final evidence-recording
 failure alone leaves an independently validated answer with attention; usable
 native observation continues during checked cancellation and bounded shutdown.
+Unreadable thread security settings and malformed sandbox reports also end the
+Codex call. MCP names and plugin IDs use bounded native identities; status replies
+are limited to 100 servers per page and 500 across the five-page observation.
 An unrestricted Claude call can preserve a previously observed answer with
 `needs_attention`; a restricted Claude call withholds it unless the entire
 stream was verified to its normal end.

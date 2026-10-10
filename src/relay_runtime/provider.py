@@ -1948,6 +1948,9 @@ def _run_peer(args, interruption):
         try:
             _atomic_record(directory, "result.json", envelope)
         except OSError:
+            if capture is not None:
+                # The raw inventory cannot establish completion without its terminal receipt.
+                capture.fault()
             envelope.pop("follow_up_preparation", None)
             envelope["needs_attention"] = True
             envelope["evidence_recording"] = "unavailable; preserve this returned result"

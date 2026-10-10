@@ -992,10 +992,8 @@ class CodexProtocolTests(unittest.TestCase):
                 self.assertEqual(UNOBSERVED, result["model_observation"])
                 self.assertEqual("unknown", result["effective_effort"])
 
-    def test_an_unusable_settings_report_clears_rather_than_keeps_an_earlier_claim(self):
-        unreadable = settings_notification()
-        unreadable["params"]["threadSettings"] = [MODEL, EFFORT]
-        for event in (unreadable, settings_notification(None, None), settings_notification("", "x\ny")):
+    def test_unusable_model_fields_clear_rather_than_keep_an_earlier_claim(self):
+        for event in (settings_notification(None, None), settings_notification("", "x\ny")):
             with self.subTest(event=event["params"]["threadSettings"]):
                 self.configure(thread_result_updates={"reasoningEffort": EFFORT},
                                events=[event, item(), completed()])

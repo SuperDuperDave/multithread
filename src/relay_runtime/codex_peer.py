@@ -33,6 +33,7 @@ _MAX_LISTING = 1024 * 1024
 _MODEL_LIST_PAGES = 32
 _MODEL_LIST_SECONDS = 10
 _MCP_STATUS_PAGES = 5  # bounded: what runs is listed before the task, not browsed
+_MCP_STATUS_PAGE_SIZE = 100  # enforce the requested size; at most 500 server identities
 _FEATURE_PAGES = 5  # Codex 0.161 lists its 160 features in one page
 # Child threads are always off for a peer; plugins and apps each unless the call allows them. Codex's own per-thread
 # feature list must confirm each before the task goes out.
@@ -45,7 +46,7 @@ _NO_ESCALATION = {"approvalPolicy": "never", "approvalsReviewer": "user"}
 
 def _server_kind(name, plugin):
     """What a listed MCP server is, judged from Codex's report. The apps' server name is reserved."""
-    if not (isinstance(name, str) and name) or not (plugin is None or isinstance(plugin, str) and plugin):
+    if not _identity(name) or not (plugin is None or _identity(plugin)):
         return "malformed"
     if name == _APPS_SERVER:
         return "apps" if plugin is None else "reserved"
@@ -518,7 +519,7 @@ class _Driver:
 
     def list_mcp(self, cursor):
         self.mcp_pages += 1
-        self.request("mcpServerStatus/list", {"threadId": self.session, "detail": "toolsAndAuthOnly", "limit": 100,
+        self.request("mcpServerStatus/list", {"threadId": self.session, "detail": "toolsAndAuthOnly", "limit": _MCP_STATUS_PAGE_SIZE,
                                               **({"cursor": cursor} if cursor is not None else {})})
 
     def mcp_listed(self, result):
@@ -527,7 +528,8 @@ class _Driver:
         plugins = self.envelope.setdefault("provider_plugins", {"mode": "off", "apps_mode": "off"})
         page = result.get("data") if isinstance(result, dict) else None
         cursor = result.get("nextCursor") if isinstance(result, dict) else None
-        readable = (isinstance(page, list) and all(isinstance(server, dict) for server in page)
+        readable = (isinstance(page, list) and len(page) <= _MCP_STATUS_PAGE_SIZE
+                    and all(isinstance(server, dict) for server in page)
                     and (cursor is None or isinstance(cursor, str) and bool(cursor)))
         if readable:
             self.mcp_read += 1
@@ -881,9 +883,11 @@ class _Driver:
             raise _ProtocolError("Malformed native notification; inspect retained output.")
         if method == "mcpServer/startupStatus/updated":
             return self.mcp_started(params)
-        if method == "thread/settings/updated" and isinstance(params.get("threadSettings"), dict):
+        if method == "thread/settings/updated":
             # Escalation must stay off for the whole call, on any thread this app-server runs.
-            settings = params["threadSettings"]
+            settings = params.get("threadSettings")
+            if not isinstance(settings, dict):
+                return self.end_call("Codex reported unreadable thread security settings")
             drifted = {key: settings[key] for key, safe in (("approvalPolicy", "never"), ("approvalsReviewer", "user"))
                        if key in settings and settings[key] != safe}
             profile = (self.envelope.get("read_scope") or {}).get("profile")
@@ -891,7 +895,8 @@ class _Driver:
                     "id": profile, "extends": None}:
                 drifted["activePermissionProfile"] = settings["activePermissionProfile"]
             sandbox = settings.get("sandboxPolicy")
-            if profile and isinstance(sandbox, dict) and (sandbox.get("type") != "readOnly" or sandbox.get("networkAccess")):
+            if profile and "sandboxPolicy" in settings and (not isinstance(sandbox, dict)
+                    or sandbox.get("type") != "readOnly" or sandbox.get("networkAccess", False) is not False):
                 drifted["sandboxPolicy"] = sandbox
             if drifted:
                 self.envelope.update(native_approval_policy=settings.get("approvalPolicy")
@@ -917,8 +922,7 @@ class _Driver:
             # Thread settings carry no turn. One sent before Codex accepted this
             # call's turn may predate its override, so only a later one counts.
             if self.turn is not None:
-                settings = params.get("threadSettings")
-                settings = settings if isinstance(settings, dict) else {}
+                settings = params["threadSettings"]
                 self.observe("codex_thread_settings", {"model": settings.get("model"),
                                                        "effort": settings.get("effort")})
             return
