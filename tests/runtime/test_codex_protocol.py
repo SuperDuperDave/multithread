@@ -199,6 +199,8 @@ while True:
     elif method == 'mcpServerStatus/list':
         for event in spec.get('before_mcp_response', []):
             emit(event)
+        if spec.get('mcp_stall_after_activity'):
+            time.sleep(20)
         if spec.get('mcp_error'):
             emit({'id': message['id'], 'error': {'code': -32601, 'message': 'fixture: no such method'}})
         else:

@@ -2,6 +2,7 @@
 import json
 from pathlib import Path
 import sys
+import time
 import unittest
 from unittest import mock
 
@@ -17,6 +18,25 @@ class BoundaryShapeTests(unittest.TestCase):
     configure = protocol.CodexProtocolTests.configure
     invoke = protocol.CodexProtocolTests.invoke
     recorded_requests = protocol.CodexProtocolTests.recorded_requests
+
+    def test_known_disallowed_early_activity_stops_without_waiting_for_inventory(self):
+        cases = [(('--allow-plugins',), 'codex_apps'),
+                 (('--allow-apps',), 'fixture-plugin'),
+                 (('--allow-plugins', '--allow-apps'), 'bad' + chr(10)),
+                 (('--allow-plugins', '--allow-apps'), [])]
+        for flags, name in cases:
+            with self.subTest(flags=flags, name=name):
+                self.configure(before_mcp_response=[{
+                    'method': 'mcpServer/startupStatus/updated',
+                    'params': {'name': name, 'status': 'starting'}}],
+                    mcp_stall_after_activity=True)
+                started = time.monotonic()
+                code, result, _ = self.invoke(*flags, '--timeout', '2')
+                self.assertNotEqual(0, code, result)
+                self.assertIn('MCP server activity', result['message'])
+                self.assertLess(time.monotonic() - started, 1.5)
+                self.assertEqual('not_submitted', result['task_submission'])
+                self.assertNotIn('turn/start', [x['method'] for x in self.recorded_requests()])
 
     def test_malformed_security_settings_revoke_after_completion_on_any_thread(self):
         base = protocol.settings_notification()["params"]["threadSettings"]
@@ -78,4 +98,3 @@ class BoundaryShapeTests(unittest.TestCase):
         self.assertFalse((directory / "result.json").exists())
         self.assertEqual("inventory_only", json.loads(
             (directory / "transport/inventory.json").read_text())["status"])
-

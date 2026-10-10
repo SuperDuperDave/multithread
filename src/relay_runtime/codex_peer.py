@@ -598,6 +598,13 @@ class _Driver:
             # An allowed server may start before the list says which it is; judge it once the list is read.
             if len(self.early_activity) >= _MAX_PENDING:
                 self.end_call("Codex's MCP activity before its server list exceeded the observation bound")
+            # The listing can establish plugin provenance, but cannot make an
+            # invalid identity or a disabled kind eligible. Stop those now,
+            # even if the pending listing never responds.
+            kind = "apps" if name == _APPS_SERVER else "plugin"
+            if not _identity(name) or not self.admits(kind):
+                self.end_call(f"Codex reported MCP server activity ({_label(name)}: {status}) "
+                              "for a server this call didn't allow")
             self.early_activity.append((name, status))
             return
         if self.admitted is not None and isinstance(name, str) and name in self.admitted:
