@@ -893,6 +893,7 @@ class PeerTests(unittest.TestCase):
         plan = {"argv": [str(self.provider), *self.native_arguments], "repo": str(self.repo)}
         with (mock.patch.object(peer, "prepare", return_value=plan),
               mock.patch.object(peer.subprocess, "Popen", return_value=process),
+              mock.patch.object(peer, "_owned_exit", side_effect=lambda child: child.returncode),
               mock.patch.object(peer, "_call_final_json", side_effect=KeyboardInterrupt()),
               mock.patch.object(peer, "_stop", side_effect=interrupted_stop)):
             code, result, _ = self.invoke()

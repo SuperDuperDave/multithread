@@ -1109,21 +1109,36 @@ def _record_refusal(target, envelope):
         os.close(fd)
 
 
-def _atomic_record(directory, name, value, *, sync_directory=False):
+def _atomic_record(directory, name, value, *, sync_directory=False, directory_fd=None):
     """Publish a complete private JSON file; a torn write leaves the old file."""
-    fd, temporary = tempfile.mkstemp(prefix=".receipt-", dir=directory)
+    if directory_fd is None:
+        fd, temporary = tempfile.mkstemp(prefix=".receipt-", dir=directory)
+    else:
+        temporary = ".receipt-" + uuid.uuid4().hex
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW |
+                     os.O_CLOEXEC, 0o600, dir_fd=directory_fd)
     try:
         with os.fdopen(fd, "wb") as stream:
             os.fchmod(stream.fileno(), 0o600)
             stream.write(json.dumps(value, ensure_ascii=True, sort_keys=True).encode("utf-8"))
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary, directory / name)
+        if directory_fd is None:
+            os.replace(temporary, directory / name)
+        else:
+            os.replace(temporary, name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+        temporary = None
         if sync_directory:
-            _sync_directory(directory)
+            if directory_fd is None:
+                _sync_directory(directory)
+            else:
+                os.fsync(directory_fd)
     finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
+        if temporary is not None:
+            try:
+                os.unlink(temporary, dir_fd=directory_fd)
+            except FileNotFoundError:
+                pass
 
 
 def _call_checkpoint(envelope, phase):
@@ -1260,20 +1275,42 @@ def _call_final_json(process, task, timeout, feedback, envelope):
     while True:
         feedback()
         try:
-            return process.wait(timeout=remaining())
+            return _wait(process, remaining())
         except subprocess.TimeoutExpired:
             if time.monotonic() >= deadline:
                 raise
 
 
+def _owned_exit(process):
+    """Observe our child's exit without releasing its PID/process-group identity."""
+    if process.returncode is not None:
+        return process.returncode
+    observed = os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+    if observed is None:
+        return None
+    return observed.si_status if observed.si_code == os.CLD_EXITED else -observed.si_status
+
+
+def _retire_owned_group(process):
+    # WNOWAIT kept the leader's PID reserved. Signal the created group before
+    # reaping it; never use a cached PID after ownership was relinquished.
+    if process.returncode is not None:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    process._owned_group_retired = True
+    process.wait(timeout=1)
+
+
 def _wait(process, timeout, observer=None, feedback=None):
-    if observer is None:
-        return process.wait(timeout=timeout)
     deadline = time.monotonic() + timeout
     while True:
-        progressed = _drain(observer)
-        if process.poll() is not None and (observer.eof or observer.truncated):
-            return process.returncode
+        progressed = _drain(observer) if observer is not None else False
+        exit_code = _owned_exit(process)
+        if exit_code is not None and (observer is None or observer.eof or observer.truncated):
+            return exit_code
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise subprocess.TimeoutExpired(process.args, timeout)
@@ -1286,6 +1323,12 @@ def _wait(process, timeout, observer=None, feedback=None):
 def _stop(process, observer=None, *, immediate=False):
     if observer is not None and getattr(observer, "capture", None) is not None:
         observer.capture.fault()
+    if process.returncode is not None:
+        # A reaped leader cannot pin the former group's identity. Normal
+        # ownership retirement already signaled it before reaping.
+        if observer is not None:
+            _drain(observer)
+        return
     # This call owns this process group only. Give the provider its normal
     # SIGTERM cleanup before escalation; never touch another native session.
     # A restricted session holding an adversarial task gets no grace.
@@ -1303,6 +1346,7 @@ def _stop(process, observer=None, *, immediate=False):
         os.killpg(process.pid, signal.SIGKILL)
     except ProcessLookupError:
         pass
+    process._owned_group_retired = True
     if observer is None:
         process.wait()
     else:
@@ -1320,6 +1364,8 @@ def _stop(process, observer=None, *, immediate=False):
                 observer.envelope["owned_process_cleanup"] = "termination requested; process exit remains unverified"
         finally:
             _drain(observer)
+            if process.returncode is None:
+                process.wait(timeout=1)
 
 
 def _call_problem(envelope, message):
@@ -1771,6 +1817,8 @@ def _run_peer(args, interruption):
                 # the provider and not a change to its execution permissions.
                 interruption["starting"] = True
                 try:
+                    if not all(hasattr(os, name) for name in ("waitid", "WNOWAIT", "WEXITED", "WNOHANG")):
+                        raise LaunchError("This host cannot retain owned process-group identity through cleanup; no provider was started.")
                     process = subprocess.Popen(native, cwd=plan["repo"], stdin=subprocess.PIPE,
                                                stdout=output, stderr=errors, start_new_session=True)
                 finally:
@@ -1838,12 +1886,14 @@ def _run_peer(args, interruption):
             finally:
                 envelope["elapsed_seconds"] = round(time.monotonic() - started, 3)
                 if process is not None:
-                    envelope["process_exit_code"] = process.returncode
+                    # Exit observation is available before safe group retirement
+                    # and reap; final-JSON interpretation needs that distinction.
+                    envelope["process_exit_code"] = _owned_exit(process)
         if not streaming and "message" not in envelope:
             stage = "result_read"
             _interpret(directory, envelope)
             code = 0 if envelope["state"] == "returned" else 1
-        elif streaming and envelope["state"] == "returned" and process.returncode != 0:
+        elif streaming and envelope["state"] == "returned" and _owned_exit(process) != 0:
             envelope["needs_attention"] = True
             envelope["message"] = "A native turn returned, but the provider process did not exit cleanly; inspect retained evidence."
     except (LaunchError, ControlError, OSError, UnicodeError) as exc:
@@ -1865,9 +1915,19 @@ def _run_peer(args, interruption):
         # signals. Restore the caller's handlers when peer_main returns.
         interruption["stopping"] = True
         if process is not None:
-            if process.poll() is None:
-                _stop(process, observer, immediate=restricted) if observer is not None else _stop(process, immediate=restricted)
-                _call_problem(envelope, "The owned provider required cleanup; inspect its observed turn and retained evidence.")
+            try:
+                if process.returncode is None:
+                    if _owned_exit(process) is None:
+                        _stop(process, observer, immediate=restricted) if observer is not None else _stop(process, immediate=restricted)
+                        _call_problem(envelope, "The owned provider required cleanup; inspect its observed turn and retained evidence.")
+                    else:
+                        _retire_owned_group(process)
+                        envelope["owned_process_cleanup"] = "owned group termination requested before leader reap"
+                        if observer is not None:
+                            _drain(observer)
+            except (OSError, subprocess.TimeoutExpired):
+                _call_problem(envelope, "Owned process cleanup could not be confirmed; inspect retained evidence.")
+                code = 1
             envelope.update(provider_started=True, process_exit_code=process.returncode)
         try:
             if observer is not None:
@@ -1938,7 +1998,7 @@ def _run_peer(args, interruption):
         envelope["transport_capture"] = capture.finish(
             process.returncode if process is not None else None,
             clean=bool(completed and code == 0 and envelope.get("state") == "returned"
-                       and not envelope.get("needs_attention")))
+                       and not envelope.get("needs_attention")), keep_directories=True)
     preparation = _follow_up_preparation(args, plan, envelope) if code == 0 else None
     if preparation is not None:
         envelope["follow_up_preparation"] = preparation
@@ -1946,7 +2006,10 @@ def _run_peer(args, interruption):
         _record_refusal(args.output_dir.absolute(), envelope)
     if directory is not None:
         try:
-            _atomic_record(directory, "result.json", envelope)
+            if capture is not None and capture.report["status"] == "complete":
+                capture.publish_receipt(directory, envelope, _atomic_record)
+            else:
+                _atomic_record(directory, "result.json", envelope, sync_directory=capture is not None)
         except OSError:
             if capture is not None:
                 # The raw inventory cannot establish completion without its terminal receipt.

@@ -588,7 +588,44 @@ class TransportCapture:
         self.report["status"] = "incomplete"
         self.report.pop("inventory_sha256", None)
 
-    def finish(self, exit_code, *, clean):
+    def close_directories(self):
+        for attribute in ("directory_fd", "parent_fd"):
+            fd = getattr(self, attribute)
+            setattr(self, attribute, None)
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    self.fault()
+
+    def publish_receipt(self, directory, envelope, record):
+        """Bind a durable matching receipt; inventory/receipt flags alone never complete capture.
+
+        The marker is created only after result.json's file and parent sync
+        have succeeded. If its own publication fails, a surviving marker
+        can bind only that already-durable receipt, never an unconfirmed one.
+        These are observations of our files, not authenticated custody.
+        """
+        try:
+            self._check_directories()
+            self.report["completion_binding"] = "capture-complete.json"
+            record(directory, "result.json", envelope, sync_directory=True, directory_fd=self.parent_fd)
+            self._check_directories()
+            body = json.dumps(envelope, ensure_ascii=True, sort_keys=True).encode("utf-8")
+            record(directory, "capture-complete.json", {
+                "schema": 1, "status": "receipt_binding",
+                "receipt_sha256": hashlib.sha256(body).hexdigest(),
+                "inventory_sha256": self.report["inventory_sha256"],
+                "capture_authenticated": False, "review_accepted": False, "release_approved": False},
+                sync_directory=True, directory_fd=self.parent_fd)
+            self._check_directories()
+        except OSError:
+            self.fault()
+            raise
+        finally:
+            self.close_directories()
+
+    def finish(self, exit_code, *, clean, keep_directories=False):
         """Inventory after the existing owner finishes cleanup; never wait or kill."""
         if self.finished:
             return self.report
@@ -652,16 +689,15 @@ class TransportCapture:
             self.failed = True
         finally:
             self.finished = True
-            for fd in [*self.files.values(), self.directory_fd, self.parent_fd]:
+            for fd in self.files.values():
                 if fd is not None:
                     try:
                         os.close(fd)
                     except OSError:
                         self.failed = True
             self.files.clear()
-            self.directory_fd = None
-            self.parent_fd = None
+            if not keep_directories or self.failed:
+                self.close_directories()
             if self.failed:
-                self.report["status"] = "incomplete"
-                self.report.pop("inventory_sha256", None)
+                self.fault()
         return self.report

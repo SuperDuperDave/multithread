@@ -494,7 +494,11 @@ manifest independently. No environment/profile snapshot is captured.
 
 `transport_capture.status=complete` in the matching call receipt means
 transport recording reached observed EOF, closed input and a clean natural
-zero exit, with no unresolved driver input/problem or capture fault. It also
+zero exit, with bounded owned-group termination before leader reap and no
+unresolved driver input/problem or capture fault. Exit observation uses
+WNOWAIT so the leader's PID remains reserved through group cleanup; hosts
+without that capability refuse before starting. Escaped groups are outside
+this cleanup scope. It also
 requires a private closed file inventory and completed file/directory syncs.
 The call and transport directories retain their descriptors and original
 device/inode identities. Construction and checks before/after publication
@@ -503,9 +507,18 @@ UID with mode0700. Observed directory changes refuse completion without
 repairing permissions. These checks do not authenticate custody or exclude
 changes between observations by another process with the same UID.
 The atomically linked `inventory.json` is explicitly `inventory_only`;
-alone it never proves completion. Require the matching receipt and inventory
-digest and independently verify all member bytes. A publication/sync failure
-may leave an inventory but gives an incomplete capture receipt.
+alone it never proves completion. Neither does a receipt's complete flag.
+Require `capture-complete.json` with status `receipt_binding`, the SHA256 of
+the exact matching `result.json` bytes and its inventory digest, and verify
+all inventory member bytes independently. The marker is published through
+the retained call-directory descriptor only after receipt file and parent
+directory syncs succeed. Failure after receipt rename but before its parent
+sync can leave a premature complete flag without a binding; consumers must
+treat that as incomplete. A marker publication failure makes the displayed
+capture incomplete; any surviving matching marker refers to a receipt whose
+durability was already confirmed. Lost markers after a host failure give
+incomplete evidence, never inferred completion. These files do not prove
+power-loss behavior, authenticated custody or release acceptance.
 
 Caps are16MiB per stream,8192 journal events and64KiB per chunk. Overflow,
 recording failures, unknown closure, protocol faults, interruption, timeout,
