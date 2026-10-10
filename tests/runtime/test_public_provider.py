@@ -52,7 +52,11 @@ assert set(warning) == {"systemMessage", "hookSpecificOutput"}, warning
 assert warning["hookSpecificOutput"]["hookEventName"] == "SessionStart"
 assert warning["hookSpecificOutput"]["additionalContext"].startswith("MULTITHREAD WARNING: this checkout is enrolled")
 assert "hook input could not be used" in warning["systemMessage"]
-assert str(launcher) + " setup --repo " in warning["systemMessage"]
+repair = warning["hookSpecificOutput"]["additionalContext"].split("the fix starts with: ", 1)[1]
+import shlex
+assert shlex.split(repair) == [str(launcher), "setup", "--repo", str(project), "--check"]
+assert repair not in warning["systemMessage"]
+assert "See the agent's warning for the exact setup --check command." in warning["systemMessage"]
 assert vetoed.stderr and snapshot(project) == before_veto
 import shlex
 assert shlex.split(generated["hook_command"]) == codex_hook, generated

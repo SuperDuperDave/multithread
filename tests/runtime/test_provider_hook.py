@@ -635,6 +635,59 @@ class HookWarningContractTests(unittest.TestCase):
                         self.assertFalse(marker.exists())
 
 
+    def test_enrollment_probe_preserves_filesystem_bytes_and_record_terminator(self):
+        with tempfile.TemporaryDirectory(prefix="relay-enrolled-", dir="/tmp") as short:
+            base = Path(short)
+            registry = SimpleNamespace(root=base / "empty-registry")
+            env = {"PATH": "/usr/bin:/bin", "HOME": "/nonexistent", "LC_ALL": "C",
+                   "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1"}
+            # A regular checkout with undecodable filename bytes, and a bare
+            # common-directory ending in whitespace/newline, exercise real Git.
+            for name, bare in [(os.fsdecode(b"checkout-\xff"), False),
+                               ("common trailing \n", True)]:
+                repo = base / name
+                command = ["/usr/bin/git", "-c", "core.hooksPath=/dev/null", "init", "-q"]
+                if bare:
+                    command.append("--bare")
+                subprocess.run(command + [str(repo)], env=env, check=True, capture_output=True)
+                common = repo if bare else repo / ".git"
+                (common / "relay-enrollment.json").write_text("{}\n")
+                self.assertTrue(runtimecli._enrolled(repo, registry))
+                out = io.StringIO()
+                args = SimpleNamespace(repo=repo, provider_event="SessionStart")
+                with redirect_stdout(out), mock.patch.object(runtimecli, "account_launcher",
+                                                             return_value=base / "fake-launcher"):
+                    runtimecli._hook_warning(args, "input", registry=registry)
+                value = json.loads(out.getvalue())
+                self.assertIn("hook input could not be used",
+                              value["hookSpecificOutput"]["additionalContext"])
+                self.assertNotIn("\n", value["hookSpecificOutput"]["additionalContext"])
+                (common / "relay-enrollment.json").unlink()
+                self.assertFalse(runtimecli._enrolled(repo, registry))
+
+    def test_inbox_projection_budget_includes_marker_and_json_escaping(self):
+        for notice, clipped in [("warning\n…", False), ("short …", False),
+                                ('"' * 512, True), ("\\" * 512, True),
+                                ("😀" * 300, True), ("plain" * 200, True)]:
+            with self.subTest(notice=notice[:20]):
+                out = io.StringIO()
+                args = SimpleNamespace(repo="/synthetic/project", provider_event="SessionStart",
+                                       inbox_warning=notice)
+                with redirect_stdout(out), mock.patch.object(runtimecli, "account_launcher",
+                                                             return_value="/synthetic/launcher"):
+                    runtimecli._hook_warning(args, "ledger", enrolled=True)
+                value = json.loads(out.getvalue())
+                context = value["hookSpecificOutput"]["additionalContext"]
+                projection = context.split(". MULTITHREAD WARNING:", 1)[0]
+                self.assertLessEqual(len(projection.encode("utf-8")), 512)
+                self.assertLessEqual(len(json.dumps(projection, ensure_ascii=False)[1:-1].encode("utf-8")), 512)
+                self.assertEqual(clipped, "[inbox notice clipped]" in projection)
+                repair = context.split("the fix starts with: ", 1)[1]
+                value["hookSpecificOutput"]["additionalContext"] = context.removesuffix(repair)
+                self.assertLess(len(json.dumps(value, ensure_ascii=False,
+                                              separators=(",", ":")).encode("utf-8")), 2048)
+
+
 class PendingReminderCacheTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(prefix="relay-reminder-test-")

@@ -153,7 +153,8 @@ The context is one line. Ordinary paths use POSIX shell quoting; paths with
 control or surrogate characters use an isolated Python execv command with
 exact filesystem byte literals, including trailing newlines. No command or
 authoritative path is clipped. Optional inbox notices are control-escaped
-and clipped to512 UTF-8 bytes, with an explicit clipping note. Fixed inbox
+and clipped to512 JSON-encoded UTF-8 bytes, including the explicit clipping
+note. Quote/backslash escaping counts toward this budget. Fixed inbox
 custody warnings fit without clipping. The serialized UTF-8 warning has
 less than2048 bytes of fixed overhead, plus the JSON-encoded repair command;
 it has no universal1024-character limit across arbitrary path lengths.

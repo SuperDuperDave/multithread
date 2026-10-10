@@ -2660,11 +2660,14 @@ class BoundedDiagnosticTests(unittest.TestCase):
 
     def test_brief_display_retains_json_quoting_and_the_declared_character_limit(self):
         for raw, shown in [('short"雪\n', 'short"雪\n'), ("a" * 160, "a" * 160),
-                           ("a" * 161, "a" * 157 + "...")]:
+                           ("a" * 161, "a" * 157 + "..."),
+                           ("before\u2028forged\u2029after", "before\u2028forged\u2029after")]:
             with self.subTest(raw=raw):
                 encoded = core_cli._quoted(raw, 160)
                 self.assertEqual(shown, json.loads(encoded))
                 self.assertNotIn("\n", encoded)
+                self.assertNotIn("\u2028", encoded)
+                self.assertNotIn("\u2029", encoded)
                 self.assertLessEqual(len(json.loads(encoded)), 160)
 
 

@@ -1483,7 +1483,9 @@ def _quoted(value: Any, maximum: int) -> str:
     text = str(value)
     if len(text) > maximum:
         text = text[: max(maximum - 3, 0)] + "..."
-    return json.dumps(text, ensure_ascii=False)
+    # JSON allows Unicode line/paragraph separators literally; escape them
+    # so a quoted ledger field cannot create an apparent extra brief line.
+    return json.dumps(text, ensure_ascii=False).replace("\u2028", "\\u2028").replace("\u2029", "\\u2029")
 
 
 if __name__ == "__main__":

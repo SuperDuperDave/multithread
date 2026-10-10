@@ -307,8 +307,10 @@ def _enrolled(repo, registry=None):
             env={"PATH": "/usr/bin:/bin", "HOME": "/nonexistent", "LC_ALL": "C",
                  "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1",
                  "GIT_TERMINAL_PROMPT": "0", "GIT_OPTIONAL_LOCKS": "0"},
-            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=2, check=True)
-        common = Path(completed.stdout.strip())
+            stdin=subprocess.DEVNULL, capture_output=True, timeout=2, check=True)
+        # Git writes one newline after the path; filesystem bytes and trailing
+        # whitespace in that path must survive the enrollment identity check.
+        common = Path(os.fsdecode(completed.stdout.removesuffix(b"\n")))
         if not common.is_absolute():
             return False
         record = hashlib.sha256(os.fsencode(str(common))).hexdigest() + ".json"
@@ -352,12 +354,23 @@ def _hook_warning(args, reason, *, enrolled=None, registry=None):
     inboxes = getattr(args, "inbox_warning", None)
     if inboxes:
         # Human context is a bounded projection, never an executable identity.
-        notice = core_cli._shown(inboxes, 512)
-        encoded = notice.encode("utf-8")
-        if len(encoded) > 512:
-            notice = encoded[:509].decode("utf-8", errors="ignore") + "…"
-        if notice.endswith("…") and notice != inboxes:
-            notice += " [inbox notice clipped]"
+        # First escape controls without silently clipping the projection.
+        # Budget its JSON-encoded bytes, including any explicit clipping marker,
+        # so quotes/backslashes cannot amplify the duplicated warning overhead.
+        notice = core_cli._shown(inboxes, len(str(inboxes)) * 12 + 1)
+        def encoded_size(value):
+            return len(json.dumps(value, ensure_ascii=False)[1:-1].encode("utf-8"))
+        if encoded_size(notice) > 512:
+            marker = "… [inbox notice clipped]"
+            budget = 512 - encoded_size(marker)
+            prefix, used = [], 0
+            for character in notice:
+                size = encoded_size(character)
+                if used + size > budget:
+                    break
+                prefix.append(character)
+                used += size
+            notice = "".join(prefix) + marker
         context, shown = notice + ". " + context, notice + ". " + shown
     print(json.dumps({"systemMessage": shown,
                       "hookSpecificOutput": {"hookEventName": event, "additionalContext": context}},
